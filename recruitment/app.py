@@ -187,12 +187,42 @@ def make_table(df: pd.DataFrame) -> pd.DataFrame:
             lambda v: fmt_str.format(v) if pd.notna(v) else "—"
         ).where(has_sub, "—")
 
-    t[f"Start delay\n(<{DELAY_MAX_MIN} min)"]              = fmt(df["announcement_start_delay"])
-    t[f"Ann. dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"]    = fmt(df["announcement_duration"])
-    t[f"Signup dur.\n(±{SIGNUP_DIFF_MAX} min)"]            = fmt(df["signup_duration"])
-    t[f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"] = fmt(df["pause_duration"])
-    t[f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"]                = fmt(df["ride_duration"])
-    t["Signups\n(≥14)"]                                    = fmt(df["total_signups"], "{:.0f}")
+    def fmt_reason(val_series, reason_col, flag_col, fmt_str="{:.1f}"):
+        """Show 'value / reason' when flagged and a reason was given."""
+        reasons = df.get(reason_col, pd.Series(dtype=str))
+        flags   = df.get(flag_col,   pd.Series(0, index=df.index))
+        out = []
+        for v, r, f, sub in zip(val_series, reasons, flags, has_sub):
+            if not sub:
+                out.append("—")
+            elif pd.isna(v):
+                out.append("—")
+            else:
+                s = fmt_str.format(float(v))
+                if f == 1 and pd.notna(r) and str(r).strip():
+                    s = f"{s} / {str(r).strip()}"
+                out.append(s)
+        return pd.Series(out, index=val_series.index)
+
+    t[f"Start delay\n(<{DELAY_MAX_MIN} min)"] = fmt_reason(
+        df["announcement_start_delay"],
+        "announcement_delay_explanation",
+        "flag_1_start_delay",
+    )
+    t[f"Ann. dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"] = fmt(df["announcement_duration"])
+    t[f"Signup dur.\n(±{SIGNUP_DIFF_MAX} min)"]         = fmt(df["signup_duration"])
+    t[f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"] = fmt_reason(
+        df["pause_duration"],
+        "pause_duration_explanation",
+        "flag_4a_pause_dur",   # covers S rides; N rides use flag_4b but same explanation field
+    )
+    t[f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"] = fmt(df["ride_duration"])
+    t["Signups\n(≥14)"] = fmt_reason(
+        df["total_signups"],
+        "final_comment_lowsignup",
+        "flag_7_low_signup",
+        "{:.0f}",
+    )
 
     return t
 
