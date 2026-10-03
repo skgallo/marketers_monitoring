@@ -126,20 +126,22 @@ if status_filter == "Submitted only":
 elif status_filter == "No submission only":
     display = display[display["submission_status"] == "No submission"]
 
-st.sidebar.markdown("---")
-if st.sidebar.button("🔄 Refresh data"):
-    load_data.clear()
-    st.rerun()
-
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 
-st.title("🚌 Recruitment HFC Dashboard")
-st.caption(
-    "One row per planned batch code. "
-    "Values shown in **red** are outside the acceptable range."
-)
+col_title, col_refresh = st.columns([6, 1])
+with col_title:
+    st.title("🚌 Recruitment HFC Dashboard")
+    st.caption(
+        "One row per planned batch code. "
+        "Values shown in **red** are outside the acceptable range."
+    )
+with col_refresh:
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh"):
+        load_data.clear()
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Summary counts
@@ -174,6 +176,7 @@ def make_table(df: pd.DataFrame) -> pd.DataFrame:
     t["Date"]         = df["ride_date"]
     t["Planned code"] = df["batch_code"]
     t["Actual code"]  = df["actual_batch_code"].where(has_sub, "—")
+    t["Enumerator"]   = df.get("username", pd.Series("—", index=df.index)).where(has_sub, "—")
     t["Status"]       = df["submission_status"]
     t["Corridor"]     = df["corridor"]
     t["Treatment"]    = df["treatment"]
@@ -184,12 +187,12 @@ def make_table(df: pd.DataFrame) -> pd.DataFrame:
             lambda v: fmt_str.format(v) if pd.notna(v) else "—"
         ).where(has_sub, "—")
 
-    t["Start delay"]   = fmt(df["announcement_start_delay"])
-    t["Ann. dur."]     = fmt(df["announcement_duration"])
-    t["Signup dur."]   = fmt(df["signup_duration"])
-    t["Pause/Pitch"]   = fmt(df["pause_duration"])
-    t["Ride dur."]     = fmt(df["ride_duration"])
-    t["Signups"]       = fmt(df["total_signups"], "{:.0f}")
+    t[f"Start delay\n(<{DELAY_MAX_MIN} min)"]              = fmt(df["announcement_start_delay"])
+    t[f"Ann. dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"]    = fmt(df["announcement_duration"])
+    t[f"Signup dur.\n(±{SIGNUP_DIFF_MAX} min)"]            = fmt(df["signup_duration"])
+    t[f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"] = fmt(df["pause_duration"])
+    t[f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"]                = fmt(df["ride_duration"])
+    t["Signups\n(≥14)"]                                    = fmt(df["total_signups"], "{:.0f}")
 
     return t
 
@@ -209,49 +212,48 @@ def style_table(t: pd.DataFrame, df: pd.DataFrame) -> pd.io.formats.style.Styler
     # Batch issue — red if non-empty
     styles.loc[t["Batch issue"].str.len() > 0, "Batch issue"] = RED
 
+    # Column name helpers (must match make_table)
+    COL_DELAY   = f"Start delay\n(<{DELAY_MAX_MIN} min)"
+    COL_ANN     = f"Ann. dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+    COL_SIGNUP  = f"Signup dur.\n(±{SIGNUP_DIFF_MAX} min)"
+    COL_PITCH   = f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+    COL_RIDE    = f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"
+    COL_SIGNUPS = "Signups\n(≥14)"
+
     # Start delay > DELAY_MAX_MIN
     delay = df["announcement_start_delay"]
-    styles.loc[has_sub & (delay > DELAY_MAX_MIN), "Start delay"] = RED
+    styles.loc[has_sub & (delay > DELAY_MAX_MIN), COL_DELAY] = RED
 
     # Ann. duration outside [ANN_DUR_MIN, ANN_DUR_MAX]
     ann = df["announcement_duration"]
-    styles.loc[has_sub & ((ann < ANN_DUR_MIN) | (ann > ANN_DUR_MAX)), "Ann. dur."] = RED
+    styles.loc[has_sub & ((ann < ANN_DUR_MIN) | (ann > ANN_DUR_MAX)), COL_ANN] = RED
 
     # Signup duration: |signup - ann| > SIGNUP_DIFF_MAX
     sig = df["signup_duration"]
-    styles.loc[has_sub & (abs(sig - ann) > SIGNUP_DIFF_MAX), "Signup dur."] = RED
+    styles.loc[has_sub & (abs(sig - ann) > SIGNUP_DIFF_MAX), COL_SIGNUP] = RED
 
     # Pause/Pitch outside [PITCH_TARGET_MIN ± PITCH_TOL_MIN]
     pause = df["pause_duration"]
-    styles.loc[
-        has_sub & (abs(pause - PITCH_TARGET_MIN) > PITCH_TOL_MIN), "Pause/Pitch"
-    ] = RED
+    styles.loc[has_sub & (abs(pause - PITCH_TARGET_MIN) > PITCH_TOL_MIN), COL_PITCH] = RED
 
     # Ride duration < RIDE_MIN_MIN
     ride = df["ride_duration"]
-    styles.loc[has_sub & (ride < RIDE_MIN_MIN), "Ride dur."] = RED
+    styles.loc[has_sub & (ride < RIDE_MIN_MIN), COL_RIDE] = RED
 
     # Signups < 14
     signups = df["total_signups"]
-    styles.loc[has_sub & (signups < 14), "Signups"] = RED
+    styles.loc[has_sub & (signups < 14), COL_SIGNUPS] = RED
 
     # Gray out no-submission rows
     no_sub_idx = df[~has_sub].index
-    for col in ["Actual code", "Batch issue", "Start delay", "Ann. dur.",
-                "Signup dur.", "Pause/Pitch", "Ride dur.", "Signups"]:
+    for col in ["Actual code", "Batch issue", COL_DELAY, COL_ANN,
+                COL_SIGNUP, COL_PITCH, COL_RIDE, COL_SIGNUPS]:
         styles.loc[no_sub_idx, col] = GRAY
 
     return t.style.apply(lambda _: styles, axis=None)
 
 
 st.subheader("Ride-by-ride monitoring")
-st.markdown(
-    f"Thresholds: start delay > {DELAY_MAX_MIN} min · "
-    f"announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min · "
-    f"signup discrepancy > {SIGNUP_DIFF_MAX} min · "
-    f"pause/pitch {PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min · "
-    f"ride < {RIDE_MIN_MIN} min · signups < 14"
-)
 
 t = make_table(display)
 styled = style_table(t, display)
