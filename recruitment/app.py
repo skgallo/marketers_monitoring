@@ -199,7 +199,7 @@ def make_table(df: pd.DataFrame) -> pd.DataFrame:
                 out.append("—")
             else:
                 s = fmt_str.format(float(v))
-                if f == 1 and pd.notna(r) and str(r).strip():
+                if pd.notna(f) and f == 1 and pd.notna(r) and str(r).strip():
                     s = f"{s} / {str(r).strip()}"
                 out.append(s)
         return pd.Series(out, index=val_series.index)
