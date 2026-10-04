@@ -20,13 +20,29 @@ import re
 # Constants / thresholds
 # ---------------------------------------------------------------------------
 
-ROUTE_CODES = ['LPRR', 'RRLP', 'LPBB', 'BBLP', 'LPJU', 'JULP']
+ROUTE_CODES = [
+    'LPRR', 'RRLP',   # Lumley – Regent Road
+    'LPBB', 'BBLP',   # Lumley Park – Bawbaw
+    'LPJU', 'JULP',   # Lumley Park – Jui
+    'CTEP', 'EPCT',   # Congo Town – Eastern Police
+    'MTEP', 'EPMT',   # Murray Town – Eastern Police
+    'MTEE', 'EEMT',   # Murray Town – East End Police
+    'BLEE', 'EEBL',   # Brima Lane – East End Police
+    'RRAB', 'ABRR',   # Regent Road – Aberdeen
+    'SSWE', 'WESS',   # Sacksville Street – Wellington
+]
 
 # Non-directional corridors
 CORRIDORS = {
     'LPRR': 'LP-RR', 'RRLP': 'LP-RR',
     'LPBB': 'LP-BB', 'BBLP': 'LP-BB',
     'LPJU': 'LP-JU', 'JULP': 'LP-JU',
+    'CTEP': 'CT-EP', 'EPCT': 'CT-EP',
+    'MTEP': 'MT-EP', 'EPMT': 'MT-EP',
+    'MTEE': 'MT-EE', 'EEMT': 'MT-EE',
+    'BLEE': 'BL-EE', 'EEBL': 'BL-EE',
+    'RRAB': 'RR-AB', 'ABRR': 'RR-AB',
+    'SSWE': 'SS-WE', 'WESS': 'SS-WE',
 }
 
 # Timing thresholds
