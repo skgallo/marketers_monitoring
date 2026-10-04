@@ -172,23 +172,19 @@ def make_table(df: pd.DataFrame) -> pd.DataFrame:
     """Select and label columns for display."""
     has_sub = df["submission_status"] == "Submitted"
 
-    t = pd.DataFrame()
-    t["Date"]         = df["ride_date"]
-    t["Planned code"] = df["batch_code"]
-    t["Actual code"]  = df["actual_batch_code"].where(has_sub, "—")
-    t["Enumerator"]   = df.get("username", pd.Series("—", index=df.index)).where(has_sub, "—")
-    t["Status"]       = df["submission_status"]
-    t["Corridor"]     = df["corridor"]
-    t["Treatment"]    = df["treatment"]
-    t["Batch issue"]  = df["batch_issue"].where(has_sub, "")
+    def actual(col):
+        """Return actual parsed value for submitted rows, '—' otherwise."""
+        return df.get(col, pd.Series("—", index=df.index)).where(has_sub, "—").fillna("—")
 
-    def fmt(series, fmt_str="{:.1f}"):
-        return series.apply(
-            lambda v: fmt_str.format(v) if pd.notna(v) else "—"
-        ).where(has_sub, "—")
+    MISSING = "Missing/not assessed"
 
-    def fmt_reason(val_series, reason_col, flag_col, fmt_str="{:.1f}"):
-        """Show 'value / reason' when flagged and a reason was given."""
+    def fmt(series, fmt_str="{:.2f}"):
+        """Format numeric value to 2 dp; submitted-but-missing → 'Missing/not assessed'."""
+        formatted = series.apply(lambda v: fmt_str.format(v) if pd.notna(v) else MISSING)
+        return formatted.where(has_sub, "—")
+
+    def fmt_reason(val_series, reason_col, flag_col, fmt_str="{:.2f}"):
+        """Show 'value / reason' when flagged and a reason exists; submitted-but-missing → MISSING."""
         reasons = df.get(reason_col, pd.Series(dtype=str))
         flags   = df.get(flag_col,   pd.Series(0, index=df.index))
         out = []
@@ -196,7 +192,7 @@ def make_table(df: pd.DataFrame) -> pd.DataFrame:
             if not sub:
                 out.append("—")
             elif pd.isna(v):
-                out.append("—")
+                out.append(MISSING)
             else:
                 s = fmt_str.format(float(v))
                 if pd.notna(f) and f == 1 and pd.notna(r) and str(r).strip():
@@ -204,121 +200,286 @@ def make_table(df: pd.DataFrame) -> pd.DataFrame:
                 out.append(s)
         return pd.Series(out, index=val_series.index)
 
-    t[f"Start delay\n(<{DELAY_MAX_MIN} min)"] = fmt_reason(
-        df["announcement_start_delay"],
-        "announcement_delay_explanation",
-        "flag_1_start_delay",
-    )
-    t[f"Ann. dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"] = fmt(df["announcement_duration"])
-    t[f"Signup dur.\n(±{SIGNUP_DIFF_MAX} min)"]         = fmt(df["signup_duration"])
-    t[f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"] = fmt_reason(
-        df["pause_duration"],
-        "pause_duration_explanation",
-        "flag_4a_pause_dur",   # covers S rides; N rides use flag_4b but same explanation field
-    )
-    t[f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"] = fmt(df["ride_duration"])
-    t["Signups\n(≥14)"] = fmt_reason(
-        df["total_signups"],
-        "final_comment_lowsignup",
-        "flag_7_low_signup",
-        "{:.0f}",
-    )
+    # --- Action needed column ---
+    treat_map = {"S": "Script", "N": "Normal", "P": "Peddling"}
+
+    def action_text(row):
+        if not has_sub[row.name]:
+            return ""
+        red_parts = []
+        if row.get("flag_batch_treatment") == 1:
+            a = treat_map.get(str(row.get("a_treatment", "")), row.get("a_treatment", ""))
+            red_parts.append(f"treatment ({a})")
+        if row.get("flag_batch_corridor") == 1:
+            red_parts.append(f"corridor ({row.get('a_corridor', '')})")
+        if row.get("flag_batch_direction") == 1:
+            red_parts.append(f"direction ({row.get('a_route', '')})")
+        if red_parts:
+            return f"⚠ Immediate: wrong {', '.join(red_parts)}"
+        orange_parts = []
+        if row.get("flag_batch_date") == 1:
+            orange_parts.append("date")
+        if row.get("flag_batch_marketer") == 1:
+            orange_parts.append("marketer ID")
+        # Ride number difference (not a named flag — compare directly)
+        p_ride = str(row.get("p_ride_num", ""))
+        a_ride = str(row.get("a_ride_num", ""))
+        if p_ride and a_ride and p_ride != a_ride and p_ride != "None" and a_ride != "None":
+            orange_parts.append("ride number")
+        if orange_parts:
+            return f"Confirm: {', '.join(orange_parts)} changed"
+        return ""
+
+    t = pd.DataFrame()
+    t["Planned code"] = df["batch_code"]
+    t["Status"]       = df["submission_status"]
+    t["Enumerator"]   = df.get("username", pd.Series("—", index=df.index)).where(has_sub, "—")
+
+    # Batch code components — actual values, colored when ≠ planned
+    t["Date"]      = actual("a_date")
+    t["Team"]      = actual("a_team")
+    t["Mkt ID"]    = actual("a_mkt_id")
+    t["Route"]     = actual("a_route")
+    t["Ride #"]    = actual("a_ride_num")
+    t["Treatment"] = actual("a_treatment").map(lambda v: treat_map.get(v, v))
+
+    t["Action needed"] = df.apply(action_text, axis=1)
+
+    # Timing columns
+    # signup_duration      = enumerator-recorded activity (flagged against 8–12 min)
+    # announcement_duration = automatic SurveyCTO form-screen timing (display only)
+    COL_DELAY    = f"Start delay\n(<{DELAY_MAX_MIN} min)"
+    COL_REC      = f"Recorded ann./\nsignup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+    COL_AUTO     = "Auto form-\nscreen dur."
+    COL_DISCREP  = f"Timing\ndiscrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"
+    COL_PITCH    = f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+    COL_RIDE     = f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"
+    COL_SIGNUPS  = "Signups\n(≥14)"
+
+    t[COL_DELAY]   = fmt_reason(df["announcement_start_delay"], "announcement_delay_explanation", "flag_1_start_delay")
+    t[COL_REC]     = fmt(df["signup_duration"])
+    t[COL_AUTO]    = fmt(df["announcement_duration"])
+    # Discrepancy: abs(signup - announcement), show both values when flagged
+    sig  = pd.to_numeric(df.get("signup_duration",       pd.Series(dtype=float)), errors="coerce")
+    ann  = pd.to_numeric(df.get("announcement_duration", pd.Series(dtype=float)), errors="coerce")
+    diff = (sig - ann).abs().round(2)
+    t[COL_DISCREP] = fmt(diff)
+    t[COL_PITCH]   = fmt_reason(df["pause_duration"], "pause_duration_explanation", "flag_4a_pause_dur")
+    t[COL_RIDE]    = fmt(df["ride_duration"])
+    t[COL_SIGNUPS] = fmt_reason(df["total_signups"], "final_comment_lowsignup", "flag_7_low_signup", "{:.0f}")
 
     return t
 
 
 def style_table(t: pd.DataFrame, df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    """Apply red text to cells with out-of-range values."""
-    RED  = "color: #CC0000; font-weight: 600"
-    GRAY = "color: #888888"
+    """Apply red/orange/gray styling."""
+    RED    = "color: #CC0000; font-weight: 600"
+    ORANGE = "color: #CC6600; font-weight: 600"
+    GRAY   = "color: #888888"
 
     styles = pd.DataFrame("", index=t.index, columns=t.columns)
     has_sub = df["submission_status"] == "Submitted"
 
-    # Actual code — red if different from planned
-    diff = df.get("flag_batch_code_different", pd.Series(0, index=df.index))
-    styles.loc[diff == 1, "Actual code"] = RED
+    # Batch code component colors
+    styles.loc[has_sub & (df.get("flag_batch_treatment", 0) == 1), "Treatment"] = RED
+    styles.loc[has_sub & (df.get("flag_batch_corridor",  0) == 1), "Route"]     = RED
+    styles.loc[has_sub & (df.get("flag_batch_direction", 0) == 1), "Route"]     = RED
+    styles.loc[has_sub & (df.get("flag_batch_date",      0) == 1), "Date"]      = ORANGE
+    styles.loc[has_sub & (df.get("flag_batch_team",     0) == 1), "Team"]      = ORANGE
+    styles.loc[has_sub & (df.get("flag_batch_marketer",  0) == 1), "Mkt ID"]    = ORANGE
 
-    # Batch issue — red if non-empty
-    styles.loc[t["Batch issue"].str.len() > 0, "Batch issue"] = RED
+    # Ride number — orange if actual ≠ planned
+    p_ride = df.get("p_ride_num", pd.Series("", index=df.index)).fillna("")
+    a_ride = df.get("a_ride_num", pd.Series("", index=df.index)).fillna("")
+    ride_diff = has_sub & (p_ride != a_ride) & (p_ride != "") & (a_ride != "")
+    styles.loc[ride_diff, "Ride #"] = ORANGE
 
-    # Column name helpers (must match make_table)
+    # Action needed column
+    styles.loc[t["Action needed"].str.startswith("⚠"), "Action needed"] = RED
+    styles.loc[t["Action needed"].str.startswith("Confirm"), "Action needed"] = ORANGE
+
+    # Timing columns (must match make_table column names exactly)
     COL_DELAY   = f"Start delay\n(<{DELAY_MAX_MIN} min)"
-    COL_ANN     = f"Ann. dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
-    COL_SIGNUP  = f"Signup dur.\n(±{SIGNUP_DIFF_MAX} min)"
+    COL_REC     = f"Recorded ann./\nsignup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+    COL_AUTO    = "Auto form-\nscreen dur."
+    COL_DISCREP = f"Timing\ndiscrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"
     COL_PITCH   = f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
     COL_RIDE    = f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"
     COL_SIGNUPS = "Signups\n(≥14)"
 
-    # Start delay > DELAY_MAX_MIN
-    delay = df["announcement_start_delay"]
+    delay = pd.to_numeric(df.get("announcement_start_delay", pd.Series(dtype=float)), errors="coerce")
     styles.loc[has_sub & (delay > DELAY_MAX_MIN), COL_DELAY] = RED
 
-    # Ann. duration outside [ANN_DUR_MIN, ANN_DUR_MAX]
-    ann = df["announcement_duration"]
-    styles.loc[has_sub & ((ann < ANN_DUR_MIN) | (ann > ANN_DUR_MAX)), COL_ANN] = RED
+    # Flag recorded duration (signup_duration) against 8–12 min threshold
+    sig = pd.to_numeric(df.get("signup_duration", pd.Series(dtype=float)), errors="coerce")
+    styles.loc[has_sub & sig.notna() & ((sig < ANN_DUR_MIN) | (sig > ANN_DUR_MAX)), COL_REC] = RED
 
-    # Signup duration: |signup - ann| > SIGNUP_DIFF_MAX
-    sig = df["signup_duration"]
-    styles.loc[has_sub & (abs(sig - ann) > SIGNUP_DIFF_MAX), COL_SIGNUP] = RED
+    # Flag discrepancy column when |signup - announcement| > threshold
+    ann  = pd.to_numeric(df.get("announcement_duration", pd.Series(dtype=float)), errors="coerce")
+    diff = (sig - ann).abs()
+    styles.loc[has_sub & sig.notna() & ann.notna() & (diff > SIGNUP_DIFF_MAX), COL_DISCREP] = RED
 
-    # Pause/Pitch outside [PITCH_TARGET_MIN ± PITCH_TOL_MIN]
-    pause = df["pause_duration"]
-    styles.loc[has_sub & (abs(pause - PITCH_TARGET_MIN) > PITCH_TOL_MIN), COL_PITCH] = RED
+    pause = pd.to_numeric(df.get("pause_duration", pd.Series(dtype=float)), errors="coerce")
+    styles.loc[has_sub & pause.notna() & (abs(pause - PITCH_TARGET_MIN) > PITCH_TOL_MIN), COL_PITCH] = RED
 
-    # Ride duration < RIDE_MIN_MIN
-    ride = df["ride_duration"]
-    styles.loc[has_sub & (ride < RIDE_MIN_MIN), COL_RIDE] = RED
+    ride = pd.to_numeric(df.get("ride_duration", pd.Series(dtype=float)), errors="coerce")
+    styles.loc[has_sub & ride.notna() & (ride < RIDE_MIN_MIN), COL_RIDE] = RED
 
-    # Signups < 14
-    signups = df["total_signups"]
-    styles.loc[has_sub & (signups < 14), COL_SIGNUPS] = RED
+    signups = pd.to_numeric(df.get("total_signups", pd.Series(dtype=float)), errors="coerce")
+    styles.loc[has_sub & signups.notna() & (signups < 14), COL_SIGNUPS] = RED
 
     # Gray out no-submission rows
     no_sub_idx = df[~has_sub].index
-    for col in ["Actual code", "Batch issue", COL_DELAY, COL_ANN,
-                COL_SIGNUP, COL_PITCH, COL_RIDE, COL_SIGNUPS]:
+    for col in ["Date", "Team", "Mkt ID", "Route", "Ride #", "Treatment", "Action needed",
+                COL_DELAY, COL_REC, COL_AUTO, COL_DISCREP, COL_PITCH, COL_RIDE, COL_SIGNUPS]:
         styles.loc[no_sub_idx, col] = GRAY
 
     return t.style.apply(lambda _: styles, axis=None)
 
 
-st.subheader("Ride-by-ride monitoring")
-
-t = make_table(display)
-styled = style_table(t, display)
-
-st.dataframe(styled, use_container_width=True, hide_index=True)
-
-# CSV download (raw values, not styled)
-csv = t.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "⬇ Download as CSV",
-    data=csv,
-    file_name="recruitment_hfc.csv",
-    mime="text/csv",
-)
-
 # ---------------------------------------------------------------------------
-# Column guide
+# Tab 2 helper: implementation issues
 # ---------------------------------------------------------------------------
 
-with st.expander("Column guide"):
-    st.markdown(f"""
-| Column | What it shows | Flagged red when |
+def make_issues_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Tab 2: one row per submitted ride, flag values + reason columns side-by-side."""
+    sub = df[df["submission_status"] == "Submitted"].copy().reset_index(drop=True)
+
+    MISSING = "Missing/not assessed"
+
+    def num(col, fmt="{:.2f}"):
+        s = pd.to_numeric(sub.get(col, pd.Series(dtype=float)), errors="coerce")
+        return s.apply(lambda v: fmt.format(v) if pd.notna(v) else MISSING)
+
+    def txt(col):
+        s = sub.get(col, pd.Series("—", index=sub.index))
+        return s.fillna("—").astype(str).replace({"nan": "—", "": "—"})
+
+    t = pd.DataFrame()
+    t["Ride"]          = sub["batch_code"]
+    t["Enumerator"]    = sub.get("username", pd.Series("—", index=sub.index)).fillna("—")
+
+    # Timing — flag value | reason (where available)
+    t[f"Start delay\n(<{DELAY_MAX_MIN} min)"]    = num("announcement_start_delay")
+    t["Delay reason"]                             = txt("announcement_delay_explanation")
+    t[f"Recorded ann./signup dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"] = num("signup_duration")
+    t[f"Auto form-screen dur."]                   = num("announcement_duration")
+    # Discrepancy between the two timing measures
+    sig2  = pd.to_numeric(sub.get("signup_duration",       pd.Series(dtype=float)), errors="coerce")
+    ann2  = pd.to_numeric(sub.get("announcement_duration", pd.Series(dtype=float)), errors="coerce")
+    diff2 = (sig2 - ann2).abs().round(2)
+    t[f"Timing discrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"] = diff2.apply(
+        lambda v: f"{v:.2f}" if pd.notna(v) else MISSING
+    )
+    t[f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"] = num("pause_duration")
+    t["Pitch reason"]                             = txt("pause_duration_explanation")
+    t[f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"]        = num("ride_duration")
+
+    # Signups
+    t["Signups\n(≥14)"]    = num("total_signups", "{:.0f}")
+    t["Signup reason"]     = txt("final_comment_lowsignup")
+
+    # Disruptions (c10 = select_multiple, c10a = text)
+    t["Disruptions"]       = txt("c10")
+    t["Disruption notes"]  = txt("c10a")
+
+    # Passenger questions
+    t["Pax Q1 (q00)"]     = txt("q00")
+    t["Pax Q2 (q01)"]     = txt("q01")
+
+    return t
+
+
+def style_issues_table(t: pd.DataFrame, df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    RED    = "color: #CC0000; font-weight: 600"
+    ORANGE = "color: #CC6600"
+
+    sub = df[df["submission_status"] == "Submitted"].reset_index(drop=True)
+    styles = pd.DataFrame("", index=t.index, columns=t.columns)
+
+    COL_DELAY   = f"Start delay\n(<{DELAY_MAX_MIN} min)"
+    COL_REC     = f"Recorded ann./signup dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+    COL_DISCREP = f"Timing discrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"
+    COL_PITCH   = f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+    COL_RIDE    = f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"
+    COL_SIGS    = "Signups\n(≥14)"
+
+    delay   = pd.to_numeric(sub.get("announcement_start_delay", pd.Series(dtype=float)), errors="coerce")
+    sig     = pd.to_numeric(sub.get("signup_duration",          pd.Series(dtype=float)), errors="coerce")
+    ann     = pd.to_numeric(sub.get("announcement_duration",    pd.Series(dtype=float)), errors="coerce")
+    pause   = pd.to_numeric(sub.get("pause_duration",           pd.Series(dtype=float)), errors="coerce")
+    ride    = pd.to_numeric(sub.get("ride_duration",            pd.Series(dtype=float)), errors="coerce")
+    signups = pd.to_numeric(sub.get("total_signups",            pd.Series(dtype=float)), errors="coerce")
+    diff_t  = (sig - ann).abs()
+
+    styles.loc[delay.notna() & (delay > DELAY_MAX_MIN),                         COL_DELAY]   = RED
+    styles.loc[sig.notna()   & ((sig < ANN_DUR_MIN) | (sig > ANN_DUR_MAX)),     COL_REC]     = RED
+    styles.loc[sig.notna()   & ann.notna() & (diff_t > SIGNUP_DIFF_MAX),        COL_DISCREP] = RED
+    styles.loc[pause.notna() & (abs(pause - PITCH_TARGET_MIN) > PITCH_TOL_MIN), COL_PITCH]   = RED
+    styles.loc[ride.notna()  & (ride < RIDE_MIN_MIN),                           COL_RIDE]    = RED
+    styles.loc[signups.notna() & (signups < 14),                                COL_SIGS]    = RED
+
+    # Reason cells — orange when they contain text (explanation was given)
+    for rc in ["Delay reason", "Pitch reason", "Signup reason", "Disruption notes"]:
+        if rc in t.columns:
+            has_text = (t[rc] != "—") & (t[rc].str.strip() != "")
+            styles.loc[has_text, rc] = ORANGE
+
+    return t.style.apply(lambda _: styles, axis=None)
+
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+
+tab1, tab2 = st.tabs(["📋 Ride overview", "⚠️ Implementation issues"])
+
+with tab1:
+    st.subheader("Ride-by-ride monitoring")
+    t = make_table(display)
+    styled = style_table(t, display)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    csv = t.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇ Download as CSV", data=csv,
+                       file_name="recruitment_hfc.csv", mime="text/csv")
+
+    with st.expander("Column guide"):
+        st.markdown(f"""
+| Column | What it shows | Flagged when |
 |--------|--------------|-----------------|
-| Actual code | Batch code submitted by enumerator | Different from planned code |
-| Batch issue | Design or confirmation problem | "Design" = wrong treatment/corridor; "Confirm" = different date or marketer |
-| Start delay | Minutes between ride start and announcement start | > {DELAY_MAX_MIN} min |
-| Ann. dur. | Announcement duration (min) | < {ANN_DUR_MIN} or > {ANN_DUR_MAX} min |
-| Signup dur. | Signup duration (min) | Differs from announcement by > {SIGNUP_DIFF_MAX} min |
-| Pause/Pitch | Pause (S) or pitch (N) duration (min) | Outside {PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min (i.e. < {PITCH_TARGET_MIN - PITCH_TOL_MIN} or > {PITCH_TARGET_MIN + PITCH_TOL_MIN}) |
-| Ride dur. | Total ride duration (min) | < {RIDE_MIN_MIN} min |
-| Signups | Total sign-ups on this ride | < 14 |
+| Date / Team / Mkt ID / Route / Ride # / Treatment | Actual batch code components | 🔴 Red = wrong treatment/corridor/direction; 🟠 Orange = date, team, marketer or ride # changed |
+| Start delay | Minutes between ride start and announcement start | 🔴 > {DELAY_MAX_MIN} min |
+| Recorded ann./signup dur. | Enumerator-recorded announcement/sign-up activity duration | 🔴 < {ANN_DUR_MIN} or > {ANN_DUR_MAX} min |
+| Auto form-screen dur. | Automatic SurveyCTO screen timing (not independently flagged) | — |
+| Timing discrepancy | \|Recorded − Auto\| difference | 🔴 > {SIGNUP_DIFF_MAX} min — review required; does not imply either measure is wrong |
+| Pause/Pitch | Pause (S) or pitch (N) duration (min) | 🔴 Outside {PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min |
+| Ride dur. | Total ride duration (min) | 🔴 < {RIDE_MIN_MIN} min |
+| Signups | Total sign-ups | 🔴 < 14 |
+| Missing/not assessed | Value not present in submitted form | Neither pass nor fail — data absent |
 """)
 
+with tab2:
+    st.subheader("Implementation issues — submitted rides only")
+    st.caption(
+        "🔴 Red = value outside threshold. 🟠 Orange = explanation was recorded. "
+        "Reason columns show the enumerator's explanation when flagged."
+    )
+    submitted_display = display[display["submission_status"] == "Submitted"]
+    if submitted_display.empty:
+        st.info("No submitted rides yet.")
+    else:
+        t2 = make_issues_table(display)
+        styled2 = style_issues_table(t2, display)
+        st.dataframe(styled2, use_container_width=True, hide_index=True)
+
+        csv2 = t2.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇ Download issues CSV", data=csv2,
+                           file_name="implementation_issues.csv", mime="text/csv",
+                           key="dl_issues")
+
 # ---------------------------------------------------------------------------
-# Diagnostics
+# Diagnostics (shared footer)
 # ---------------------------------------------------------------------------
 
 with st.expander("Diagnostics"):

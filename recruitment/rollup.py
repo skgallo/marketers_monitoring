@@ -131,9 +131,15 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # Drop test / enumerator rows
+    # Drop test rows
     if 'username' in df.columns:
         df = df[~df['username'].str.lower().isin(TEST_USERNAMES)].copy()
+
+    # Keep only Enumerator 1 submissions (role_type = 1).
+    # Supervisor submissions (role_type = 0) are handled separately in Tab 3.
+    # If role_type is absent from the form, all submissions are kept.
+    if 'role_type' in df.columns:
+        df = df[df['role_type'].astype(str).str.strip() == '1'].copy()
 
     # Extract submission year for typo fixes
     if 'SubmissionDate' in df.columns:
@@ -181,6 +187,7 @@ def add_batch_code_flags(df: pd.DataFrame) -> pd.DataFrame:
     )
     df['flag_batch_date']      = flag(df['p_date']      != df['a_date'])
     df['flag_batch_marketer']  = flag(df['p_mkt_id']    != df['a_mkt_id'])
+    df['flag_batch_team']      = flag(df['p_team']      != df['a_team'])
 
     df['flag_design_problem']     = flag(
         (df['p_treatment'] != df['a_treatment']) |
@@ -229,92 +236,133 @@ def _diff_minutes(t1, t2) -> float:
 def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Parse raw time columns
+    # ── Parse raw SurveyCTO time columns ────────────────────────────────────
     for col in ['b02_r', 'b03', 'b05', 'b06', 'b09', 'b10', 'b11']:
-        if col in df.columns:
-            df[f'_{col}'] = df[col].apply(_parse_time)
-        else:
-            df[f'_{col}'] = pd.NaT
+        df[f'_{col}'] = df[col].apply(_parse_time) if col in df.columns else pd.NaT
 
-    # Derive durations (recompute from raw regardless of SurveyCTO's calculated fields)
-    df['_delay_min']     = df.apply(lambda r: _diff_minutes(r['_b02_r'], r['_b03']),  axis=1)
-    df['_pitch_dur_min'] = df.apply(lambda r: _diff_minutes(r['_b05'],   r['_b09']),  axis=1)  # N
-    df['_pause_dur_min'] = df.apply(lambda r: _diff_minutes(r['_b06'],   r['_b10']),  axis=1)  # S
-    df['_b09_to_b11']    = df.apply(lambda r: _diff_minutes(r['_b09'],   r['_b11']),  axis=1)
-    df['_b10_to_b11']    = df.apply(lambda r: _diff_minutes(r['_b10'],   r['_b11']),  axis=1)
+    # Derive raw durations from timestamps (for chronological checks)
+    df['_delay_min']     = df.apply(lambda r: _diff_minutes(r['_b02_r'], r['_b03']), axis=1)
+    df['_pitch_dur_min'] = df.apply(lambda r: _diff_minutes(r['_b05'],   r['_b09']), axis=1)  # N
+    df['_pause_dur_min'] = df.apply(lambda r: _diff_minutes(r['_b06'],   r['_b10']), axis=1)  # S
+    df['_b09_to_b11']    = df.apply(lambda r: _diff_minutes(r['_b09'],   r['_b11']), axis=1)
+    df['_b10_to_b11']    = df.apply(lambda r: _diff_minutes(r['_b10'],   r['_b11']), axis=1)
 
-    # Use SurveyCTO's computed durations where the raw calculation fails
-    for src, dst in [('announcement_duration', '_ann_dur'), ('signup_duration', '_signup_dur')]:
-        df[dst] = pd.to_numeric(df.get(src, pd.Series(dtype=float)), errors='coerce')
+    # ── SurveyCTO computed fields ────────────────────────────────────────────
+    # signup_duration      = enumerator-RECORDED announcement/signup activity duration
+    # announcement_duration = AUTOMATIC form-screen timing (b03→b05/b06 area)
+    # Round to 6 dp for comparison; display layer rounds to 2 dp.
+    sig_dur = pd.to_numeric(df.get('signup_duration',       pd.Series(dtype=float)), errors='coerce').round(6)
+    ann_dur = pd.to_numeric(df.get('announcement_duration', pd.Series(dtype=float)), errors='coerce').round(6)
 
-    # Determine pitch type from planned batch code treatment (fall back to actual)
+    # Overwrite with rounded versions so display layer gets consistent values
+    df['signup_duration']       = sig_dur
+    df['announcement_duration'] = ann_dur
+
+    # ── Treatment and submission presence ────────────────────────────────────
     treatment = df.get('p_treatment', pd.Series(dtype=str)).fillna(
                 df.get('a_treatment', pd.Series(dtype=str)))
-
-    is_N = treatment == 'N'
-    is_S = treatment == 'S'
+    is_N    = treatment == 'N'
+    is_S    = treatment == 'S'
     has_sub = df['actual_batch_code'].notna()
 
-    def mk_flag(cond_series):
-        """0/1 where submission exists, NA where no submission."""
-        return np.where(has_sub, cond_series.fillna(0).astype(int), pd.NA)
+    # ── NA-safe flag helper ──────────────────────────────────────────────────
+    def flag_where(condition, *required):
+        """
+        Return 1/0/NA.
+        NA when: no submission OR any required value is missing.
+        Missing values NEVER receive a green pass (0).
+        """
+        valid = has_sub.copy()
+        for s in required:
+            valid = valid & pd.Series(s, index=df.index).notna()
+        return np.where(valid, condition.fillna(False).astype(int), pd.NA)
 
-    # Flag 1: announcement start delay > 2 min
-    df['flag_1_start_delay'] = mk_flag(df['_delay_min'] > DELAY_MAX_MIN)
+    # ── Flag 1: announcement start delay > 2 min ─────────────────────────────
+    delay = pd.to_numeric(df.get('announcement_start_delay', pd.Series(dtype=float)), errors='coerce')
+    df['flag_1_start_delay'] = flag_where(delay > DELAY_MAX_MIN, delay)
 
-    # Flag 2: announcement duration outside 8–12 min
-    df['flag_2_ann_duration'] = mk_flag(
-        (df['_ann_dur'] < ANN_DUR_MIN) | (df['_ann_dur'] > ANN_DUR_MAX)
+    # ── Flag 2: RECORDED ann./signup duration outside 8–12 min ───────────────
+    # Uses signup_duration (enumerator-recorded).
+    # announcement_duration (auto form timing) is NOT independently flagged here.
+    df['flag_2_ann_duration'] = flag_where(
+        (sig_dur < ANN_DUR_MIN) | (sig_dur > ANN_DUR_MAX), sig_dur
     )
 
-    # Flag 3: |signup_duration − announcement_duration| > 1 min
-    df['flag_3_signup_discrep'] = mk_flag(
-        abs(df['_signup_dur'] - df['_ann_dur']) > SIGNUP_DIFF_MAX
-    )
+    # ── Flag 3: discrepancy between recorded and auto timing ──────────────────
+    # Both rounded to 6 dp before comparison.
+    # Label: "Recorded activity timing differs from automatic form timing—review required."
+    # Does NOT imply either measure is wrong.
+    discrep = (sig_dur - ann_dur).abs()
+    df['flag_3_signup_discrep'] = flag_where(discrep > SIGNUP_DIFF_MAX, sig_dur, ann_dur)
 
-    # Flag 4a: S-ride pause duration outside 23–27 min (no short-ride exception)
-    # Use SurveyCTO's pause_duration where available (computed from pause_start field,
-    # not raw b06 which can differ slightly). Fall back to b06→b10 for older submissions.
+    # ── Flag 4a: S-ride pause outside 23–27 min ───────────────────────────────
     s_pause_dur = pd.to_numeric(df.get('pause_duration', pd.Series(dtype=float)), errors='coerce')
     s_pause_dur = s_pause_dur.where(s_pause_dur.notna(), df['_pause_dur_min'])
     df['flag_4a_pause_dur'] = np.where(
-        has_sub & is_S,
+        has_sub & is_S & s_pause_dur.notna(),
         (abs(s_pause_dur - PITCH_TARGET_MIN) > PITCH_TOL_MIN).astype(int),
         pd.NA
     )
 
-    # Flag 4b: N-ride pitch duration outside 23–27 min (no short-ride exception)
-    # No SurveyCTO field for pitch_duration — always computed from b05→b09
+    # ── Flag 4b: N-ride pitch outside 23–27 min ───────────────────────────────
+    pitch_raw = pd.Series(df['_pitch_dur_min'], index=df.index)
     df['flag_4b_pitch_dur'] = np.where(
-        has_sub & is_N,
-        (abs(df['_pitch_dur_min'] - PITCH_TARGET_MIN) > PITCH_TOL_MIN).astype(int),
+        has_sub & is_N & pitch_raw.notna(),
+        (abs(pitch_raw - PITCH_TARGET_MIN) > PITCH_TOL_MIN).astype(int),
         pd.NA
     )
 
-    # Flag 4c: pitch/pause ends after ride end
+    # ── Flag 4c: pitch/pause ends AFTER ride end (chronological impossible) ───
+    b09_to_b11 = pd.Series(df['_b09_to_b11'], index=df.index)
+    b10_to_b11 = pd.Series(df['_b10_to_b11'], index=df.index)
     df['flag_4c_after_ride'] = np.where(
-        has_sub & is_S, (df['_b10_to_b11'] < 0).astype(int),
+        has_sub & is_S & b10_to_b11.notna(), (b10_to_b11 < 0).astype(int),
         np.where(
-            has_sub & is_N, (df['_b09_to_b11'] < 0).astype(int),
+            has_sub & is_N & b09_to_b11.notna(), (b09_to_b11 < 0).astype(int),
             pd.NA
         )
     )
 
-    # Flag 6: short ride — ride_duration < 35 min (10 ann/signup + 25 pause/pitch minimum)
+    # ── Chronological impossibility flags ────────────────────────────────────
+    # These catch impossible timestamp sequences regardless of computed field values.
+    delay_raw = pd.Series(df['_delay_min'], index=df.index)
+    pause_raw = pd.Series(df['_pause_dur_min'], index=df.index)
+
+    # Announcement started before ride (negative delay from raw timestamps)
+    df['flag_chron_neg_delay'] = np.where(
+        has_sub & delay_raw.notna(), (delay_raw < 0).astype(int), pd.NA
+    )
+    # Negative auto form-screen duration
+    df['flag_chron_neg_ann'] = flag_where(ann_dur < 0, ann_dur)
+    # Negative enumerator-recorded duration
+    df['flag_chron_neg_signup'] = flag_where(sig_dur < 0, sig_dur)
+    # Negative pause/pitch duration from raw timestamps
+    df['flag_chron_neg_pause'] = np.where(
+        has_sub & is_S & pause_raw.notna(), (pause_raw < 0).astype(int), pd.NA
+    )
+    df['flag_chron_neg_pitch'] = np.where(
+        has_sub & is_N & pitch_raw.notna(), (pitch_raw < 0).astype(int), pd.NA
+    )
+
+    # ── Flag 6: short ride ────────────────────────────────────────────────────
     ride_dur = pd.to_numeric(df.get('ride_duration', pd.Series(dtype=float)), errors='coerce')
-    df['flag_6_short_ride'] = mk_flag(ride_dur < RIDE_MIN_MIN)
+    df['flag_6_short_ride'] = flag_where(ride_dur < RIDE_MIN_MIN, ride_dur)
 
-    # Flag 7: low signups — total_signups < 14
+    # ── Flag 7: low signups ───────────────────────────────────────────────────
     total_signups = pd.to_numeric(df.get('total_signups', pd.Series(dtype=float)), errors='coerce')
-    df['flag_7_low_signup'] = mk_flag(total_signups < 14)
+    df['flag_7_low_signup'] = flag_where(total_signups < 14, total_signups)
 
-    # Flag 5: any timing issue (includes short ride)
-    timing = ['flag_1_start_delay', 'flag_2_ann_duration', 'flag_3_signup_discrep',
-              'flag_4a_pause_dur', 'flag_4b_pitch_dur', 'flag_4c_after_ride',
-              'flag_6_short_ride']
+    # ── Flag 5: any timing/chronological issue ───────────────────────────────
+    timing_flags = [
+        'flag_1_start_delay', 'flag_2_ann_duration', 'flag_3_signup_discrep',
+        'flag_4a_pause_dur', 'flag_4b_pitch_dur', 'flag_4c_after_ride',
+        'flag_6_short_ride',
+        'flag_chron_neg_delay', 'flag_chron_neg_ann', 'flag_chron_neg_signup',
+        'flag_chron_neg_pause', 'flag_chron_neg_pitch',
+    ]
     df['flag_5_any_timing'] = np.where(
         has_sub,
-        df[timing].apply(lambda row: int(row.fillna(0).eq(1).any()), axis=1),
+        df[timing_flags].apply(lambda row: int(row.fillna(0).eq(1).any()), axis=1),
         pd.NA
     )
 
@@ -340,6 +388,17 @@ def rollup(submissions_df: pd.DataFrame, batch_codes_df: pd.DataFrame) -> pd.Dat
     subs = clean_submissions(submissions_df)
     subs = add_batch_code_flags(subs)
     subs = add_timing_flags(subs)
+
+    # Flag batch codes with more than one enumerator submission (ambiguous match)
+    dup_counts = subs.groupby('batch_code').size()
+    subs['flag_duplicate_submission'] = subs['batch_code'].map(
+        lambda bc: 1 if dup_counts.get(bc, 0) > 1 else 0
+    )
+
+    # When duplicates exist, keep the most recent submission per batch_code
+    if 'SubmissionDate' in subs.columns:
+        subs['_sort_date'] = pd.to_datetime(subs['SubmissionDate'], format='mixed', errors='coerce')
+        subs = subs.sort_values('_sort_date').drop_duplicates(subset='batch_code', keep='last')
 
     # Left-join frame onto submissions (frame is the source of truth)
     result = batch_codes_df.merge(subs, on='batch_code', how='left')
