@@ -16,14 +16,14 @@ Requires .streamlit/secrets.toml (never committed) with:
     app_password     = "..."
     submissions_url  = "https://docs.google.com/spreadsheets/d/.../export?format=csv&gid=..."
     batch_codes_url  = "https://docs.google.com/spreadsheets/d/.../export?format=csv&gid=..."
-    resolutions_url  = "..."   # optional — see data_io.load_resolutions
+    reviews_url      = "..."   # optional — CSV export URL of the "reviews" tab (see data_io.load_reviews)
 """
 
 import pandas as pd
 import streamlit as st
 
 from auth import require_password
-from data_io import load_data, load_resolutions, diagnostics
+from data_io import load_data, load_reviews, diagnostics
 from rollup import CORRIDORS, DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX, \
                    PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN
 import views as v
@@ -38,7 +38,7 @@ require_password()
 with st.spinner("Loading data…"):
     try:
         submissions_raw, batch_codes, subs = load_data()
-        resolutions = load_resolutions()
+        reviews = load_reviews()
     except RuntimeError as e:
         st.error(str(e))
         st.stop()
@@ -78,10 +78,10 @@ with col_refresh:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Refresh"):
         load_data.clear()
-        load_resolutions.clear()
+        load_reviews.clear()
         st.rerun()
 
-ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, resolutions)
+ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, reviews)
 
 st.sidebar.header("Filters (tabs 1 & 2)")
 dates = sorted(set(ledger_all["_date"].dropna()) | set(subs["ride_date"].dropna())) if not ledger_all.empty else \
@@ -125,30 +125,47 @@ with tab1:
     ledger, ledger_css = filter_ledger(ledger_all, ledger_css_all)
 
     counts = ledger["_tags"].explode().value_counts() if not ledger.empty else pd.Series(dtype=int)
-    cols = st.columns(8)
+    cols = st.columns(6)
     cols[0].metric("Planned rides", len(ledger))
-    for c, s_ in zip(cols[1:], ["Done as planned", "Wrong code selected", "Design problem", "Duplicate E1",
-                                "To confirm", "Supervisor only", "Not submitted"]):
-        c.metric(s_, int(counts.get(s_, 0)))
-    st.caption("A ride can have several issues, so these counts can add up to more than the number of rides.")
+    cols[1].metric("Done as planned", int(counts.get("Done as planned", 0)))
+    cols[2].metric("Not reviewed yet", int(ledger["_needs_decision"].sum()) if not ledger.empty else 0,
+                   help="Rides with a flagged difference that has no decision in the reviews tab")
+    cols[3].metric("Reviewed", int(ledger["Review status"].str.startswith("✓").sum()) if not ledger.empty else 0,
+                   help="Every flagged difference on the ride has a decision (approved / fixed)")
+    cols[4].metric("Fix needed", int(ledger["_fix_needed"].sum()) if not ledger.empty else 0,
+                   help="You decided this needs communicating to the enumerator(s)")
+    cols[5].metric("Not submitted", int(counts.get("Not submitted", 0)))
+    st.caption(" · ".join(f"{k}: {int(counts.get(k, 0))}" for k in
+                          ["Wrong code selected", "Design problem", "Duplicate E1", "To confirm", "Supervisor only"]
+                          if counts.get(k, 0)) or "No open flags.")
 
-    f1, f2 = st.columns([4, 1])
+    f1, f2 = st.columns([3, 2])
     with f1:
         sel_status = st.multiselect("Show status", list(v.STATUS_RANK), default=[],
                                     placeholder="All statuses", key="status_f")
     with f2:
-        hide_resolved = st.checkbox("Hide resolved", value=False,
-                                    disabled=resolutions.empty,
-                                    help="Needs a 'resolutions' tab (batch_code, resolution) in the Sheet.")
+        sel_review = st.selectbox("Review", ["All rides", "Not reviewed yet", "Reviewed", "Fix needed"],
+                                  key="review_f")
     m = pd.Series(True, index=ledger.index)
     if sel_status:
         m &= ledger["_tags"].map(lambda tags: any(x in tags for x in sel_status))
-    if hide_resolved:
-        m &= ledger["Resolution"] == ""
-    if resolutions.empty and "Resolution" in ledger.columns:
-        ledger, ledger_css = ledger.drop(columns="Resolution"), ledger_css.drop(columns="Resolution")
+    if sel_review == "Not reviewed yet":
+        m &= ledger["_needs_decision"]
+    elif sel_review == "Reviewed":
+        m &= ledger["Review status"].str.startswith("✓")
+    elif sel_review == "Fix needed":
+        m &= ledger["_fix_needed"]
+    if reviews.empty:
+        st.info("To approve planned changes or mark fixes, add a **reviews** tab to the Google Sheet "
+                "and its CSV link as `reviews_url` in the Streamlit secrets — see *How to record decisions* below.")
     show(ledger[m], ledger_css[m])
     download(ledger[m], "ride_verification.csv", "dl_ledger")
+
+    fixes = v.fixes_to_communicate(subs, batch_codes, reviews)
+    if not fixes.empty:
+        with st.expander(f"🔧 Fixes to communicate to enumerators ({len(fixes)})", expanded=True):
+            show(fixes)
+            download(fixes, "fixes_to_communicate.csv", "dl_fixes")
 
     st.markdown("#### Forms that don't match any planned ride")
     unmatched = v.unmatched_submissions(filter_subs(subs), batch_codes)
@@ -169,7 +186,7 @@ form** — not only the planned code picked from the list. A ride can carry seve
 
 | Status | Meaning | What to do |
 |---|---|---|
-| 🔴 **Wrong code selected** | A form's team/ride # point to a different planned ride than the code it selected. Flagged on both rows — where it was filed and where it belongs (see *Code selection*) | Correct the planned code in the data / note it in the resolutions tab |
+| 🔴 **Wrong code selected** | A form describing this ride (by its date, team and ride #) was filed under another planned code. The form is counted here only; the row it was filed under shows a grey note in *Code selection* but is not flagged | Decide: Fix needed or Fixed |
 | 🔴 **Design problem** | The actual code has a different treatment, corridor or direction, or no readable code | Act now: the ride may not count for the design |
 | 🔴 **Duplicate E1** | More than one E1 form describes this ride | Same person → keep one; different people → two E1s on one ride, or a wrong code |
 | 🔵 **To confirm** | Date, team, marketer ID or ride # differ from plan | Confirm with the team |
@@ -184,6 +201,35 @@ marketer ID or ride # differs. If forms disagree, both values are shown ("A / B"
 **E1 form / Supervisor form** show who submitted for the ride (✗ = missing).
 **What changed** lists planned → actual for each part that differs (one entry per form when there are several).
 **Forms that don't match** lists forms whose selected planned code is not in the batch_codes tab.
+A **✓** after a status means you've recorded a decision for every issue behind it — the flag stays, so the
+history is kept, but you know it's been dealt with. **Review status** sums this up per ride: *Not reviewed*,
+*Partly reviewed*, *✓ Reviewed (approved / fixed)* or 🟣 *Fix needed* (still to communicate or correct).
+**Review notes** shows each decision and its note.
+
+**Needs decision on** lists the issues on that ride you haven't reviewed yet — use these exact names in the reviews tab.
+""")
+
+    with st.expander("How to record decisions (approve planned changes, mark fixes)"):
+        st.markdown("""
+Add a tab called **reviews** to the Google Sheet with these columns, one row per decision:
+
+| batch_code | issue | decision | note | reviewed_by | date |
+|---|---|---|---|---|---|
+| 051020261000EPCT2N | Route | Approved | Route blocked — team moved to EEBL | Sofia | 05/10/2026 |
+| 051020262000MTEP1N | Treatment | Fix needed | Remind Daniel: ride 1 was Normal, not Script | Sofia | 06/10/2026 |
+| 051020261000CTEP3N | Wrong code | Fixed | Cecil told; code corrected in cleaning | Sofia | 06/10/2026 |
+
+- **batch_code** — the *planned* code (first column of the table above).
+- **issue** — `Route`, `Treatment`, `Date`, `Team`, `Mkt ID`, `Ride #`, `Batch code`, `Wrong code`,
+  `Duplicate E1`, `Missing form`, or `All` (everything on that ride).
+- **decision** — the flag always stays visible; the decision marks it as reviewed:
+  `Approved` (planned change — doesn't count against the enumerator) ·
+  `Fix needed` (to communicate — appears in *Fixes to communicate* and the enumerator's feedback card) ·
+  `Fixed` (dealt with — still counts in the enumerator's batch-code score).
+- If you add a later row for the same batch_code + issue, the later one wins — so you can go Fix needed → Fixed.
+
+Then publish that tab as CSV (same way as the other tabs) and add the link as `reviews_url` in
+Streamlit → Settings → Secrets. Changes show up within 5 minutes, or press 🔄 Refresh.
 """)
 
 # ---------------------------------------------------------------------------
@@ -254,7 +300,7 @@ with tab3:
                "(supervisor observations) and **agreement** (supervisor's independent record vs theirs). "
                f"Shares below {v.PERF_TARGET:.0%} are red.")
 
-    e1m, supm = v.performance_records(subs)
+    e1m, supm = v.performance_records(subs, batch_codes, reviews)
     weeks = sorted(set(e1m["week_start"].dropna() if not e1m.empty else [])
                    | set(supm["week_start"].dropna() if not supm.empty else []))
     if not weeks:
@@ -273,7 +319,7 @@ with tab3:
             st.markdown(f"""
 | Measure | Share of … | Source |
 |---|---|---|
-| Batch code as planned | E1 forms whose actual code equals the planned code | E1 form |
+| Batch code correct | E1 forms filed under the right planned code with an actual code matching the plan (differences you approved as planned changes don't count against) | E1 form |
 | Timing targets met | E1 forms with no timing flag (delay, ann./signup, pause/pitch, ride length) | E1 form |
 | Flags explained | E1 forms with flags where every flag has a reason or external disruption | E1 form |
 | Complete data | E1 forms with all core values present and no impossible timestamps | E1 form |
@@ -331,7 +377,7 @@ Sign-up totals are deliberately left out: they depend heavily on route and passe
             pr, pr_css = v.performance_by_ride(subs, e1m, supm, sel_weeks, [pid])
             show(pr, pr_css)
 
-            card = v.feedback_card(e1m, supm, pid, sel_weeks)
+            card = v.feedback_card(e1m, supm, pid, sel_weeks, fixes)
             with st.expander("📝 Feedback card (to share with the enumerator)", expanded=False):
                 st.markdown(card)
             safe = "".join(ch if ch.isalnum() else "_" for ch in who)

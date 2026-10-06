@@ -37,6 +37,7 @@ RED  = "color: #CC0000; font-weight: 600"
 BLUE = "color: #0055AA; font-weight: 600"
 GRAY = "color: #888888"
 GREEN = "color: #1E7B34; font-weight: 600"
+PURPLE = "color: #7B2CBF; font-weight: 600"
 
 TIME_GAP_MAX    = 2    # min — E1 vs supervisor checkpoint gap that needs review
 PAIR_WINDOW_MIN = 20   # min — supervisor form paired with an E1 form if ride starts are this close
@@ -203,37 +204,100 @@ def decode_c10(v) -> str:
 # ---------------------------------------------------------------------------
 
 def code_changes(row) -> list:
-    """[(severity, text)] — severity 'design' (wrong ride) or 'confirm' (check with team)."""
+    """
+    [(severity, text, part)] — severity 'design' (wrong ride for the design) or
+    'confirm' (check with team); part is the batch-code component that differs
+    (Treatment, Route, Date, Team, Mkt ID, Ride #, Batch code) — the name used in
+    the reviews tab.
+    """
     actual = _txt(row.get("actual_batch_code"))
     if not actual:
-        return [("design", "No actual batch code")]
+        return [("design", "No actual batch code", "Batch code")]
     if not _true(row.get("a_parse_ok")):
-        return [("design", f"Actual code unreadable ({actual})")]
+        return [("design", f"Actual code unreadable ({actual})", "Batch code")]
     if not _true(row.get("p_parse_ok")):
-        return [("confirm", "Planned code unreadable")]
+        return [("confirm", "Planned code unreadable", "Batch code")]
 
     g = lambda k: _txt(row.get(k))
     out = []
     if g("p_treatment") != g("a_treatment"):
         out.append(("design", f"Treatment {TREAT.get(g('p_treatment'), g('p_treatment'))}"
-                              f"→{TREAT.get(g('a_treatment'), g('a_treatment'))}"))
+                              f"→{TREAT.get(g('a_treatment'), g('a_treatment'))}", "Treatment"))
     if g("p_corridor") != g("a_corridor"):
-        out.append(("design", f"Corridor {g('p_route')}→{g('a_route')}"))
+        out.append(("design", f"Corridor {g('p_route')}→{g('a_route')}", "Route"))
     elif g("p_route") != g("a_route"):
-        out.append(("design", f"Direction {g('p_route')}→{g('a_route')}"))
+        out.append(("design", f"Direction {g('p_route')}→{g('a_route')}", "Route"))
     if g("p_date") != g("a_date"):
-        out.append(("confirm", f"Date {fmt_code_date(g('p_date'))}→{fmt_code_date(g('a_date'))}"))
+        out.append(("confirm", f"Date {fmt_code_date(g('p_date'))}→{fmt_code_date(g('a_date'))}", "Date"))
     if g("p_team") != g("a_team"):
-        out.append(("confirm", f"Team {g('p_team')}→{g('a_team')}"))
+        out.append(("confirm", f"Team {g('p_team')}→{g('a_team')}", "Team"))
     if g("p_mkt_id") != g("a_mkt_id"):
-        out.append(("confirm", f"Mkt ID {g('p_mkt_id')}→{g('a_mkt_id')}"))
+        out.append(("confirm", f"Mkt ID {g('p_mkt_id')}→{g('a_mkt_id')}", "Mkt ID"))
     if g("p_ride_num") != g("a_ride_num"):
-        out.append(("confirm", f"Ride # {g('p_ride_num')}→{g('a_ride_num')}"))
+        out.append(("confirm", f"Ride # {g('p_ride_num')}→{g('a_ride_num')}", "Ride #"))
     return out
 
 
 def _changes_text(ch: list) -> str:
-    return "; ".join(t for _, t in ch) if ch else "As planned"
+    return "; ".join(c[1] for c in ch) if ch else "As planned"
+
+
+# ---------------------------------------------------------------------------
+# Reviews — decisions you record about flagged differences
+# ---------------------------------------------------------------------------
+# A "reviews" tab in the Google Sheet, one row per decision:
+#   batch_code | issue | decision | note | reviewed_by | date
+# issue    : Route, Treatment, Date, Team, Mkt ID, Ride #, Batch code,
+#            Wrong code, Duplicate E1, Missing form — or All
+# decision : Approved   — a planned/accepted change: no longer a flag
+#            Fix needed — a mistake to communicate to the enumerator(s): stays flagged
+#            Fixed      — the mistake has been dealt with / data corrected: no longer a flag
+# Later rows override earlier ones for the same batch_code + issue.
+
+ISSUE_ALIASES = {
+    "route": "Route", "corridor": "Route", "direction": "Route",
+    "treatment": "Treatment", "date": "Date", "team": "Team",
+    "mkt id": "Mkt ID", "mkt_id": "Mkt ID", "marketer": "Mkt ID", "marketer id": "Mkt ID",
+    "ride #": "Ride #", "ride": "Ride #", "ride number": "Ride #", "ride_num": "Ride #",
+    "batch code": "Batch code", "code": "Batch code",
+    "wrong code": "Wrong code", "wrong code selected": "Wrong code",
+    "duplicate": "Duplicate E1", "duplicate e1": "Duplicate E1",
+    "missing form": "Missing form", "supervisor only": "Missing form", "not submitted": "Missing form",
+    "all": "All", "": "All",
+}
+DECISION_ALIASES = {
+    "approved": "Approved", "approve": "Approved", "planned": "Approved", "planned change": "Approved",
+    "ok": "Approved", "accepted": "Approved",
+    "fix needed": "Fix needed", "fix": "Fix needed", "communicate": "Fix needed", "to fix": "Fix needed",
+    "fixed": "Fixed", "resolved": "Fixed", "corrected": "Fixed", "done": "Fixed",
+}
+DESIGN_PARTS  = {"Treatment", "Route", "Batch code"}
+CONFIRM_PARTS = {"Date", "Team", "Mkt ID", "Ride #"}
+
+
+def review_map(reviews: pd.DataFrame | None) -> dict:
+    """{planned code: {issue: {'decision', 'note', 'by'}}} from the reviews tab."""
+    out = {}
+    if reviews is None or reviews.empty:
+        return out
+    cols = {c.strip().lower().replace(" ", "_"): c for c in reviews.columns}
+    get = lambda r, k: _txt(r.get(cols[k])) if k in cols else ""
+    if "batch_code" not in cols or "decision" not in cols:
+        return out
+    for _, r in reviews.iterrows():
+        code = get(r, "batch_code")
+        dec = DECISION_ALIASES.get(get(r, "decision").lower())
+        if not code or not dec:
+            continue
+        issue = ISSUE_ALIASES.get(get(r, "issue").lower(), get(r, "issue"))
+        out.setdefault(code, {})[issue] = {"decision": dec, "note": get(r, "note"),
+                                           "by": get(r, "reviewed_by")}
+    return out
+
+
+def _review_for(rmap: dict, code: str, part: str):
+    d = rmap.get(code, {})
+    return d.get(part) or d.get("All")
 
 
 def _names(series) -> str:
@@ -297,7 +361,7 @@ def _role_short(role):
 
 
 def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
-                resolutions: pd.DataFrame | None = None):
+                reviews: pd.DataFrame | None = None):
     """
     One row per planned ride. Forms are assigned to the ride they describe
     (date + team + ride # on the form), so a form filed under the wrong planned
@@ -310,11 +374,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
     by_sel = {k: d for k, d in s2.groupby("batch_code")}
     empty = s2.iloc[0:0]
 
-    res_map = {}
-    if resolutions is not None and not resolutions.empty and "batch_code" in resolutions.columns:
-        rcol = next((c for c in resolutions.columns if c.lower().startswith("resolution")), None)
-        if rcol:
-            res_map = {_txt(b): _txt(r) for b, r in zip(resolutions["batch_code"], resolutions[rcol]) if _txt(b)}
+    rmap = review_map(reviews)
 
     rows = []
     for code in planned_codes(batch_codes):
@@ -328,33 +388,69 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 
         basis = e1 if len(e1) else sp
         changes = [code_changes_vs(r, code) for _, r in basis.iterrows()]
-        sev = {x for ch in changes for x, _ in ch}
 
-        tags = []
-        if len(came_in) or len(went_out):
-            tags.append("Wrong code selected")
-        if "design" in sev:
-            tags.append("Design problem")
+        # Every issue on this ride, by the name used in the reviews tab
+        parts = {c[2] for ch in changes for c in ch}
+        if len(came_in):
+            parts.add("Wrong code")
         if len(e1) > 1:
-            tags.append("Duplicate E1")
-        if "confirm" in sev and "design" not in sev:
-            tags.append("To confirm")
-        if e1.empty and not sp.empty:
-            tags.append("Supervisor only")
-        if d.empty:
-            tags.append("Not submitted")
-        if not tags:
-            tags = ["Done as planned"]
-        tags = sorted(set(tags), key=STATUS_RANK.get)
+            parts.add("Duplicate E1")
+        if e1.empty:
+            parts.add("Missing form")
+
+        # Review decisions — they never remove a flag; they mark it as reviewed
+        decisions, review_txt = {}, []
+        for part in sorted(parts):
+            rv = _review_for(rmap, code, part)
+            if rv is None:
+                continue
+            decisions[part] = rv["decision"]
+            note = f" — {rv['note']}" if rv["note"] else ""
+            by = f" ({rv['by']})" if rv["by"] else ""
+            icon = "🔧" if rv["decision"] == "Fix needed" else "✓"
+            review_txt.append(f"{icon} {part}: {rv['decision'].lower()}{note}{by}")
+        undecided = sorted(p_ for p_ in parts if p_ not in decisions and p_ != "Missing form")
+        fix_needed = "Fix needed" in decisions.values()
+
+        # Which issue parts produce which status
+        tag_parts = {}
+        if "Wrong code" in parts:
+            tag_parts["Wrong code selected"] = {"Wrong code"}
+        if parts & DESIGN_PARTS:
+            tag_parts["Design problem"] = parts & DESIGN_PARTS
+        if "Duplicate E1" in parts:
+            tag_parts["Duplicate E1"] = {"Duplicate E1"}
+        if parts & CONFIRM_PARTS and not parts & DESIGN_PARTS:
+            tag_parts["To confirm"] = parts & CONFIRM_PARTS
+        if "Missing form" in parts:
+            tag_parts["Supervisor only" if not sp.empty else "Not submitted"] = {"Missing form"}
+        if not tag_parts:
+            tag_parts["Done as planned"] = set()
+        tags = sorted(tag_parts, key=STATUS_RANK.get)
+        # A status is "reviewed" (✓) when every issue behind it has a decision
+        tag_reviewed = {t_: bool(ps) and all(x in decisions for x in ps) for t_, ps in tag_parts.items()}
+
+        relevant = {p_ for p_ in parts if p_ != "Missing form" or p_ in decisions}
+        if not relevant:
+            review_status = "—"
+        elif fix_needed:
+            review_status = "🔧 Fix needed" + (" · not all reviewed" if undecided else "")
+        elif undecided and decisions:
+            review_status = "Partly reviewed"
+        elif undecided:
+            review_status = "Not reviewed"
+        else:
+            kinds = sorted({d_.lower() for d_ in decisions.values()})
+            review_status = "✓ Reviewed (" + " / ".join(kinds) + ")"
 
         # Code selection notes
         notes = []
         for _, f in came_in.iterrows():
             notes.append(f"{_role_short(f['role'])} form ({_txt(f['person'])}, team {_code(f.get('a02a_r'))} "
                          f"ride {_code(f.get('a04_r'))}) was filed under {_txt(f['batch_code'])}")
-        for _, f in went_out.iterrows():
-            notes.append(f"{_role_short(f['role'])} form ({_txt(f['person'])}) filed here is team "
-                         f"{_code(f.get('a02a_r'))} ride {_code(f.get('a04_r'))} → belongs to {f['_likely']}")
+        moved = [f"{_role_short(f['role'])} form by {_txt(f['person'])} chose this code but is "
+                 f"{fmt_day(f['ride_date'])}, team {_code(f.get('a02a_r'))} ride {_code(f.get('a04_r'))} "
+                 f"→ counted under {f['_likely']}" for _, f in went_out.iterrows()]
         if len(e1) > 1:
             people = [_txt(x) for x in e1["person"]]
             if len(set(people)) == 1:
@@ -391,7 +487,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 
         last = d["submitted_at"].max() if not d.empty else pd.NaT
         rows.append({
-            "Status":         " + ".join(tags),
+            "Status":         " + ".join(f"{t_} ✓" if tag_reviewed[t_] else t_ for t_ in tags),
+            "Review status":  review_status,
             "Planned code":   code,
             "Actual code(s)": ", ".join(_txt(c) for c in basis["actual_batch_code"]) or "—",
             "Date":           actual("a_date", fmt_code_date),
@@ -402,10 +499,14 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             "Treatment":      actual("a_treatment", lambda x: TREAT.get(x, x)),
             "E1 form":        e1_col,
             "Supervisor form": sup_col,
-            "Code selection": "; ".join(notes) or "—",
+            "Code selection": "; ".join(notes + [f"({m})" for m in moved]) or "—",
+            "_code_flag":     bool(notes and any("filed under" in n for n in notes)),
             "What changed":   what,
             "Last submitted": last.strftime("%d %b %H:%M") if pd.notna(last) else "",
-            "Resolution":     res_map.get(code, ""),
+            "Review notes":   "; ".join(review_txt) or "—",
+            "Needs decision on": ", ".join(undecided) or "—",
+            "_needs_decision": bool(undecided),
+            "_fix_needed":    fix_needed,
             "_tags":          tags,
             "_corridor":      p["corridor"],
             "_date":          pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce"),
@@ -435,12 +536,43 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
     for col, style in [("Treatment", RED), ("Route", RED),
                        ("Date", BLUE), ("Team", BLUE), ("Mkt ID", BLUE), ("Ride #", BLUE)]:
         css.loc[t["_diff"].map(lambda dd: dd[col]), col] = style
-    css.loc[t["Code selection"] != "—", "Code selection"] = RED
+    css.loc[t["Code selection"] != "—", "Code selection"] = GRAY
+    css.loc[t["_code_flag"], "Code selection"] = RED
     css.loc[t["E1 form"].str.startswith("✗") & ~not_sub, "E1 form"] = RED
     css.loc[t["E1 form"].str.contains("×", regex=False), "E1 form"] = RED
     css.loc[t["_tags"].map(lambda x: "Design problem" in x), "What changed"] = RED
     css.loc[t["_tags"].map(lambda x: "To confirm" in x), "What changed"] = BLUE
+    css.loc[t["Review status"].str.startswith("✓"), "Review status"] = GREEN
+    css.loc[t["Review status"].isin(["Not reviewed", "Partly reviewed"]), "Review status"] = RED
+    css.loc[t["_fix_needed"], "Review status"] = PURPLE
+    css.loc[t["_needs_decision"], "Needs decision on"] = RED
     return t, css
+
+
+def fixes_to_communicate(subs: pd.DataFrame, batch_codes: pd.DataFrame,
+                         reviews: pd.DataFrame | None) -> pd.DataFrame:
+    """One row per 'Fix needed' decision, with the E1(s) on that ride — the list to share."""
+    rmap = review_map(reviews)
+    if not rmap:
+        return pd.DataFrame()
+    eff = effective_codes(subs, batch_codes)
+    s2 = subs.assign(_eff=eff["eff_code"])
+    rows = []
+    for code, issues in rmap.items():
+        for issue, rv in issues.items():
+            if rv["decision"] != "Fix needed":
+                continue
+            d = s2[(s2["_eff"] == code) & (s2["role"] == E1)]
+            if d.empty:
+                d = s2[s2["_eff"] == code]
+            p = parse_batch_code(code)
+            rows.append({"Ride date": fmt_code_date(p["date"]), "Planned code": code,
+                         "Enumerator 1": _names(d["e1_name"]) or "—",
+                         "Supervisor": _names(d.loc[d["role"] == SUP, "person"]) or "—",
+                         "Issue": issue, "What to communicate": rv["note"] or "—",
+                         "Decided by": rv["by"] or "—",
+                         "_e1_ids": list(dict.fromkeys(d["e1_id"].dropna()))})
+    return pd.DataFrame(rows)
 
 
 def unmatched_submissions(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFrame:
@@ -685,7 +817,7 @@ def crosscheck_table(subs: pd.DataFrame):
 # Each metric is a share of rides: numerator / denominator, pooled over the period.
 
 E1_METRICS = [
-    ("Batch code as planned", "code_ok"),
+    ("Batch code correct",    "code_ok"),
     ("Timing targets met",    "timing_ok"),
     ("Flags explained",       "explained"),
     ("Complete data",         "complete"),
@@ -705,11 +837,31 @@ def _bin(v, yes=("1",), no=("0",)):
     return 1.0 if c in yes else 0.0 if c in no else np.nan
 
 
-def performance_records(subs: pd.DataFrame):
-    """(e1m, supm): one row per form with 0/1 metric values (NaN = not assessed)."""
+def performance_records(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+                        reviews: pd.DataFrame | None = None):
+    """
+    (e1m, supm): one row per form with 0/1 metric values (NaN = not assessed).
+
+    "Batch code correct" (code_ok) = the E1 picked the right planned code AND the
+    actual code matches the plan, except for differences you marked Approved in
+    the reviews tab (planned changes). Fix needed / Fixed / unreviewed still count.
+    """
     e1 = subs[subs["role"] == E1]
+    rmap = review_map(reviews)
+    eff = effective_codes(subs, batch_codes) if batch_codes is not None else None
     e1_rows = []
     for _, r in e1.iterrows():
+        if eff is not None:
+            code = eff.at[_, "eff_code"]
+            parts = {c[2] for c in code_changes_vs(r, code)} if _txt(code) else {"Batch code"}
+            if eff.at[_, "misfiled"]:
+                parts.add("Wrong code")
+            parts = {p_ for p_ in parts
+                     if not ((rv := _review_for(rmap, code, p_)) and rv["decision"] == "Approved")}
+            code_ok = 0.0 if parts else 1.0
+        else:
+            f = _num(r.get("flag_batch_code_different"))
+            code_ok = np.nan if np.isnan(f) else 1.0 - f
         a = assess_issues(r)
         timing_flags = [r.get(f) for f, _, _ in ISSUE_DEFS if f != "flag_7_low_signup"]
         assessed = [f for f in timing_flags if not np.isnan(_num(f))]
@@ -720,7 +872,7 @@ def performance_records(subs: pd.DataFrame):
             "_idx": _,
             "e1_id": r["e1_id"], "e1_name": r["e1_name"], "week_start": r["week_start"],
             "ride_date": r["ride_date"], "batch_code": r["batch_code"],
-            "code_ok":   1.0 - _num(r.get("flag_batch_code_different")) if not np.isnan(_num(r.get("flag_batch_code_different"))) else np.nan,
+            "code_ok":   code_ok,
             "timing_ok": (0.0 if any(_num(f) == 1 for f in assessed) else 1.0) if assessed else np.nan,
             "explained": (1.0 if a["n_expl"] == a["n_flag"] else 0.0) if a["n_flag"] else np.nan,
             "complete":  1.0 if core_ok and not impossible else 0.0,
@@ -926,7 +1078,7 @@ def ride_history(subs, pid) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def feedback_card(e1m, supm, pid, weeks=None) -> str:
+def feedback_card(e1m, supm, pid, weeks=None, fixes: pd.DataFrame | None = None) -> str:
     """Markdown feedback summary for one enumerator over the chosen weeks."""
     names = _people(e1m, supm)
     name = names.get(pid, str(pid))
@@ -966,6 +1118,13 @@ def feedback_card(e1m, supm, pid, weeks=None) -> str:
         L += ["", "## Flagged values with no explanation recorded"]
         L += [f"- {fmt_day(d)} · {c}: {', '.join(i.replace(' (no reason)', '') for i in items)}"
               for d, c, items in unexplained] or ["- None"]
+
+    if fixes is not None and not fixes.empty:
+        mine = fixes[fixes["_e1_ids"].map(lambda ids: pid in ids)]
+        if not mine.empty:
+            L += ["", "## Batch code / form corrections"]
+            L += [f"- {r['Ride date']} · {r['Planned code']} — {r['Issue']}: {r['What to communicate']}"
+                  for _, r in mine.iterrows()]
 
     if not b.empty:
         comments = [(r.ride_date, r.supervisor, r.strengths, r.improvements) for r in b.itertuples()

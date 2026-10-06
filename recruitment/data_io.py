@@ -84,18 +84,24 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 @st.cache_data(ttl=300)
-def load_resolutions() -> pd.DataFrame:
+def load_reviews() -> pd.DataFrame:
     """
-    Optional 'resolutions' tab: columns batch_code, resolution (free text),
-    and anything else you like (resolved_by, date). Add its CSV export URL as
-    resolutions_url in secrets to enable. Returns an empty frame if not set.
+    Optional 'reviews' tab — your decisions about flagged differences:
+        batch_code | issue | decision | note | reviewed_by | date
+    (see views.review_map for accepted values). Add the tab's CSV export URL as
+    reviews_url in secrets to enable. Returns an empty frame if not set.
     """
-    try:
-        url = st.secrets["resolutions_url"]
-    except Exception:
+    url = None
+    for key in ("reviews_url", "resolutions_url"):
+        try:
+            url = st.secrets[key]
+            break
+        except Exception:
+            continue
+    if not url:
         return pd.DataFrame()
     try:
-        return _read_tab(url, "resolutions")
+        return _read_tab(url, "reviews")
     except RuntimeError:
         return pd.DataFrame()
 
