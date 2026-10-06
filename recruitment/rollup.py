@@ -55,7 +55,7 @@ PITCH_TOL_MIN        = 2    # Flag 4a/4b: tolerance either side (±2 → 23–27
 RIDE_MIN_MIN         = 35   # Flag 6: minimum expected ride duration (10 ann/signup + 25 pause/pitch)
 SIGNUP_MIN           = 14   # Flag 7: minimum expected sign-ups
 
-TEST_USERNAMES = {'testing', 'test'}   # drop these submissions
+TEST_USERNAMES = {'testing', 'test', 'skgallo@uchicago.edu'}   # drop these submissions (lowercase)
 
 # Supervisor names — choice list "supervisor" in the SurveyCTO form.
 # Update here if the roster changes (-55 = Other → supervisor_oth is used).

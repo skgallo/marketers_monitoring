@@ -45,11 +45,11 @@ PERF_TARGET     = 0.80 # performance rates below this are shown in red
 TREAT = {"S": "Script", "N": "Normal", "P": "Peddling"}
 
 STATUS_RANK = {
-    "Design problem": 0, "Duplicate E1": 1, "To confirm": 2,
-    "Supervisor only": 3, "Not submitted": 4, "Done as planned": 5,
+    "Wrong code selected": 0, "Design problem": 1, "Duplicate E1": 2, "To confirm": 3,
+    "Supervisor only": 4, "Not submitted": 5, "Done as planned": 6,
 }
 STATUS_STYLE = {
-    "Design problem": RED, "Duplicate E1": RED, "To confirm": BLUE,
+    "Wrong code selected": RED, "Design problem": RED, "Duplicate E1": RED, "To confirm": BLUE,
     "Supervisor only": BLUE, "Not submitted": GRAY, "Done as planned": GREEN,
 }
 
@@ -251,11 +251,64 @@ def planned_codes(batch_codes: pd.DataFrame) -> list:
     ))
 
 
+def _ride_lookup(batch_codes: pd.DataFrame) -> dict:
+    """{(date, team, ride #): planned code} — only keys that identify exactly one planned ride."""
+    keys = {}
+    for code in planned_codes(batch_codes):
+        p = parse_batch_code(code)
+        if p["parse_ok"]:
+            k = (pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce"), p["team"], p["ride_num"])
+            keys.setdefault(k, []).append(code)
+    return {k: v[0] for k, v in keys.items() if len(v) == 1}
+
+
+def effective_codes(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFrame:
+    """
+    Which planned ride each form actually belongs to.
+
+    The form records ride date (a01_r), team (a02a_r) and ride number (a04_r)
+    separately from the planned code picked from the list. If those identify a
+    different planned ride than the one picked, the form was filed under the
+    wrong code: likely_code is the ride it belongs to and misfiled is True.
+    eff_code = likely_code when known, else the code selected.
+    """
+    lookup = _ride_lookup(batch_codes)
+    likely = []
+    for _, r in subs.iterrows():
+        team, ride = _code(r.get("a02a_r")), _code(r.get("a04_r"))
+        likely.append(lookup.get((r["ride_date"], team, ride)) if team and ride and pd.notna(r["ride_date"]) else None)
+    out = pd.DataFrame({"likely_code": likely}, index=subs.index)
+    sel = subs["batch_code"].map(_txt)
+    out["misfiled"] = out["likely_code"].notna() & (out["likely_code"] != sel)
+    out["eff_code"] = out["likely_code"].where(out["likely_code"].notna(), sel)
+    return out
+
+
+def code_changes_vs(row, planned: str) -> list:
+    """code_changes() against a given planned code instead of the one selected on the form."""
+    r = dict(row)
+    for k, val in parse_batch_code(planned).items():
+        r[f"p_{k}"] = val
+    return code_changes(r)
+
+
+def _role_short(role):
+    return "E1" if role == E1 else "Supervisor"
+
+
 def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 resolutions: pd.DataFrame | None = None):
-    """One row per planned batch code with a single status. Returns (table, css)."""
-    groups = {k: d for k, d in subs.groupby("batch_code")}
-    empty = subs.iloc[0:0]
+    """
+    One row per planned ride. Forms are assigned to the ride they describe
+    (date + team + ride # on the form), so a form filed under the wrong planned
+    code is counted on its real ride and flagged on both rows. Status lists every
+    issue that applies, worst first. Returns (table, css).
+    """
+    eff = effective_codes(subs, batch_codes)
+    s2 = subs.assign(_eff=eff["eff_code"], _likely=eff["likely_code"], _misfiled=eff["misfiled"])
+    by_eff = {k: d for k, d in s2.groupby("_eff")}
+    by_sel = {k: d for k, d in s2.groupby("batch_code")}
+    empty = s2.iloc[0:0]
 
     res_map = {}
     if resolutions is not None and not resolutions.empty and "batch_code" in resolutions.columns:
@@ -266,25 +319,49 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
     rows = []
     for code in planned_codes(batch_codes):
         p = parse_batch_code(code)
-        d = groups.get(code, empty)
+        d = by_eff.get(code, empty)                       # forms that describe this ride
         e1 = d[d["role"] == E1].sort_values("submitted_at")
         sp = d[d["role"] == SUP].sort_values("submitted_at")
-        basis = e1 if len(e1) else sp
-        changes = [code_changes(r) for _, r in basis.iterrows()]
-        sev = {s for ch in changes for s, _ in ch}
+        came_in = d[d["_misfiled"]]                       # belong here, filed under another code
+        sel = by_sel.get(code, empty)
+        went_out = sel[sel["_misfiled"]]                  # filed here, belong to another ride
 
+        basis = e1 if len(e1) else sp
+        changes = [code_changes_vs(r, code) for _, r in basis.iterrows()]
+        sev = {x for ch in changes for x, _ in ch}
+
+        tags = []
+        if len(came_in) or len(went_out):
+            tags.append("Wrong code selected")
+        if "design" in sev:
+            tags.append("Design problem")
+        if len(e1) > 1:
+            tags.append("Duplicate E1")
+        if "confirm" in sev and "design" not in sev:
+            tags.append("To confirm")
+        if e1.empty and not sp.empty:
+            tags.append("Supervisor only")
         if d.empty:
-            status = "Not submitted"
-        elif e1.empty:
-            status = "Supervisor only"
-        elif "design" in sev:
-            status = "Design problem"
-        elif len(e1) > 1:
-            status = "Duplicate E1"
-        elif "confirm" in sev:
-            status = "To confirm"
-        else:
-            status = "Done as planned"
+            tags.append("Not submitted")
+        if not tags:
+            tags = ["Done as planned"]
+        tags = sorted(set(tags), key=STATUS_RANK.get)
+
+        # Code selection notes
+        notes = []
+        for _, f in came_in.iterrows():
+            notes.append(f"{_role_short(f['role'])} form ({_txt(f['person'])}, team {_code(f.get('a02a_r'))} "
+                         f"ride {_code(f.get('a04_r'))}) was filed under {_txt(f['batch_code'])}")
+        for _, f in went_out.iterrows():
+            notes.append(f"{_role_short(f['role'])} form ({_txt(f['person'])}) filed here is team "
+                         f"{_code(f.get('a02a_r'))} ride {_code(f.get('a04_r'))} → belongs to {f['_likely']}")
+        if len(e1) > 1:
+            people = [_txt(x) for x in e1["person"]]
+            if len(set(people)) == 1:
+                notes.append(f"{people[0]} submitted {len(e1)} E1 forms for this ride — keep one")
+            else:
+                notes.append(f"{len(e1)} E1 forms by different enumerators ({', '.join(people)}) — "
+                             f"two E1s on one ride, or a wrong code")
 
         if len(basis) > 1:
             what = " | ".join(f"Form {i + 1}: {_changes_text(ch)}" for i, ch in enumerate(changes))
@@ -292,17 +369,18 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             what = _changes_text(changes[0])
         else:
             what = ""
-        if status == "Supervisor only":
-            what = f"No E1 form. Supervisor code: {what}"
 
-        e1_names = _names(e1["person"])
-        if not e1_names and not sp.empty:
+        if len(e1):
+            names = _names(e1["person"])
+            e1_col = f"✓ {names}" + (f" (×{len(e1)})" if len(e1) > 1 else "")
+        else:
             observed = _names(sp["e1_name"])
-            e1_names = f"{observed} (no E1 form)" if observed else ""
+            e1_col = "✗ none" + (f" (supervisor observed {observed})" if observed else "")
+        sup_col = f"✓ {_names(sp['person'])}" if len(sp) else "✗ none"
 
         last = d["submitted_at"].max() if not d.empty else pd.NaT
         rows.append({
-            "Status":         status,
+            "Status":         " + ".join(tags),
             "Planned code":   code,
             "Date":           fmt_code_date(p["date"]),
             "Team":           p["team"] or "",
@@ -310,29 +388,32 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             "Route":          p["route"] or "",
             "Ride #":         p["ride_num"] or "",
             "Treatment":      TREAT.get(p["treatment"], p["treatment"] or ""),
-            "E1 forms":       len(e1),
-            "Enumerator 1":   e1_names,
-            "Supervisor":     _names(sp["person"]),
+            "E1 form":        e1_col,
+            "Supervisor form": sup_col,
+            "Code selection": "; ".join(notes) or "—",
             "Actual code(s)": ", ".join(_txt(c) for c in basis["actual_batch_code"]),
             "What changed":   what,
             "Last submitted": last.strftime("%d %b %H:%M") if pd.notna(last) else "",
             "Resolution":     res_map.get(code, ""),
+            "_tags":          tags,
             "_corridor":      p["corridor"],
             "_date":          pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce"),
-            "_rank":          STATUS_RANK[status],
+            "_rank":          STATUS_RANK[tags[0]],
         })
 
     t = pd.DataFrame(rows)
     if t.empty:
         return t, _empty_css(t)
-    t = t.sort_values(["_date", "_rank", "Planned code"]).reset_index(drop=True)
+    t = t.sort_values(["_date", "Team", "Ride #", "Planned code"]).reset_index(drop=True)
     css = _empty_css(t)
-    css["Status"] = t["Status"].map(STATUS_STYLE).fillna("")
-    css.loc[t["Status"].isin(["Design problem"]), "What changed"] = RED
-    css.loc[t["Status"].isin(["To confirm", "Supervisor only"]), "What changed"] = BLUE
-    css.loc[t["Status"] == "Duplicate E1", "E1 forms"] = RED
-    css.loc[t["Status"] == "Not submitted"] = GRAY
-    css["Status"] = t["Status"].map(STATUS_STYLE).fillna("")
+    not_sub = t["_tags"].map(lambda x: x == ["Not submitted"])
+    css.loc[not_sub] = GRAY
+    css["Status"] = t["_tags"].map(lambda x: STATUS_STYLE.get(x[0], ""))
+    css.loc[t["Code selection"] != "—", "Code selection"] = RED
+    css.loc[t["E1 form"].str.startswith("✗") & ~not_sub, "E1 form"] = RED
+    css.loc[t["E1 form"].str.contains("×", regex=False), "E1 form"] = RED
+    css.loc[t["_tags"].map(lambda x: "Design problem" in x), "What changed"] = RED
+    css.loc[t["_tags"].map(lambda x: "To confirm" in x), "What changed"] = BLUE
     return t, css
 
 
@@ -356,7 +437,8 @@ def unmatched_submissions(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.D
 def submission_log(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFrame:
     """Every form, one row each — the audit trail behind Tab 1."""
     planned = set(planned_codes(batch_codes))
-    d = subs.sort_values("submitted_at")
+    eff = effective_codes(subs, batch_codes)
+    d = subs.assign(_likely=eff["likely_code"], _mis=eff["misfiled"]).sort_values("submitted_at")
     return pd.DataFrame({
         "Submitted":      d["submitted_at"].dt.strftime("%d %b %H:%M"),
         "Ride date":      d["ride_date"].map(fmt_day),
@@ -366,6 +448,8 @@ def submission_log(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFram
         "Planned code":   d["batch_code"].map(_txt),
         "Actual code":    d["actual_batch_code"].map(_txt),
         "In plan":        d["batch_code"].map(lambda c: "Yes" if _txt(c) in planned else "No"),
+        "Team / ride on form": [f"{_code(r.get('a02a_r')) or '?'} / {_code(r.get('a04_r')) or '?'}" for _, r in d.iterrows()],
+        "Belongs to ride": [("⚠ " + l) if m else (l or "—") for l, m in zip(d["_likely"], d["_mis"])],
         "E1 forms on code": d["n_e1_forms"],
         "Code check":     [_changes_text(code_changes(r)) for _, r in d.iterrows()],
         "Form ID":        d["form_id"].map(lambda k: _txt(k)[-12:]),

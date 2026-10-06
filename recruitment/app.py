@@ -124,12 +124,13 @@ with tab1:
                "One row per planned batch code.")
     ledger, ledger_css = filter_ledger(ledger_all, ledger_css_all)
 
-    counts = ledger["Status"].value_counts() if not ledger.empty else pd.Series(dtype=int)
-    cols = st.columns(7)
+    counts = ledger["_tags"].explode().value_counts() if not ledger.empty else pd.Series(dtype=int)
+    cols = st.columns(8)
     cols[0].metric("Planned rides", len(ledger))
-    for c, s in zip(cols[1:], ["Done as planned", "To confirm", "Design problem",
-                               "Duplicate E1", "Supervisor only", "Not submitted"]):
-        c.metric(s, int(counts.get(s, 0)))
+    for c, s_ in zip(cols[1:], ["Done as planned", "Wrong code selected", "Design problem", "Duplicate E1",
+                                "To confirm", "Supervisor only", "Not submitted"]):
+        c.metric(s_, int(counts.get(s_, 0)))
+    st.caption("A ride can have several issues, so these counts can add up to more than the number of rides.")
 
     f1, f2 = st.columns([4, 1])
     with f1:
@@ -141,7 +142,7 @@ with tab1:
                                     help="Needs a 'resolutions' tab (batch_code, resolution) in the Sheet.")
     m = pd.Series(True, index=ledger.index)
     if sel_status:
-        m &= ledger["Status"].isin(sel_status)
+        m &= ledger["_tags"].map(lambda tags: any(x in tags for x in sel_status))
     if hide_resolved:
         m &= ledger["Resolution"] == ""
     if resolutions.empty and "Resolution" in ledger.columns:
@@ -163,17 +164,20 @@ with tab1:
 
     with st.expander("How statuses are assigned"):
         st.markdown("""
-Statuses are checked in this order; the first that applies is shown.
+Each form is assigned to the ride it describes, using the **date, team and ride number entered on the
+form** — not only the planned code picked from the list. A ride can carry several statuses; the worst is listed first.
 
 | Status | Meaning | What to do |
 |---|---|---|
-| 🔴 **Design problem** | An E1 form's actual code has a different treatment, corridor or direction, or no readable code | Act now: the ride may not count for the design |
-| 🔴 **Duplicate E1** | More than one E1 form selected this planned code | Decide: wrong code selected by mistake, or two E1s on the same ride |
-| 🔵 **To confirm** | Date, team, marketer ID or ride # differ from plan | Confirm with the team; record the outcome in the resolutions tab |
-| 🔵 **Supervisor only** | Supervisor form(s) but no E1 form | Chase the E1 form, or check if E1 picked another code |
-| ⚪ **Not submitted** | No form at all | Check whether the ride happened |
-| 🟢 **Done as planned** | One E1 form, actual code = planned code | — |
+| 🔴 **Wrong code selected** | A form's team/ride # point to a different planned ride than the code it selected. Flagged on both rows — where it was filed and where it belongs (see *Code selection*) | Correct the planned code in the data / note it in the resolutions tab |
+| 🔴 **Design problem** | The actual code has a different treatment, corridor or direction, or no readable code | Act now: the ride may not count for the design |
+| 🔴 **Duplicate E1** | More than one E1 form describes this ride | Same person → keep one; different people → two E1s on one ride, or a wrong code |
+| 🔵 **To confirm** | Date, team, marketer ID or ride # differ from plan | Confirm with the team |
+| 🔵 **Supervisor only** | Supervisor form(s) but no E1 form for this ride | Chase the E1 form |
+| ⚪ **Not submitted** | No form describes this ride | Check whether the ride happened |
+| 🟢 **Done as planned** | One E1 form, filed under the right code, actual code = planned code | — |
 
+**E1 form / Supervisor form** show who submitted for the ride (✗ = missing).
 **What changed** lists planned → actual for each part that differs (one entry per form when there are several).
 **Forms that don't match** lists forms whose selected planned code is not in the batch_codes tab.
 """)
