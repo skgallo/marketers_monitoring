@@ -1,517 +1,363 @@
 """
 app.py — Recruitment HFC Dashboard
 ====================================
-Passenger recruitment monitoring. One row per planned batch code.
-Values shown in red when outside acceptable range.
+Three views, each with one unit of analysis:
+
+  1 · Ride verification       one row per planned batch code
+  2 · Implementation fidelity one row per E1 form (+ supervisor cross-check)
+  3 · Enumerator performance  one row per enumerator, with weekly trends
+
+All table logic lives in views.py; this file only lays out the page.
 
 Run locally:
     streamlit run app.py
 
-Requires .streamlit/secrets.toml with:
+Requires .streamlit/secrets.toml (never committed) with:
     app_password     = "..."
     submissions_url  = "https://docs.google.com/spreadsheets/d/.../export?format=csv&gid=..."
     batch_codes_url  = "https://docs.google.com/spreadsheets/d/.../export?format=csv&gid=..."
+    resolutions_url  = "..."   # optional — see data_io.load_resolutions
 """
 
 import pandas as pd
-import numpy as np
 import streamlit as st
-import datetime as _dt
 
 from auth import require_password
-from data_io import load_data, diagnostics
-from rollup import CORRIDORS, DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, \
-                   SIGNUP_DIFF_MAX, PITCH_TARGET_MIN, PITCH_TOL_MIN, \
-                   RIDE_MIN_MIN
+from data_io import load_data, load_resolutions, diagnostics
+from rollup import CORRIDORS, DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX, \
+                   PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN
+import views as v
 
 # ---------------------------------------------------------------------------
-# Page config
+# Page setup, auth, data
 # ---------------------------------------------------------------------------
 
-st.set_page_config(
-    page_title="Recruitment HFC Dashboard",
-    page_icon="🚌",
-    layout="wide",
-)
-
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
+st.set_page_config(page_title="Recruitment HFC Dashboard", page_icon="🚌", layout="wide")
 require_password()
-
-# ---------------------------------------------------------------------------
-# Load data
-# ---------------------------------------------------------------------------
 
 with st.spinner("Loading data…"):
     try:
-        submissions_raw, batch_codes, result = load_data()
+        submissions_raw, batch_codes, subs = load_data()
+        resolutions = load_resolutions()
     except RuntimeError as e:
         st.error(str(e))
         st.stop()
 
-# ---------------------------------------------------------------------------
-# Build display table
-# ---------------------------------------------------------------------------
 
-def build_display(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    # Ride date
-    for col in ["ride_day", "ride_month", "ride_year"]:
-        out[col] = pd.to_numeric(out.get(col, pd.Series(dtype=float)), errors="coerce")
-    try:
-        out["ride_date"] = pd.to_datetime(
-            out[["ride_year", "ride_month", "ride_day"]].rename(
-                columns={"ride_year": "year", "ride_month": "month", "ride_day": "day"}
-            ), errors="coerce",
-        ).dt.date
-    except Exception:
-        out["ride_date"] = pd.NaT
-
-    # Corridor and treatment from parsed planned batch code
-    out["corridor"] = out.get("p_corridor", pd.Series(dtype=str))
-    treat_map = {"S": "Script", "N": "Normal", "P": "Peddling"}
-    out["treatment"] = out.get("p_treatment", pd.Series(dtype=str)).map(treat_map)
-
-    # Numeric measurement columns
-    for col in ["announcement_start_delay", "announcement_duration",
-                "signup_duration", "pause_duration", "ride_duration", "total_signups"]:
-        out[col] = pd.to_numeric(out.get(col, pd.Series(dtype=float)), errors="coerce")
-
-    # Batch code issues — short text label
-    def batch_issue(row):
-        if pd.isna(row.get("actual_batch_code")):
-            return ""
-        parts = []
-        if row.get("flag_design_problem") == 1:
-            parts.append("Design")
-        if row.get("flag_needs_confirmation") == 1:
-            parts.append("Confirm")
-        return ", ".join(parts)
-
-    out["batch_issue"] = out.apply(batch_issue, axis=1)
-
-    return out
+def show(t: pd.DataFrame, css: pd.DataFrame | None = None, height: int | None = None):
+    """Render a table with per-cell CSS, hiding helper columns (prefixed '_')."""
+    if t is None or t.empty:
+        st.info("Nothing to show.")
+        return
+    keep = [c for c in t.columns if not str(c).startswith("_")]
+    t = t[keep].reset_index(drop=True)
+    kwargs = dict(width="stretch", hide_index=True)
+    if height:
+        kwargs["height"] = height
+    if css is not None:
+        css = css[keep].reset_index(drop=True)
+        st.dataframe(t.style.apply(lambda _: css, axis=None), **kwargs)
+    else:
+        st.dataframe(t, **kwargs)
 
 
-display = build_display(result)
+def download(t: pd.DataFrame, name: str, key: str, label="⬇ Download CSV"):
+    keep = [c for c in t.columns if not str(c).startswith("_")]
+    st.download_button(label, t[keep].to_csv(index=False).encode("utf-8"),
+                       file_name=name, mime="text/csv", key=key)
+
 
 # ---------------------------------------------------------------------------
-# Sidebar filters
-# ---------------------------------------------------------------------------
-
-st.sidebar.header("Filters")
-
-# Date
-all_dates = sorted(display["ride_date"].dropna().unique())
-if all_dates:
-    date_opts = ["All dates"] + [str(d) for d in all_dates]
-    sel_dates = st.sidebar.multiselect("Ride date", date_opts, default=["All dates"])
-    if "All dates" not in sel_dates and sel_dates:
-        display = display[display["ride_date"].astype(str).isin(sel_dates)]
-
-# Corridor
-all_corridors = sorted(set(CORRIDORS.values()))
-sel_corridors = st.sidebar.multiselect("Corridor", all_corridors, default=all_corridors)
-if sel_corridors:
-    display = display[display["corridor"].isin(sel_corridors)]
-
-# Status
-status_filter = st.sidebar.radio(
-    "Submission status", ["All", "Submitted only", "No submission only"], index=0
-)
-if status_filter == "Submitted only":
-    display = display[display["submission_status"] == "Submitted"]
-elif status_filter == "No submission only":
-    display = display[display["submission_status"] == "No submission"]
-
-# ---------------------------------------------------------------------------
-# Header
+# Header + sidebar filters (apply to tabs 1 and 2)
 # ---------------------------------------------------------------------------
 
 col_title, col_refresh = st.columns([6, 1])
 with col_title:
     st.title("🚌 Recruitment HFC Dashboard")
-    st.caption(
-        "One row per planned batch code. "
-        "Values shown in **red** are outside the acceptable range."
-    )
 with col_refresh:
-    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Refresh"):
         load_data.clear()
+        load_resolutions.clear()
         st.rerun()
 
-# ---------------------------------------------------------------------------
-# Summary counts
-# ---------------------------------------------------------------------------
+ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, resolutions)
 
-total     = len(display)
-submitted = (display["submission_status"] == "Submitted").sum()
-no_sub    = (display["submission_status"] == "No submission").sum()
+st.sidebar.header("Filters (tabs 1 & 2)")
+dates = sorted(set(ledger_all["_date"].dropna()) | set(subs["ride_date"].dropna())) if not ledger_all.empty else \
+        sorted(set(subs["ride_date"].dropna()))
+date_labels = {v.fmt_day(d): d for d in dates}
+sel_dates = st.sidebar.multiselect("Ride date", list(date_labels), default=[],
+                                   placeholder="All dates")
+all_corridors = sorted(set(CORRIDORS.values()))
+sel_corr = st.sidebar.multiselect("Corridor", all_corridors, default=[], placeholder="All corridors")
 
-flag_cols = [c for c in display.columns if c.startswith("flag_")]
-any_flag  = display[flag_cols].apply(
-    lambda row: row.fillna(0).eq(1).any(), axis=1
-).sum()
+def filter_ledger(t, css):
+    m = pd.Series(True, index=t.index)
+    if sel_dates:
+        m &= t["_date"].isin([date_labels[d] for d in sel_dates])
+    if sel_corr:
+        m &= t["_corridor"].isin(sel_corr)
+    return t[m], css[m]
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Planned rides", total)
-c2.metric("Submitted",     submitted)
-c3.metric("No submission", no_sub)
-c4.metric("Any issue",     int(any_flag))
+def filter_subs(df):
+    m = pd.Series(True, index=df.index)
+    if sel_dates:
+        m &= df["ride_date"].isin([date_labels[d] for d in sel_dates])
+    if sel_corr:
+        corr = df["p_corridor"].fillna(df["a_corridor"])
+        m &= corr.isin(sel_corr)
+    return df[m]
 
-st.markdown("---")
+subs_f = filter_subs(subs)
+st.sidebar.caption("Tab 3 uses all dates — pick weeks inside the tab.")
 
-# ---------------------------------------------------------------------------
-# Build styled ride-by-ride table
-# ---------------------------------------------------------------------------
-
-def make_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Select and label columns for display."""
-    has_sub = df["submission_status"] == "Submitted"
-
-    def actual(col):
-        """Return actual parsed value for submitted rows, '—' otherwise."""
-        return df.get(col, pd.Series("—", index=df.index)).where(has_sub, "—").fillna("—")
-
-    MISSING = "Missing/not assessed"
-
-    def fmt(series, fmt_str="{:.2f}"):
-        """Format numeric value to 2 dp; submitted-but-missing → 'Missing/not assessed'."""
-        formatted = series.apply(lambda v: fmt_str.format(v) if pd.notna(v) else MISSING)
-        return formatted.where(has_sub, "—")
-
-    def fmt_reason(val_series, reason_col, flag_col, fmt_str="{:.2f}"):
-        """Show 'value / reason' when flagged and a reason exists; submitted-but-missing → MISSING."""
-        reasons = df.get(reason_col, pd.Series(dtype=str))
-        flags   = df.get(flag_col,   pd.Series(0, index=df.index))
-        out = []
-        for v, r, f, sub in zip(val_series, reasons, flags, has_sub):
-            if not sub:
-                out.append("—")
-            elif pd.isna(v):
-                out.append(MISSING)
-            else:
-                s = fmt_str.format(float(v))
-                if pd.notna(f) and f == 1 and pd.notna(r) and str(r).strip():
-                    s = f"{s} / {str(r).strip()}"
-                out.append(s)
-        return pd.Series(out, index=val_series.index)
-
-    # --- Action needed column ---
-    treat_map = {"S": "Script", "N": "Normal", "P": "Peddling"}
-
-    def action_text(row):
-        if not has_sub[row.name]:
-            return ""
-        red_parts = []
-        if row.get("flag_batch_treatment") == 1:
-            a = treat_map.get(str(row.get("a_treatment", "")), row.get("a_treatment", ""))
-            red_parts.append(f"treatment ({a})")
-        if row.get("flag_batch_corridor") == 1:
-            red_parts.append(f"corridor ({row.get('a_corridor', '')})")
-        if row.get("flag_batch_direction") == 1:
-            red_parts.append(f"direction ({row.get('a_route', '')})")
-        if red_parts:
-            return f"⚠ Immediate: wrong {', '.join(red_parts)}"
-        orange_parts = []
-        if row.get("flag_batch_date") == 1:
-            orange_parts.append("date")
-        if row.get("flag_batch_marketer") == 1:
-            orange_parts.append("marketer ID")
-        # Ride number difference (not a named flag — compare directly)
-        p_ride = str(row.get("p_ride_num", ""))
-        a_ride = str(row.get("a_ride_num", ""))
-        if p_ride and a_ride and p_ride != a_ride and p_ride != "None" and a_ride != "None":
-            orange_parts.append("ride number")
-        if orange_parts:
-            return f"Confirm: {', '.join(orange_parts)} changed"
-        return ""
-
-    def fmt_date(s):
-        """DDMMYYYY → '05 Oct 2026'; leave '—' unchanged."""
-        if s in ("—", "Missing/not assessed") or pd.isna(s):
-            return s
-        try:
-            return _dt.datetime.strptime(str(s).strip(), "%d%m%Y").strftime("%d %b %Y")
-        except Exception:
-            return s
-
-    t = pd.DataFrame()
-    t["Planned code"] = df["batch_code"]
-    t["Actual code"]  = actual("actual_batch_code")
-    t["Status"]       = df["submission_status"]
-    t["Enumerator"]   = df.get("username", pd.Series("—", index=df.index)).where(has_sub, "—")
-
-    # Batch code components — actual values, colored when ≠ planned
-    t["Date"]      = actual("a_date").apply(fmt_date)
-    t["Team"]      = actual("a_team")
-    t["Mkt ID"]    = actual("a_mkt_id")
-    t["Route"]     = actual("a_route")
-    t["Ride #"]    = actual("a_ride_num")
-    t["Treatment"] = actual("a_treatment").map(lambda v: treat_map.get(v, v))
-
-    t["Action needed"] = df.apply(action_text, axis=1)
-
-    # Timing columns
-    # signup_duration      = enumerator-recorded activity (flagged against 8–12 min)
-    # announcement_duration = automatic SurveyCTO form-screen timing (display only)
-    COL_DELAY    = f"Start delay\n(<{DELAY_MAX_MIN} min)"
-    COL_REC      = f"Recorded ann./\nsignup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
-    COL_AUTO     = "Auto form-\nscreen dur."
-    COL_DISCREP  = f"Timing\ndiscrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"
-    COL_PITCH    = f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
-    COL_RIDE     = f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"
-    COL_SIGNUPS  = "Signups\n(≥14)"
-
-    # Tab 1 shows values only — reasons live in Tab 2
-    t[COL_DELAY]   = fmt(df["announcement_start_delay"])
-    t[COL_REC]     = fmt(df["signup_duration"])
-    t[COL_AUTO]    = fmt(df["announcement_duration"])
-    sig  = pd.to_numeric(df.get("signup_duration",       pd.Series(dtype=float)), errors="coerce")
-    ann  = pd.to_numeric(df.get("announcement_duration", pd.Series(dtype=float)), errors="coerce")
-    diff = (sig - ann).abs().round(2)
-    t[COL_DISCREP] = fmt(diff)
-    t[COL_PITCH]   = fmt(df["pause_duration"])
-    t[COL_RIDE]    = fmt(df["ride_duration"])
-    t[COL_SIGNUPS] = fmt(df["total_signups"], "{:.0f}")
-
-    return t
-
-
-def style_table(t: pd.DataFrame, df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    """Apply red/orange/gray styling."""
-    RED  = "color: #CC0000; font-weight: 600"
-    BLUE = "color: #0055AA; font-weight: 600"   # confirmation issues (was orange)
-    GRAY = "color: #888888"
-
-    styles = pd.DataFrame("", index=t.index, columns=t.columns)
-    has_sub = df["submission_status"] == "Submitted"
-
-    # Batch code component colors
-    styles.loc[has_sub & (df.get("flag_batch_treatment", 0) == 1), "Treatment"] = RED
-    styles.loc[has_sub & (df.get("flag_batch_corridor",  0) == 1), "Route"]     = RED
-    styles.loc[has_sub & (df.get("flag_batch_direction", 0) == 1), "Route"]     = RED
-    styles.loc[has_sub & (df.get("flag_batch_date",      0) == 1), "Date"]      = BLUE
-    styles.loc[has_sub & (df.get("flag_batch_team",      0) == 1), "Team"]      = BLUE
-    styles.loc[has_sub & (df.get("flag_batch_marketer",  0) == 1), "Mkt ID"]    = BLUE
-
-    # Ride number — blue if actual ≠ planned
-    p_ride = df.get("p_ride_num", pd.Series("", index=df.index)).fillna("")
-    a_ride = df.get("a_ride_num", pd.Series("", index=df.index)).fillna("")
-    ride_diff = has_sub & (p_ride != a_ride) & (p_ride != "") & (a_ride != "")
-    styles.loc[ride_diff, "Ride #"] = BLUE
-
-    # Action needed column
-    styles.loc[t["Action needed"].str.startswith("⚠"), "Action needed"] = RED
-    styles.loc[t["Action needed"].str.startswith("Confirm"), "Action needed"] = BLUE
-
-    # Timing columns (must match make_table column names exactly)
-    COL_DELAY   = f"Start delay\n(<{DELAY_MAX_MIN} min)"
-    COL_REC     = f"Recorded ann./\nsignup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
-    COL_AUTO    = "Auto form-\nscreen dur."
-    COL_DISCREP = f"Timing\ndiscrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"
-    COL_PITCH   = f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
-    COL_RIDE    = f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"
-    COL_SIGNUPS = "Signups\n(≥14)"
-
-    delay = pd.to_numeric(df.get("announcement_start_delay", pd.Series(dtype=float)), errors="coerce")
-    styles.loc[has_sub & (delay > DELAY_MAX_MIN), COL_DELAY] = RED
-
-    # Flag recorded duration (signup_duration) against 8–12 min threshold
-    sig = pd.to_numeric(df.get("signup_duration", pd.Series(dtype=float)), errors="coerce")
-    styles.loc[has_sub & sig.notna() & ((sig < ANN_DUR_MIN) | (sig > ANN_DUR_MAX)), COL_REC] = RED
-
-    # Flag discrepancy column when |signup - announcement| > threshold
-    ann  = pd.to_numeric(df.get("announcement_duration", pd.Series(dtype=float)), errors="coerce")
-    diff = (sig - ann).abs()
-    styles.loc[has_sub & sig.notna() & ann.notna() & (diff > SIGNUP_DIFF_MAX), COL_DISCREP] = RED
-
-    pause = pd.to_numeric(df.get("pause_duration", pd.Series(dtype=float)), errors="coerce")
-    styles.loc[has_sub & pause.notna() & (abs(pause - PITCH_TARGET_MIN) > PITCH_TOL_MIN), COL_PITCH] = RED
-
-    ride = pd.to_numeric(df.get("ride_duration", pd.Series(dtype=float)), errors="coerce")
-    styles.loc[has_sub & ride.notna() & (ride < RIDE_MIN_MIN), COL_RIDE] = RED
-
-    signups = pd.to_numeric(df.get("total_signups", pd.Series(dtype=float)), errors="coerce")
-    styles.loc[has_sub & signups.notna() & (signups < 14), COL_SIGNUPS] = RED
-
-    # Gray out no-submission rows
-    no_sub_idx = df[~has_sub].index
-    for col in ["Actual code", "Date", "Team", "Mkt ID", "Route", "Ride #", "Treatment", "Action needed",
-                COL_DELAY, COL_REC, COL_AUTO, COL_DISCREP, COL_PITCH, COL_RIDE, COL_SIGNUPS]:
-        styles.loc[no_sub_idx, col] = GRAY
-
-    return t.style.apply(lambda _: styles, axis=None)
-
+tab1, tab2, tab3 = st.tabs(["1 · Ride verification", "2 · Implementation fidelity",
+                            "3 · Enumerator performance"])
 
 # ---------------------------------------------------------------------------
-# Tab 2 helper: implementation issues
+# TAB 1 — Ride verification
 # ---------------------------------------------------------------------------
-
-def make_issues_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Tab 2: one row per submitted ride, flag values + reason columns side-by-side."""
-    sub = df[df["submission_status"] == "Submitted"].copy().reset_index(drop=True)
-
-    MISSING = "Missing/not assessed"
-
-    def num(col, fmt="{:.2f}"):
-        s = pd.to_numeric(sub.get(col, pd.Series(dtype=float)), errors="coerce")
-        return s.apply(lambda v: fmt.format(v) if pd.notna(v) else MISSING)
-
-    def txt(col):
-        s = sub.get(col, pd.Series("—", index=sub.index))
-        return s.fillna("—").astype(str).replace({"nan": "—", "": "—"})
-
-    t = pd.DataFrame()
-    t["Ride"]          = sub["batch_code"]
-    t["Enumerator"]    = sub.get("username", pd.Series("—", index=sub.index)).fillna("—")
-
-    # Timing — flag value | reason (where available)
-    t[f"Start delay\n(<{DELAY_MAX_MIN} min)"]    = num("announcement_start_delay")
-    t["Delay reason"]                             = txt("announcement_delay_explanation")
-    t[f"Recorded ann./signup dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"] = num("signup_duration")
-    t[f"Auto form-screen dur."]                   = num("announcement_duration")
-    # Discrepancy between the two timing measures
-    sig2  = pd.to_numeric(sub.get("signup_duration",       pd.Series(dtype=float)), errors="coerce")
-    ann2  = pd.to_numeric(sub.get("announcement_duration", pd.Series(dtype=float)), errors="coerce")
-    diff2 = (sig2 - ann2).abs().round(2)
-    t[f"Timing discrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"] = diff2.apply(
-        lambda v: f"{v:.2f}" if pd.notna(v) else MISSING
-    )
-    t[f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"] = num("pause_duration")
-    t["Pitch reason"]                             = txt("pause_duration_explanation")
-    t[f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"]        = num("ride_duration")
-
-    # Signups
-    t["Signups\n(≥14)"]    = num("total_signups", "{:.0f}")
-    t["Signup reason"]     = txt("final_comment_lowsignup")
-
-    # Disruptions (c10 = select_multiple with numeric codes → human labels)
-    C10_LABELS = {
-        '0': "None", '1': "Bus/route interruption",
-        '2': "Passenger disruption/confrontation",
-        '3': "Marketer/pitch interruption",
-        '4': "Team, equipment or materials",
-        '5': "Recruitment paused/stopped", '-55': "Other",
-    }
-    def decode_c10(val):
-        if pd.isna(val) or str(val).strip() in ('', 'nan', '—'):
-            return "—"
-        labels = [C10_LABELS.get(c.strip(), c.strip()) for c in str(val).split()]
-        return "; ".join(labels)
-
-    t["Disruptions"]       = sub.get("c10", pd.Series("—", index=sub.index)).apply(decode_c10)
-    t["Disruption notes"]  = txt("c10a")
-
-    # Passenger questions
-    t["Pax Q1 (q00)"]     = txt("q00")
-    t["Pax Q2 (q01)"]     = txt("q01")
-
-    return t
-
-
-def style_issues_table(t: pd.DataFrame, df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    RED = "color: #CC0000; font-weight: 600"
-
-    sub = df[df["submission_status"] == "Submitted"].reset_index(drop=True)
-    styles = pd.DataFrame("", index=t.index, columns=t.columns)
-
-    COL_DELAY   = f"Start delay\n(<{DELAY_MAX_MIN} min)"
-    COL_REC     = f"Recorded ann./signup dur.\n({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
-    COL_DISCREP = f"Timing discrepancy\n(|diff|>{SIGNUP_DIFF_MAX} min)"
-    COL_PITCH   = f"Pause/Pitch\n({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
-    COL_RIDE    = f"Ride dur.\n(≥{RIDE_MIN_MIN} min)"
-    COL_SIGS    = "Signups\n(≥14)"
-
-    delay   = pd.to_numeric(sub.get("announcement_start_delay", pd.Series(dtype=float)), errors="coerce")
-    sig     = pd.to_numeric(sub.get("signup_duration",          pd.Series(dtype=float)), errors="coerce")
-    ann     = pd.to_numeric(sub.get("announcement_duration",    pd.Series(dtype=float)), errors="coerce")
-    pause   = pd.to_numeric(sub.get("pause_duration",           pd.Series(dtype=float)), errors="coerce")
-    ride    = pd.to_numeric(sub.get("ride_duration",            pd.Series(dtype=float)), errors="coerce")
-    signups = pd.to_numeric(sub.get("total_signups",            pd.Series(dtype=float)), errors="coerce")
-    diff_t  = (sig - ann).abs()
-
-    styles.loc[delay.notna() & (delay > DELAY_MAX_MIN),                         COL_DELAY]   = RED
-    styles.loc[sig.notna()   & ((sig < ANN_DUR_MIN) | (sig > ANN_DUR_MAX)),     COL_REC]     = RED
-    styles.loc[sig.notna()   & ann.notna() & (diff_t > SIGNUP_DIFF_MAX),        COL_DISCREP] = RED
-    styles.loc[pause.notna() & (abs(pause - PITCH_TARGET_MIN) > PITCH_TOL_MIN), COL_PITCH]   = RED
-    styles.loc[ride.notna()  & (ride < RIDE_MIN_MIN),                           COL_RIDE]    = RED
-    styles.loc[signups.notna() & (signups < 14),                                COL_SIGS]    = RED
-
-    return t.style.apply(lambda _: styles, axis=None)
-
-
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
-
-tab1, tab2 = st.tabs(["📋 Ride overview", "⚠️ Implementation issues"])
 
 with tab1:
-    st.subheader("Ride-by-ride monitoring")
-    t = make_table(display)
-    styled = style_table(t, display)
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption("Did each planned ride happen as planned, and if not, what still needs resolving? "
+               "One row per planned batch code.")
+    ledger, ledger_css = filter_ledger(ledger_all, ledger_css_all)
 
-    csv = t.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇ Download as CSV", data=csv,
-                       file_name="recruitment_hfc.csv", mime="text/csv")
+    counts = ledger["Status"].value_counts() if not ledger.empty else pd.Series(dtype=int)
+    cols = st.columns(7)
+    cols[0].metric("Planned rides", len(ledger))
+    for c, s in zip(cols[1:], ["Done as planned", "To confirm", "Design problem",
+                               "Duplicate E1", "Supervisor only", "Not submitted"]):
+        c.metric(s, int(counts.get(s, 0)))
+
+    f1, f2 = st.columns([4, 1])
+    with f1:
+        sel_status = st.multiselect("Show status", list(v.STATUS_RANK), default=[],
+                                    placeholder="All statuses", key="status_f")
+    with f2:
+        hide_resolved = st.checkbox("Hide resolved", value=False,
+                                    disabled=resolutions.empty,
+                                    help="Needs a 'resolutions' tab (batch_code, resolution) in the Sheet.")
+    m = pd.Series(True, index=ledger.index)
+    if sel_status:
+        m &= ledger["Status"].isin(sel_status)
+    if hide_resolved:
+        m &= ledger["Resolution"] == ""
+    if resolutions.empty and "Resolution" in ledger.columns:
+        ledger, ledger_css = ledger.drop(columns="Resolution"), ledger_css.drop(columns="Resolution")
+    show(ledger[m], ledger_css[m])
+    download(ledger[m], "ride_verification.csv", "dl_ledger")
+
+    st.markdown("#### Forms that don't match any planned ride")
+    unmatched = v.unmatched_submissions(filter_subs(subs), batch_codes)
+    if unmatched.empty:
+        st.success("Every form points to a planned batch code.")
+    else:
+        show(unmatched)
+
+    with st.expander("Full submission log — every form"):
+        log = v.submission_log(subs_f, batch_codes)
+        show(log)
+        download(log, "submission_log.csv", "dl_log")
+
+    with st.expander("How statuses are assigned"):
+        st.markdown("""
+Statuses are checked in this order; the first that applies is shown.
+
+| Status | Meaning | What to do |
+|---|---|---|
+| 🔴 **Design problem** | An E1 form's actual code has a different treatment, corridor or direction, or no readable code | Act now: the ride may not count for the design |
+| 🔴 **Duplicate E1** | More than one E1 form selected this planned code | Decide: wrong code selected by mistake, or two E1s on the same ride |
+| 🔵 **To confirm** | Date, team, marketer ID or ride # differ from plan | Confirm with the team; record the outcome in the resolutions tab |
+| 🔵 **Supervisor only** | Supervisor form(s) but no E1 form | Chase the E1 form, or check if E1 picked another code |
+| ⚪ **Not submitted** | No form at all | Check whether the ride happened |
+| 🟢 **Done as planned** | One E1 form, actual code = planned code | — |
+
+**What changed** lists planned → actual for each part that differs (one entry per form when there are several).
+**Forms that don't match** lists forms whose selected planned code is not in the batch_codes tab.
+""")
+
+# ---------------------------------------------------------------------------
+# TAB 2 — Implementation fidelity
+# ---------------------------------------------------------------------------
+
+with tab2:
+    st.caption("Were timings, sign-ups and procedures followed, and why not when they weren't? "
+               "One row per Enumerator 1 form.")
+    fid, fid_css = v.fidelity_table(subs_f)
+    xc, xc_css = v.crosscheck_table(subs_f)
+
+    if fid.empty:
+        st.info("No E1 forms for the selected filters.")
+    else:
+        st_counts = fid["Issue status"].value_counts()
+        c = st.columns(5)
+        c[0].metric("E1 forms", len(fid))
+        c[1].metric("No issues", int(st_counts.get("No issues", 0)))
+        c[2].metric("All explained", int(st_counts.get("All explained", 0)))
+        c[3].metric("Unexplained / partly", int(st_counts.get("Unexplained", 0) + st_counts.get("Partly explained", 0)))
+        c[4].metric("Observed by supervisor", int((xc["Supervisor"] != "— not observed —").sum()))
+
+        only_issues = st.toggle("Only rides with issues", value=False)
+        m = fid["Issue status"] != "No issues" if only_issues else pd.Series(True, index=fid.index)
+        if only_issues:
+            m |= fid["Recording problems"] != "—"
+
+        st.markdown("#### Implementation — values and the reasons given")
+        show(fid[m], fid_css[m])
+        download(fid[m], "implementation_fidelity.csv", "dl_fid")
+
+        st.markdown("#### Supervisor cross-check — independent record of the same ride")
+        st.caption(f"Gaps are |E1 − supervisor| minutes at each checkpoint; red above {v.TIME_GAP_MAX} min. "
+                   "Supervisor forms are paired with E1 forms by the E1 named on the supervisor form, "
+                   f"ride date and ride start time (within {v.PAIR_WINDOW_MIN} min).")
+        show(xc[m.values] if only_issues else xc, xc_css[m.values] if only_issues else xc_css)
+        download(xc, "supervisor_crosscheck.csv", "dl_xc")
 
     with st.expander("Column guide"):
         st.markdown(f"""
-| Column | What it shows | Flagged when |
-|--------|--------------|-----------------|
-| Actual code | Full batch code submitted by enumerator | — |
-| Date / Team / Mkt ID / Route / Ride # / Treatment | Actual batch code components | 🔴 Red = wrong treatment/corridor/direction; 🔵 Blue = date, team, marketer or ride # changed |
-| Start delay | Minutes between ride start and announcement start | 🔴 > {DELAY_MAX_MIN} min |
-| Recorded ann./signup dur. | Enumerator-recorded announcement/sign-up activity duration | 🔴 < {ANN_DUR_MIN} or > {ANN_DUR_MAX} min |
-| Auto form-screen dur. | Automatic SurveyCTO screen timing (not independently flagged) | — |
-| Timing discrepancy | \|Recorded − Auto\| difference | 🔴 > {SIGNUP_DIFF_MAX} min — review required; does not imply either measure is wrong |
-| Pause/Pitch | Pause (S) or pitch (N) duration (min) | 🔴 Outside {PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min |
-| Ride dur. | Total ride duration (min) | 🔴 < {RIDE_MIN_MIN} min |
-| Signups | Total sign-ups | 🔴 < 14 |
-| Missing/not assessed | Value not present in submitted form | Neither pass nor fail — data absent |
+| Column | Flagged (🔴) when |
+|---|---|
+| Start delay | > {DELAY_MAX_MIN} min after ride start |
+| Recorded ann./signup dur. | Outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min (enumerator-recorded) |
+| Auto form-screen dur. | Not flagged — SurveyCTO screen timing, for reference |
+| Timing discrepancy | Recorded and auto differ by > {SIGNUP_DIFF_MAX} min — review; doesn't mean either is wrong |
+| Pause/Pitch | Outside {PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min |
+| Ride dur. | < {RIDE_MIN_MIN} min |
+| Signups | < {SIGNUP_MIN} |
+
+**Issue status** — *All explained*: every flagged value has a reason, or an external disruption was
+reported (bus/route, passenger, marketer/pitch interruption, recruitment paused). *Unexplained*: flagged
+with no reason and no external disruption. A reason being given is not a judgement that it is valid.
+
+**Recording problems** — impossible or inconsistent timestamps (data quality, not protocol).
+
+**Missing/not assessed** (grey) — the value is absent from the form; it neither passes nor fails.
 """)
 
-with tab2:
-    st.subheader("Implementation issues — submitted rides only")
-    st.caption(
-        "🔴 Red = value outside threshold. 🟠 Orange = explanation was recorded. "
-        "Reason columns show the enumerator's explanation when flagged."
-    )
-    submitted_display = display[display["submission_status"] == "Submitted"]
-    if submitted_display.empty:
-        st.info("No submitted rides yet.")
-    else:
-        t2 = make_issues_table(display)
-        styled2 = style_issues_table(t2, display)
-        st.dataframe(styled2, use_container_width=True, hide_index=True)
+# ---------------------------------------------------------------------------
+# TAB 3 — Enumerator performance
+# ---------------------------------------------------------------------------
 
-        csv2 = t2.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇ Download issues CSV", data=csv2,
-                           file_name="implementation_issues.csv", mime="text/csv",
-                           key="dl_issues")
+with tab3:
+    st.caption("How is each enumerator doing, and are they improving? Three separate signal families — "
+               "never blended into one score: **data quality** (their own forms), **protocol** "
+               "(supervisor observations) and **agreement** (supervisor's independent record vs theirs). "
+               f"Shares below {v.PERF_TARGET:.0%} are red.")
+
+    e1m, supm = v.performance_records(subs)
+    weeks = sorted(set(e1m["week_start"].dropna() if not e1m.empty else [])
+                   | set(supm["week_start"].dropna() if not supm.empty else []))
+    if not weeks:
+        st.info("No E1 or supervisor forms yet.")
+    else:
+        week_opts = ["All weeks"] + [f"Week of {v.fmt_day(w)}" for w in reversed(weeks)]
+        week_map = {f"Week of {v.fmt_day(w)}": w for w in weeks}
+        sel_week = st.selectbox("Period", week_opts, index=0)
+        sel_weeks = None if sel_week == "All weeks" else [week_map[sel_week]]
+
+        summ, summ_css, ids = v.performance_summary(e1m, supm, sel_weeks)
+        show(summ, summ_css)
+        download(summ, "enumerator_performance.csv", "dl_perf")
+
+        with st.expander("What each measure means"):
+            st.markdown(f"""
+| Measure | Share of … | Source |
+|---|---|---|
+| Batch code as planned | E1 forms whose actual code equals the planned code | E1 form |
+| Timing targets met | E1 forms with no timing flag (delay, ann./signup, pause/pitch, ride length) | E1 form |
+| Flags explained | E1 forms with flags where every flag has a reason or external disruption | E1 form |
+| Complete data | E1 forms with all core values present and no impossible timestamps | E1 form |
+| Recorded = auto timing | E1 forms where recorded and auto durations agree within {SIGNUP_DIFF_MAX} min | E1 form |
+| Protocol (sup. obs.) | Observed behaviours (s01–s26) marked Yes, pooled across rides | Supervisor form |
+| Sign-up count agrees | Supervisor-verified rides where the counts matched | Supervisor form |
+| Times agree | Observed rides where the supervisor said all times matched | Supervisor form |
+| No E1 recording error | Rides where a timing mismatch was not attributed to E1 | Supervisor form |
+
+Sign-up totals are deliberately left out: they depend heavily on route and passengers.
+""")
+
+        st.markdown("#### Ride by ride — each enumerator's performance on each ride")
+        st.caption("One row per ride × enumerator: their E1 form and, when observed, the paired supervisor "
+                   "form. ✓ met · ✗ not met · — not assessed. The table above pools these rows.")
+        sel_people = st.multiselect("Enumerators", list(summ["Enumerator"]), default=[],
+                                    placeholder="All enumerators", key="ride_people")
+        pid_map = dict(zip(summ["Enumerator"], ids))
+        by_ride, by_ride_css = v.performance_by_ride(
+            subs, e1m, supm, sel_weeks, [pid_map[p] for p in sel_people] if sel_people else None)
+        show(by_ride, by_ride_css)
+        if not by_ride.empty:
+            download(by_ride, "performance_by_ride.csv", "dl_by_ride")
+
+        st.divider()
+        if ids:
+            names = dict(zip(summ["Enumerator"], ids))
+            who = st.selectbox("Enumerator detail", list(names))
+            pid = names[who]
+
+            left, right = st.columns([3, 2])
+            with left:
+                st.markdown(f"#### {who} — weekly trend")
+                trend = v.performance_trend(e1m, supm, pid)
+                if len(trend) >= 2:
+                    st.line_chart(trend * 100, height=260)
+                elif not trend.empty:
+                    st.caption("Only one week so far — the chart appears from the second week.")
+                if not trend.empty:
+                    tr = trend.copy()
+                    tr.index = [v.fmt_day(w) for w in tr.index]
+                    st.dataframe(tr.apply(lambda col: col.map(lambda x: "—" if pd.isna(x) else f"{x:.0%}")),
+                                 width="stretch")
+            with right:
+                st.markdown("#### Supervisor observation by category")
+                cats = v.category_scores(supm, pid, sel_weeks)
+                if cats.empty or cats["_share"].isna().all():
+                    st.caption("No supervisor observations in this period.")
+                else:
+                    ccss = pd.DataFrame("", index=cats.index, columns=cats.columns)
+                    ccss.loc[cats["_share"] < v.PERF_TARGET, "Score"] = v.RED
+                    show(cats, ccss)
+
+            st.markdown(f"#### {who} — rides")
+            pr, pr_css = v.performance_by_ride(subs, e1m, supm, sel_weeks, [pid])
+            show(pr, pr_css)
+
+            card = v.feedback_card(e1m, supm, pid, sel_weeks)
+            with st.expander("📝 Feedback card (to share with the enumerator)", expanded=False):
+                st.markdown(card)
+            safe = "".join(ch if ch.isalnum() else "_" for ch in who)
+            st.download_button("⬇ Download feedback card", card.encode("utf-8"),
+                               file_name=f"feedback_{safe}.md", mime="text/markdown", key="dl_card")
+
+        st.divider()
+        with st.expander("All supervisor observations (one row per supervisor form)"):
+            obs, obs_css = v.supervisor_observations(subs)
+            show(obs, obs_css)
+            if not obs.empty:
+                download(obs, "supervisor_observations.csv", "dl_obs")
+            st.markdown("""
+| Category | Indicators |
+|---|---|
+| Preparation | s01 Sat in assigned position |
+| Form use | s03 Followed SurveyCTO in real time |
+| Announcement | s04 Script · s05 Voice · s06 Eye contact · s07 Persuasive · s08 Active stance · s09 Displayed card · s10 Correct pause/resume |
+| Pax questions | s11 Answered correctly · s12 Avoided guessing |
+| Pause period | s15 Respected the pause |
+| Cards | s16 Checked cards for missing info |
+| Tickets | s19 Gave apprentice ticket bag |
+| Payment | s21 Agreed fare count · s22 Got signed receipt |
+| Close-out | s23 Completed recruitment form · s24 Completed RIDE form |
+| Materials | s25 Labelled/stored ride bag · s26 Stored all materials |
+""")
 
 # ---------------------------------------------------------------------------
-# Diagnostics (shared footer)
+# Diagnostics
 # ---------------------------------------------------------------------------
 
 with st.expander("Diagnostics"):
-    diag = diagnostics(submissions_raw, batch_codes, result)
-    st.markdown(f"""
-| | |
-|---|---|
-| Submissions tab rows read | {diag['submissions_tab_rows']} |
-| Batch codes tab rows read | {diag['batch_codes_tab_rows']} |
-| Rollup rows (planned rides) | {diag['rollup_rows']} |
-| Submitted | {diag['submitted']} |
-| No submission | {diag['no_submission']} |
-""")
-    st.caption(
-        "If rows = 0, check the Sheet is shared as 'Anyone with link → Viewer' "
-        "and the URLs in secrets.toml point to the correct tabs."
-    )
+    diag = diagnostics(submissions_raw, batch_codes, subs)
+    st.markdown("\n".join(["| | |", "|---|---|"] + [f"| {k.replace('_', ' ').capitalize()} | {val} |"
+                                                     for k, val in diag.items()]))
+    st.caption("If rows = 0, check the Sheet is shared as 'Anyone with link → Viewer' "
+               "and the URLs in secrets point to the correct tabs.")

@@ -1,0 +1,904 @@
+"""
+views.py — builds the three dashboard views from prepared submissions
+======================================================================
+Pure pandas (no Streamlit), so every view can be tested locally:
+
+    from rollup import prepare_submissions
+    subs = prepare_submissions(raw_submissions)
+    ledger, css = ride_ledger(subs, batch_codes)
+
+Unit of analysis per view
+-------------------------
+Tab 1  Ride verification       one row per PLANNED batch code
+Tab 2  Implementation fidelity one row per E1 form (the ride as carried out)
+Tab 3  Enumerator performance  one row per enumerator (× week for trends)
+
+Builders that feed styled tables return (table, css): css has the same shape
+as the table and holds a CSS string per cell ("" = no style).
+"""
+
+import numpy as np
+import pandas as pd
+
+from rollup import (
+    parse_batch_code, _parse_time, _diff_minutes, _code,
+    DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX,
+    PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+E1, SUP = "Enumerator 1", "Supervisor"
+MISSING = "Missing/not assessed"
+
+RED  = "color: #CC0000; font-weight: 600"
+BLUE = "color: #0055AA; font-weight: 600"
+GRAY = "color: #888888"
+GREEN = "color: #1E7B34; font-weight: 600"
+
+TIME_GAP_MAX    = 2    # min — E1 vs supervisor checkpoint gap that needs review
+PAIR_WINDOW_MIN = 20   # min — supervisor form paired with an E1 form if ride starts are this close
+PERF_TARGET     = 0.80 # performance rates below this are shown in red
+
+TREAT = {"S": "Script", "N": "Normal", "P": "Peddling"}
+
+STATUS_RANK = {
+    "Design problem": 0, "Duplicate E1": 1, "To confirm": 2,
+    "Supervisor only": 3, "Not submitted": 4, "Done as planned": 5,
+}
+STATUS_STYLE = {
+    "Design problem": RED, "Duplicate E1": RED, "To confirm": BLUE,
+    "Supervisor only": BLUE, "Not submitted": GRAY, "Done as planned": GREEN,
+}
+
+C10_LABELS = {
+    "0": "None", "1": "Bus/route interruption",
+    "2": "Passenger disruption/confrontation",
+    "3": "Marketer/pitch interruption",
+    "4": "Team, equipment or materials",
+    "5": "Recruitment paused/stopped", "-55": "Other",
+}
+# Disruptions outside the enumerator's control — count as an explanation for a flagged value
+EXTERNAL_DISRUPTIONS = {"1", "2", "3", "5"}
+
+COMPLETION_LABELS = {
+    "1": "Completed — no disruption", "2": "Completed — with disruption",
+    "3": "Not fully completed", "4": "Completion not confirmed",
+}
+MATCH_LABELS = {"1": "✓ Match", "2": "✗ Mismatch", "3": "Not verified"}
+YESNO = {"1": "Yes", "0": "No"}
+DISCREPANCY_SOURCE = {
+    "1": "E1 recorded incorrectly",
+    "2": "Supervisor recorded incorrectly",
+    "3": "Both records have errors",
+    "4": "Device clocks differed",
+    "5": "Could not establish",
+}
+RECORDING_ISSUE = {"1": "E1 recording error", "0": "Not attributed to E1", "-1": "Unclear"}
+
+# Supervisor behavioural observations (s-field → category)
+S_CATEGORIES = {
+    "Preparation":   ["s01"],
+    "Form use":      ["s03"],
+    "Announcement":  ["s04", "s05", "s06", "s07", "s08", "s09", "s10"],
+    "Pax questions": ["s11", "s12"],
+    "Pause period":  ["s15"],
+    "Cards":         ["s16"],
+    "Tickets":       ["s19"],
+    "Payment":       ["s21", "s22"],
+    "Close-out":     ["s23", "s24"],
+    "Materials":     ["s25", "s26"],
+}
+
+# Flagged implementation values and the form field holding the explanation
+ISSUE_DEFS = [
+    ("flag_1_start_delay",  "Start delay",          "announcement_delay_explanation"),
+    ("flag_2_ann_duration", "Ann./signup duration", "signup_duration_explanation"),
+    ("flag_4a_pause_dur",   "Pause duration",       "pause_duration_explanation"),
+    ("flag_4b_pitch_dur",   "Pitch duration",       "pause_duration_explanation"),
+    ("flag_6_short_ride",   "Short ride",           "ride_duration_explanation"),
+    ("flag_7_low_signup",   "Low sign-ups",         "final_comment_lowsignup"),
+]
+# Recording / data-quality problems (not protocol deviations)
+RECORDING_DEFS = [
+    ("flag_3_signup_discrep", "Recorded ≠ auto timing"),
+    ("flag_4c_after_ride",    "Pitch/pause ends after ride end"),
+    ("flag_chron_neg_delay",  "Announcement before ride start"),
+    ("flag_chron_neg_ann",    "Negative auto duration"),
+    ("flag_chron_neg_signup", "Negative recorded duration"),
+    ("flag_chron_neg_pause",  "Negative pause duration"),
+    ("flag_chron_neg_pitch",  "Negative pitch duration"),
+]
+CORE_FIELDS = ["announcement_start_delay", "signup_duration", "pause_duration",
+               "ride_duration", "total_signups"]
+
+# E1 vs supervisor timestamp checkpoints (label, fields — first present on both is used)
+CHECKPOINTS = [
+    ("Ride start",          ["b02_r"]),
+    ("Ann. start",          ["b03"]),
+    ("Ann. end",            ["b05", "b06"]),
+    ("Pitch/pause end",     ["b09", "b10"]),
+    ("Ride end",            ["b11"]),
+]
+
+# Column names shared with app.py (styling) --------------------------------
+COL_DELAY   = f"Start delay (<{DELAY_MAX_MIN} min)"
+COL_REC     = f"Recorded ann./signup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+COL_AUTO    = "Auto form-screen dur."
+COL_DISCREP = f"Timing discrepancy (>{SIGNUP_DIFF_MAX} min)"
+COL_PITCH   = f"Pause/Pitch ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+COL_RIDE    = f"Ride dur. (≥{RIDE_MIN_MIN} min)"
+COL_SIGNUPS = f"Signups (≥{SIGNUP_MIN})"
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _txt(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return "" if s.lower() in ("nan", "none", "nat") else s
+
+
+def _num(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _is1(v) -> bool:
+    return _code(v) == "1"
+
+
+def _true(v) -> bool:
+    return isinstance(v, (bool, np.bool_)) and bool(v)
+
+
+def fmt_code_date(s) -> str:
+    """DDMMYYYY → '05 Oct 2026'."""
+    s = _txt(s)
+    if not s:
+        return ""
+    try:
+        return pd.to_datetime(s, format="%d%m%Y").strftime("%d %b %Y")
+    except Exception:
+        return s
+
+
+def fmt_day(ts) -> str:
+    return ts.strftime("%d %b %Y") if pd.notna(ts) else ""
+
+
+def fmt_val(v, nd=2) -> str:
+    f = _num(v)
+    return MISSING if np.isnan(f) else f"{f:.{nd}f}"
+
+
+def fmt_rate(num, den) -> str:
+    return "—" if not den else f"{num / den:.0%} ({int(num)}/{int(den)})"
+
+
+def _empty_css(t: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame("", index=t.index, columns=t.columns)
+
+
+def decode_c10(v) -> str:
+    s = _txt(v)
+    if not s:
+        return "—"
+    return "; ".join(C10_LABELS.get(c, c) for c in s.split())
+
+
+# ---------------------------------------------------------------------------
+# Batch code comparison for one form
+# ---------------------------------------------------------------------------
+
+def code_changes(row) -> list:
+    """[(severity, text)] — severity 'design' (wrong ride) or 'confirm' (check with team)."""
+    actual = _txt(row.get("actual_batch_code"))
+    if not actual:
+        return [("design", "No actual batch code")]
+    if not _true(row.get("a_parse_ok")):
+        return [("design", f"Actual code unreadable ({actual})")]
+    if not _true(row.get("p_parse_ok")):
+        return [("confirm", "Planned code unreadable")]
+
+    g = lambda k: _txt(row.get(k))
+    out = []
+    if g("p_treatment") != g("a_treatment"):
+        out.append(("design", f"Treatment {TREAT.get(g('p_treatment'), g('p_treatment'))}"
+                              f"→{TREAT.get(g('a_treatment'), g('a_treatment'))}"))
+    if g("p_corridor") != g("a_corridor"):
+        out.append(("design", f"Corridor {g('p_route')}→{g('a_route')}"))
+    elif g("p_route") != g("a_route"):
+        out.append(("design", f"Direction {g('p_route')}→{g('a_route')}"))
+    if g("p_date") != g("a_date"):
+        out.append(("confirm", f"Date {fmt_code_date(g('p_date'))}→{fmt_code_date(g('a_date'))}"))
+    if g("p_team") != g("a_team"):
+        out.append(("confirm", f"Team {g('p_team')}→{g('a_team')}"))
+    if g("p_mkt_id") != g("a_mkt_id"):
+        out.append(("confirm", f"Mkt ID {g('p_mkt_id')}→{g('a_mkt_id')}"))
+    if g("p_ride_num") != g("a_ride_num"):
+        out.append(("confirm", f"Ride # {g('p_ride_num')}→{g('a_ride_num')}"))
+    return out
+
+
+def _changes_text(ch: list) -> str:
+    return "; ".join(t for _, t in ch) if ch else "As planned"
+
+
+def _names(series) -> str:
+    vals = [v for v in dict.fromkeys(_txt(x) for x in series) if v]
+    return ", ".join(vals)
+
+
+# ---------------------------------------------------------------------------
+# TAB 1 — Ride verification
+# ---------------------------------------------------------------------------
+
+def planned_codes(batch_codes: pd.DataFrame) -> list:
+    return list(dict.fromkeys(
+        _txt(c) for c in batch_codes.get("batch_code", pd.Series(dtype=str)) if _txt(c)
+    ))
+
+
+def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
+                resolutions: pd.DataFrame | None = None):
+    """One row per planned batch code with a single status. Returns (table, css)."""
+    groups = {k: d for k, d in subs.groupby("batch_code")}
+    empty = subs.iloc[0:0]
+
+    res_map = {}
+    if resolutions is not None and not resolutions.empty and "batch_code" in resolutions.columns:
+        rcol = next((c for c in resolutions.columns if c.lower().startswith("resolution")), None)
+        if rcol:
+            res_map = {_txt(b): _txt(r) for b, r in zip(resolutions["batch_code"], resolutions[rcol]) if _txt(b)}
+
+    rows = []
+    for code in planned_codes(batch_codes):
+        p = parse_batch_code(code)
+        d = groups.get(code, empty)
+        e1 = d[d["role"] == E1].sort_values("submitted_at")
+        sp = d[d["role"] == SUP].sort_values("submitted_at")
+        basis = e1 if len(e1) else sp
+        changes = [code_changes(r) for _, r in basis.iterrows()]
+        sev = {s for ch in changes for s, _ in ch}
+
+        if d.empty:
+            status = "Not submitted"
+        elif e1.empty:
+            status = "Supervisor only"
+        elif "design" in sev:
+            status = "Design problem"
+        elif len(e1) > 1:
+            status = "Duplicate E1"
+        elif "confirm" in sev:
+            status = "To confirm"
+        else:
+            status = "Done as planned"
+
+        if len(basis) > 1:
+            what = " | ".join(f"Form {i + 1}: {_changes_text(ch)}" for i, ch in enumerate(changes))
+        elif changes:
+            what = _changes_text(changes[0])
+        else:
+            what = ""
+        if status == "Supervisor only":
+            what = f"No E1 form. Supervisor code: {what}"
+
+        e1_names = _names(e1["person"])
+        if not e1_names and not sp.empty:
+            observed = _names(sp["e1_name"])
+            e1_names = f"{observed} (no E1 form)" if observed else ""
+
+        last = d["submitted_at"].max() if not d.empty else pd.NaT
+        rows.append({
+            "Status":         status,
+            "Planned code":   code,
+            "Date":           fmt_code_date(p["date"]),
+            "Team":           p["team"] or "",
+            "Mkt ID":         p["mkt_id"] or "",
+            "Route":          p["route"] or "",
+            "Ride #":         p["ride_num"] or "",
+            "Treatment":      TREAT.get(p["treatment"], p["treatment"] or ""),
+            "E1 forms":       len(e1),
+            "Enumerator 1":   e1_names,
+            "Supervisor":     _names(sp["person"]),
+            "Actual code(s)": ", ".join(_txt(c) for c in basis["actual_batch_code"]),
+            "What changed":   what,
+            "Last submitted": last.strftime("%d %b %H:%M") if pd.notna(last) else "",
+            "Resolution":     res_map.get(code, ""),
+            "_corridor":      p["corridor"],
+            "_date":          pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce"),
+            "_rank":          STATUS_RANK[status],
+        })
+
+    t = pd.DataFrame(rows)
+    if t.empty:
+        return t, _empty_css(t)
+    t = t.sort_values(["_date", "_rank", "Planned code"]).reset_index(drop=True)
+    css = _empty_css(t)
+    css["Status"] = t["Status"].map(STATUS_STYLE).fillna("")
+    css.loc[t["Status"].isin(["Design problem"]), "What changed"] = RED
+    css.loc[t["Status"].isin(["To confirm", "Supervisor only"]), "What changed"] = BLUE
+    css.loc[t["Status"] == "Duplicate E1", "E1 forms"] = RED
+    css.loc[t["Status"] == "Not submitted"] = GRAY
+    css["Status"] = t["Status"].map(STATUS_STYLE).fillna("")
+    return t, css
+
+
+def unmatched_submissions(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFrame:
+    """Forms whose selected planned code is not in the batch_codes frame."""
+    planned = set(planned_codes(batch_codes))
+    m = ~subs["batch_code"].map(_txt).isin(planned)
+    d = subs[m].sort_values("submitted_at")
+    return pd.DataFrame({
+        "Submitted":             d["submitted_at"].dt.strftime("%d %b %H:%M"),
+        "Role":                  d["role"],
+        "Filled by":             d["person"].map(_txt),
+        "Enumerator 1":          d["e1_name"].map(_txt),
+        "Planned code selected": d["batch_code"].map(_txt).replace("", "(none)"),
+        "Actual code":           d["actual_batch_code"].map(_txt),
+        "Issue": np.where(d["batch_code"].map(_txt) == "",
+                          "No planned code selected", "Planned code not in batch_codes frame"),
+    }).reset_index(drop=True)
+
+
+def submission_log(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFrame:
+    """Every form, one row each — the audit trail behind Tab 1."""
+    planned = set(planned_codes(batch_codes))
+    d = subs.sort_values("submitted_at")
+    return pd.DataFrame({
+        "Submitted":      d["submitted_at"].dt.strftime("%d %b %H:%M"),
+        "Ride date":      d["ride_date"].map(fmt_day),
+        "Role":           d["role"],
+        "Filled by":      d["person"].map(_txt),
+        "Enumerator 1":   d["e1_name"].map(_txt),
+        "Planned code":   d["batch_code"].map(_txt),
+        "Actual code":    d["actual_batch_code"].map(_txt),
+        "In plan":        d["batch_code"].map(lambda c: "Yes" if _txt(c) in planned else "No"),
+        "E1 forms on code": d["n_e1_forms"],
+        "Code check":     [_changes_text(code_changes(r)) for _, r in d.iterrows()],
+        "Form ID":        d["form_id"].map(lambda k: _txt(k)[-12:]),
+    }).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Supervisor ↔ E1 pairing
+# ---------------------------------------------------------------------------
+
+def pair_supervisors(subs: pd.DataFrame) -> dict:
+    """
+    {E1 row index: (supervisor row index, method)}.
+    A supervisor form names the E1 observed (a02_1), so candidates are supervisor
+    forms for the same E1 on the same ride date. Among those, the closest ride
+    start time (within PAIR_WINDOW_MIN) wins; without times, the same ride
+    number, then the same planned code. Several E1 forms may share one supervisor.
+    """
+    e1 = subs[subs["role"] == E1]
+    sp = subs[subs["role"] == SUP]
+    start = subs["b02_r"].map(_parse_time) if "b02_r" in subs.columns else pd.Series(pd.NaT, index=subs.index)
+    out = {}
+    for i, r in e1.iterrows():
+        cand = sp[sp["e1_id"] == r["e1_id"]]
+        if pd.notna(r["ride_date"]):
+            cand = cand[cand["ride_date"] == r["ride_date"]]
+        scored = []
+        for j, c in cand.iterrows():
+            gap = _diff_minutes(start[i], start[j])
+            if not np.isnan(gap):
+                if abs(gap) <= PAIR_WINDOW_MIN:
+                    scored.append((0, abs(gap), j, "ride start time"))
+            elif _code(r.get("a04_r")) and _code(r.get("a04_r")) == _code(c.get("a04_r")):
+                scored.append((1, 0, j, "ride number"))
+            elif _txt(r["batch_code"]) and r["batch_code"] == c["batch_code"]:
+                scored.append((2, 0, j, "planned code"))
+        if scored:
+            best = min(scored)
+            out[i] = (best[2], best[3])
+    return out
+
+
+def time_gaps(e1_row, sup_row) -> dict:
+    """{checkpoint label: |E1 − supervisor| minutes} for checkpoints recorded on both forms."""
+    gaps = {}
+    for label, fields in CHECKPOINTS:
+        for f in fields:
+            a, b = _parse_time(e1_row.get(f)), _parse_time(sup_row.get(f))
+            if pd.notna(a) and pd.notna(b):
+                gaps[label] = abs(_diff_minutes(a, b))
+                break
+    return gaps
+
+
+# ---------------------------------------------------------------------------
+# TAB 2 — Implementation fidelity
+# ---------------------------------------------------------------------------
+
+def assess_issues(row) -> dict:
+    """Which implementation values are flagged and whether each was explained."""
+    disruptions = set(_txt(row.get("c10")).split())
+    external = bool(disruptions & EXTERNAL_DISRUPTIONS)
+    items, n_flag, n_expl = [], 0, 0
+    for flag, label, reason_col in ISSUE_DEFS:
+        if _num(row.get(flag)) == 1:
+            n_flag += 1
+            if _txt(row.get(reason_col)):
+                items.append(f"{label} (reason given)"); n_expl += 1
+            elif external:
+                items.append(f"{label} (disruption)"); n_expl += 1
+            else:
+                items.append(f"{label} (no reason)")
+    recording = [label for flag, label in RECORDING_DEFS if _num(row.get(flag)) == 1]
+    if n_flag == 0:
+        status = "No issues"
+    elif n_expl == n_flag:
+        status = "All explained"
+    elif n_expl:
+        status = "Partly explained"
+    else:
+        status = "Unexplained"
+    return {"status": status, "items": items, "n_flag": n_flag, "n_expl": n_expl,
+            "recording": recording}
+
+
+def fidelity_table(subs: pd.DataFrame):
+    """One row per E1 form: values next to reasons. Returns (table, css)."""
+    d = subs[subs["role"] == E1].sort_values(["ride_date", "batch_code", "submitted_at"])
+    rows, flags = [], []
+    for i, r in d.iterrows():
+        a = assess_issues(r)
+        sig, ann = _num(r.get("signup_duration")), _num(r.get("announcement_duration"))
+        rows.append({
+            "Planned code":        _txt(r["batch_code"]),
+            "Ride date":           fmt_day(r["ride_date"]),
+            "Treatment":           TREAT.get(_txt(r.get("p_treatment")), _txt(r.get("p_treatment"))),
+            "Enumerator 1":        _txt(r["person"]),
+            "Issue status":        a["status"],
+            "Flagged values":      "; ".join(a["items"]) or "—",
+            "Recording problems":  "; ".join(a["recording"]) or "—",
+            COL_DELAY:             fmt_val(r.get("announcement_start_delay")),
+            "Delay reason":        _txt(r.get("announcement_delay_explanation")) or "—",
+            COL_REC:               fmt_val(sig),
+            "Ann./signup reason":  _txt(r.get("signup_duration_explanation")) or "—",
+            COL_AUTO:              fmt_val(ann),
+            COL_DISCREP:           fmt_val(abs(sig - ann)),
+            COL_PITCH:             fmt_val(r.get("pause_duration")),
+            "Pause/pitch reason":  _txt(r.get("pause_duration_explanation")) or "—",
+            COL_RIDE:              fmt_val(r.get("ride_duration")),
+            "Ride dur. reason":    _txt(r.get("ride_duration_explanation")) or "—",
+            "Completion":          COMPLETION_LABELS.get(_code(r.get("ride_completion_outcome")), "—"),
+            "Not completed — why": "; ".join(x for x in [_txt(r.get("signup_completed_why")),
+                                                           _txt(r.get("pitchpause_completed_why"))] if x) or "—",
+            COL_SIGNUPS:           fmt_val(r.get("total_signups"), 0),
+            "Signup reason":       _txt(r.get("final_comment_lowsignup")) or "—",
+            "Disruptions":         decode_c10(r.get("c10")),
+            "Disruption notes":    _txt(r.get("c10a")) or "—",
+            "Pax Q1":              _txt(r.get("q00")) or "—",
+            "Pax Q2":              _txt(r.get("q01")) or "—",
+        })
+        flags.append({
+            COL_DELAY: r.get("flag_1_start_delay"), COL_REC: r.get("flag_2_ann_duration"),
+            COL_DISCREP: r.get("flag_3_signup_discrep"),
+            COL_PITCH: 1 if (_num(r.get("flag_4a_pause_dur")) == 1 or _num(r.get("flag_4b_pitch_dur")) == 1) else 0,
+            COL_RIDE: r.get("flag_6_short_ride"), COL_SIGNUPS: r.get("flag_7_low_signup"),
+        })
+    t = pd.DataFrame(rows)
+    css = _empty_css(t)
+    if t.empty:
+        return t, css
+    for k, fl in enumerate(flags):
+        for col, v in fl.items():
+            if _num(v) == 1:
+                css.at[k, col] = RED
+            elif t.at[k, col] == MISSING:
+                css.at[k, col] = GRAY
+    css["Issue status"] = t["Issue status"].map(
+        {"Unexplained": RED, "Partly explained": RED, "All explained": BLUE, "No issues": GREEN}).fillna("")
+    css.loc[t["Recording problems"] != "—", "Recording problems"] = RED
+    css.loc[t["Completion"] == "Not fully completed", "Completion"] = RED
+    return t, css
+
+
+def crosscheck_table(subs: pd.DataFrame):
+    """One row per E1 form with the paired supervisor's independent record. Returns (table, css)."""
+    pairs = pair_supervisors(subs)
+    d = subs[subs["role"] == E1].sort_values(["ride_date", "batch_code", "submitted_at"])
+    rows = []
+    for i, r in d.iterrows():
+        row = {
+            "Planned code": _txt(r["batch_code"]),
+            "Ride date":    fmt_day(r["ride_date"]),
+            "Enumerator 1": _txt(r["person"]),
+        }
+        if i not in pairs:
+            row.update({"Supervisor": "— not observed —"})
+            rows.append(row)
+            continue
+        j, method = pairs[i]
+        s = subs.loc[j]
+        gaps = time_gaps(r, s)
+        row["Supervisor"] = _txt(s["person"])
+        row["Paired by"]  = method
+        for label, _ in CHECKPOINTS:
+            row[f"Gap: {label}"] = f"{gaps[label]:.1f}" if label in gaps else "—"
+        if gaps:
+            worst = max(gaps, key=gaps.get)
+            row["Max gap (min)"] = f"{gaps[worst]:.1f}"
+            row["Largest at"]    = worst
+        row["Sign-ups E1 / Sup"]   = f"{fmt_val(r.get('total_signups'), 0)} / {fmt_val(s.get('total_signups'), 0)}".replace(MISSING, "?")
+        row["Sup: times match"]    = YESNO.get(_code(s.get("sup_times_match")), "—")
+        row["Mismatched times"]    = _txt(s.get("sup_time_mismatch_labels")) or "—"
+        row["Discrepancy source"]  = DISCREPANCY_SOURCE.get(_code(s.get("sup_time_discrepancy_source")), "—")
+        row["E1 recording issue"]  = RECORDING_ISSUE.get(_code(s.get("sup_recording_issue")), "—")
+        row["Count match"]         = MATCH_LABELS.get(_code(s.get("s17")), "—")
+        row["Ticket match"]        = MATCH_LABELS.get(_code(s.get("s20")), "—")
+        row["Completion match"]    = {"1": "✓ Match", "0": "✗ Differs"}.get(_code(s.get("sup_completion_matches_e1")), "—")
+        rows.append(row)
+
+    cols = (["Planned code", "Ride date", "Enumerator 1", "Supervisor", "Paired by"]
+            + [f"Gap: {l}" for l, _ in CHECKPOINTS]
+            + ["Max gap (min)", "Largest at", "Sign-ups E1 / Sup", "Sup: times match", "Mismatched times",
+               "Discrepancy source", "E1 recording issue", "Count match", "Ticket match", "Completion match"])
+    t = pd.DataFrame(rows).reindex(columns=cols).fillna("—")
+    css = _empty_css(t)
+    if t.empty:
+        return t, css
+    for c in [c for c in cols if c.startswith("Gap:")] + ["Max gap (min)"]:
+        css.loc[t[c].map(_num) > TIME_GAP_MAX, c] = RED
+    css.loc[t["Sup: times match"] == "No", "Sup: times match"] = RED
+    css.loc[t["E1 recording issue"] == "E1 recording error", "E1 recording issue"] = RED
+    for c in ["Count match", "Ticket match", "Completion match"]:
+        css.loc[t[c].str.startswith("✗"), c] = RED
+    so = t["Sign-ups E1 / Sup"].str.split(" / ")
+    css.loc[so.map(lambda x: len(x) == 2 and "?" not in x and x[0] != x[1]), "Sign-ups E1 / Sup"] = RED
+    css.loc[t["Supervisor"] == "— not observed —"] = GRAY
+    return t, css
+
+
+# ---------------------------------------------------------------------------
+# TAB 3 — Enumerator performance
+# ---------------------------------------------------------------------------
+# Three families of signals, kept separate (never blended into one score):
+#   Data quality      — from the enumerator's own E1 forms
+#   Protocol          — supervisor behavioural observations (s-fields)
+#   Agreement         — supervisor's independent counts/times vs E1's
+# Each metric is a share of rides: numerator / denominator, pooled over the period.
+
+E1_METRICS = [
+    ("Batch code as planned", "code_ok"),
+    ("Timing targets met",    "timing_ok"),
+    ("Flags explained",       "explained"),
+    ("Complete data",         "complete"),
+    ("Recorded = auto timing","recording_ok"),
+]
+SUP_METRICS = [
+    ("Protocol (sup. obs.)",  "obs"),        # pooled yes / assessed items
+    ("Sign-up count agrees",  "count_ok"),
+    ("Times agree",           "times_ok"),
+    ("No E1 recording error", "no_rec_err"),
+]
+ALL_METRICS = E1_METRICS + SUP_METRICS
+
+
+def _bin(v, yes=("1",), no=("0",)):
+    c = _code(v)
+    return 1.0 if c in yes else 0.0 if c in no else np.nan
+
+
+def performance_records(subs: pd.DataFrame):
+    """(e1m, supm): one row per form with 0/1 metric values (NaN = not assessed)."""
+    e1 = subs[subs["role"] == E1]
+    e1_rows = []
+    for _, r in e1.iterrows():
+        a = assess_issues(r)
+        timing_flags = [r.get(f) for f, _, _ in ISSUE_DEFS if f != "flag_7_low_signup"]
+        assessed = [f for f in timing_flags if not np.isnan(_num(f))]
+        core_ok = all(not np.isnan(_num(r.get(c))) for c in CORE_FIELDS)
+        # impossible timestamp sequences (the recorded-vs-auto discrepancy is its own metric)
+        impossible = any(_num(r.get(f)) == 1 for f, _ in RECORDING_DEFS if f != "flag_3_signup_discrep")
+        e1_rows.append({
+            "_idx": _,
+            "e1_id": r["e1_id"], "e1_name": r["e1_name"], "week_start": r["week_start"],
+            "ride_date": r["ride_date"], "batch_code": r["batch_code"],
+            "code_ok":   1.0 - _num(r.get("flag_batch_code_different")) if not np.isnan(_num(r.get("flag_batch_code_different"))) else np.nan,
+            "timing_ok": (0.0 if any(_num(f) == 1 for f in assessed) else 1.0) if assessed else np.nan,
+            "explained": (1.0 if a["n_expl"] == a["n_flag"] else 0.0) if a["n_flag"] else np.nan,
+            "complete":  1.0 if core_ok and not impossible else 0.0,
+            "recording_ok": 1.0 - _num(r.get("flag_3_signup_discrep")) if not np.isnan(_num(r.get("flag_3_signup_discrep"))) else np.nan,
+            "issue_status": a["status"], "issue_items": a["items"],
+        })
+    e1m = pd.DataFrame(e1_rows)
+
+    sp = subs[subs["role"] == SUP]
+    sup_rows = []
+    for j, r in sp.iterrows():
+        rec = {"_idx": j, "e1_id": r["e1_id"], "e1_name": r["e1_name"], "week_start": r["week_start"],
+               "ride_date": r["ride_date"], "batch_code": r["batch_code"], "supervisor": r["person"]}
+        yes_t = n_t = 0
+        for cat, fields in S_CATEGORIES.items():
+            vals = [_code(r.get(f)) for f in fields]
+            y = sum(v == "1" for v in vals); n = sum(v in ("0", "1") for v in vals)
+            rec[f"cat_yes:{cat}"], rec[f"cat_n:{cat}"] = y, n
+            yes_t += y; n_t += n
+        rec["obs_yes"], rec["obs_n"] = yes_t, n_t
+        rec["count_ok"]   = _bin(r.get("s17"), yes=("1",), no=("2",))
+        rec["times_ok"]   = _bin(r.get("sup_times_match"))
+        rec["no_rec_err"] = _bin(r.get("sup_recording_issue"), yes=("0",), no=("1",))
+        rec["strengths"]    = _txt(r.get("sup_feedback_additional_strengths"))
+        rec["improvements"] = _txt(r.get("sup_feedback_additional_improvements"))
+        rec["auto_improvements"] = _txt(r.get("fb_improvements"))
+        rec["count_label"] = MATCH_LABELS.get(_code(r.get("s17")), "—")
+        sup_rows.append(rec)
+    supm = pd.DataFrame(sup_rows)
+    return e1m, supm
+
+
+def _rate(df, key):
+    """(numerator, denominator) for a metric over a slice of records."""
+    if df is None or df.empty:
+        return 0, 0
+    if key == "obs":
+        return df["obs_yes"].sum(), df["obs_n"].sum()
+    s = df[key].dropna()
+    return s.sum(), len(s)
+
+
+def _people(e1m, supm) -> dict:
+    """{e1_id: display name} across both record sets."""
+    names = {}
+    for df in (e1m, supm):
+        if df is not None and not df.empty:
+            for i, n in zip(df["e1_id"], df["e1_name"]):
+                if _txt(i) and _txt(n):
+                    names.setdefault(i, n)
+    return names
+
+
+def performance_summary(e1m, supm, weeks=None):
+    """One row per enumerator for the chosen weeks (None = all). Returns (table, css, ids)."""
+    def sl(df):
+        if df is None or df.empty or weeks is None:
+            return df
+        return df[df["week_start"].isin(weeks)]
+    e1s, sups = sl(e1m), sl(supm)
+    rows, ids = [], []
+    for pid, name in sorted(_people(e1s, sups).items(), key=lambda x: x[1]):
+        a = e1s[e1s["e1_id"] == pid] if e1s is not None and not e1s.empty else None
+        b = sups[sups["e1_id"] == pid] if sups is not None and not sups.empty else None
+        row = {"Enumerator": name,
+               "E1 rides": 0 if a is None else len(a),
+               "Observed rides": 0 if b is None else len(b)}
+        for label, key in E1_METRICS:
+            row[label] = fmt_rate(*_rate(a, key))
+        for label, key in SUP_METRICS:
+            row[label] = fmt_rate(*_rate(b, key))
+        rows.append(row); ids.append(pid)
+    t = pd.DataFrame(rows)
+    css = _empty_css(t)
+    for label, _ in ALL_METRICS:
+        if label in t.columns:
+            pct = t[label].map(lambda s: _num(s.split("%")[0]) / 100 if "%" in s else np.nan)
+            css.loc[pct < PERF_TARGET, label] = RED
+    return t, css, ids
+
+
+def _mark(v) -> str:
+    return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else ("✓" if v == 1 else "✗")
+
+
+def performance_by_ride(subs, e1m, supm, weeks=None, pids=None):
+    """
+    One row per ride × enumerator: the E1 form and, when observed, the paired
+    supervisor form side by side, with each performance measure as ✓ / ✗ / —.
+    Supervisor forms with no matching E1 form get their own row.
+    Returns (table, css).
+    """
+    pairs = pair_supervisors(subs)
+    sup_by_idx = {r["_idx"]: r for r in supm.to_dict("records")} if not supm.empty else {}
+    used, rows = set(), []
+
+    def build(e, s):
+        src = e if e is not None else s
+        row = {
+            "Ride date":    fmt_day(src["ride_date"]),
+            "Planned code": _txt(src["batch_code"]),
+            "Enumerator":   _txt(src["e1_name"]),
+            "Supervisor":   _txt(s["supervisor"]) if s is not None else "—",
+            "Forms":        ("E1 + supervisor" if s is not None else "E1 only") if e is not None else "Supervisor only",
+        }
+        for label, key in E1_METRICS:
+            row[label] = _mark(e[key]) if e is not None else "—"
+        if s is not None:
+            row["Protocol (sup. obs.)"] = fmt_rate(s["obs_yes"], s["obs_n"])
+            for label, key in SUP_METRICS[1:]:
+                row[label] = _mark(s[key])
+        else:
+            for label, _ in SUP_METRICS:
+                row[label] = "—"
+        row["Flagged values"]     = "; ".join(e["issue_items"]) if e is not None and e["issue_items"] else "—"
+        row["Supervisor: strengths"]  = (s["strengths"] or "—") if s is not None else "—"
+        row["Supervisor: to improve"] = (s["improvements"] or "—") if s is not None else "—"
+        row["_e1_id"], row["_week"], row["_date"] = src["e1_id"], src["week_start"], src["ride_date"]
+        row["_protocol"] = (s["obs_yes"] / s["obs_n"]) if s is not None and s["obs_n"] else np.nan
+        return row
+
+    for e in (e1m.to_dict("records") if not e1m.empty else []):
+        j = pairs.get(e["_idx"], (None,))[0]
+        s = sup_by_idx.get(j)
+        if s is not None:
+            used.add(j)
+        rows.append(build(e, s))
+    for j, s in sup_by_idx.items():
+        if j not in used:
+            rows.append(build(None, s))
+
+    t = pd.DataFrame(rows)
+    if t.empty:
+        return t, _empty_css(t)
+    if weeks is not None:
+        t = t[t["_week"].isin(weeks)]
+    if pids is not None:
+        t = t[t["_e1_id"].isin(pids)]
+    t = t.sort_values(["_date", "Enumerator", "Planned code"]).reset_index(drop=True)
+
+    css = _empty_css(t)
+    metric_cols = [l for l, _ in ALL_METRICS if l != "Protocol (sup. obs.)"]
+    for c in metric_cols:
+        css.loc[t[c] == "✗", c] = RED
+        css.loc[t[c] == "✓", c] = GREEN
+    css.loc[t["_protocol"] < PERF_TARGET, "Protocol (sup. obs.)"] = RED
+    css.loc[t["Forms"] == "Supervisor only", "Forms"] = BLUE
+    css.loc[t["Flagged values"].str.contains("no reason", na=False), "Flagged values"] = RED
+    return t, css
+
+
+def performance_trend(e1m, supm, pid) -> pd.DataFrame:
+    """Rows = weeks, columns = metric shares (0–1) for one enumerator — for charts."""
+    weeks = sorted(set(
+        list(e1m.loc[e1m["e1_id"] == pid, "week_start"].dropna() if not e1m.empty else [])
+        + list(supm.loc[supm["e1_id"] == pid, "week_start"].dropna() if not supm.empty else [])))
+    out = []
+    for w in weeks:
+        a = e1m[(e1m["e1_id"] == pid) & (e1m["week_start"] == w)] if not e1m.empty else None
+        b = supm[(supm["e1_id"] == pid) & (supm["week_start"] == w)] if not supm.empty else None
+        row = {"Week of": w}
+        for label, key in E1_METRICS:
+            n, dn = _rate(a, key); row[label] = n / dn if dn else np.nan
+        for label, key in SUP_METRICS:
+            n, dn = _rate(b, key); row[label] = n / dn if dn else np.nan
+        out.append(row)
+    return pd.DataFrame(out).set_index("Week of") if out else pd.DataFrame()
+
+
+def category_scores(supm, pid, weeks=None) -> pd.DataFrame:
+    if supm is None or supm.empty:
+        return pd.DataFrame()
+    b = supm[supm["e1_id"] == pid]
+    if weeks is not None:
+        b = b[b["week_start"].isin(weeks)]
+    rows = []
+    for cat in S_CATEGORIES:
+        y, n = b[f"cat_yes:{cat}"].sum(), b[f"cat_n:{cat}"].sum()
+        rows.append({"Category": cat, "Score": fmt_rate(y, n), "_share": y / n if n else np.nan})
+    return pd.DataFrame(rows)
+
+
+def ride_history(subs, pid) -> pd.DataFrame:
+    """Every ride involving this enumerator: their E1 forms and supervisor forms about them."""
+    d = subs[subs["e1_id"] == pid].sort_values(["ride_date", "submitted_at"])
+    rows = []
+    for _, r in d.iterrows():
+        if r["role"] == E1:
+            a = assess_issues(r)
+            rows.append({"Ride date": fmt_day(r["ride_date"]), "Planned code": _txt(r["batch_code"]),
+                         "Form": "E1 form", "By": _txt(r["person"]),
+                         "Issue status": a["status"], "Details": "; ".join(a["items"] + a["recording"]) or "—"})
+        else:
+            yes = n = 0
+            for fields in S_CATEGORIES.values():
+                for f in fields:
+                    v = _code(r.get(f)); yes += v == "1"; n += v in ("0", "1")
+            fb = " · ".join(x for x in [_txt(r.get("sup_feedback_additional_strengths")) and f"+ {_txt(r.get('sup_feedback_additional_strengths'))}",
+                                         _txt(r.get("sup_feedback_additional_improvements")) and f"Δ {_txt(r.get('sup_feedback_additional_improvements'))}"] if x)
+            rows.append({"Ride date": fmt_day(r["ride_date"]), "Planned code": _txt(r["batch_code"]),
+                         "Form": "Supervisor observation", "By": _txt(r["person"]),
+                         "Issue status": f"Protocol {fmt_rate(yes, n)}", "Details": fb or "—"})
+    return pd.DataFrame(rows)
+
+
+def feedback_card(e1m, supm, pid, weeks=None) -> str:
+    """Markdown feedback summary for one enumerator over the chosen weeks."""
+    names = _people(e1m, supm)
+    name = names.get(pid, str(pid))
+    a = e1m[e1m["e1_id"] == pid] if not e1m.empty else e1m
+    b = supm[supm["e1_id"] == pid] if not supm.empty else supm
+    if weeks is not None:
+        a = a[a["week_start"].isin(weeks)] if not a.empty else a
+        b = b[b["week_start"].isin(weeks)] if not b.empty else b
+    dates = pd.concat([a["ride_date"] if not a.empty else pd.Series(dtype="datetime64[ns]"),
+                       b["ride_date"] if not b.empty else pd.Series(dtype="datetime64[ns]")]).dropna()
+    period = f"{fmt_day(dates.min())} – {fmt_day(dates.max())}" if not dates.empty else "—"
+
+    L = [f"# Feedback — {name}", "",
+         f"**Period:** {period}  ",
+         f"**Rides as Enumerator 1:** {len(a)}  ·  **Rides observed by a supervisor:** {len(b)}", "",
+         "## Your forms (data quality)"]
+    for label, key in E1_METRICS:
+        L.append(f"- {label}: {fmt_rate(*_rate(a, key))}")
+    L += ["", "## Supervisor observations"]
+    for label, key in SUP_METRICS:
+        L.append(f"- {label}: {fmt_rate(*_rate(b, key))}")
+
+    cats = category_scores(supm, pid, weeks)
+    if not cats.empty and cats["_share"].notna().any():
+        c = cats.dropna(subset=["_share"]).sort_values("_share", ascending=False)
+        strong = c[c["_share"] >= PERF_TARGET]
+        weak = c[c["_share"] < PERF_TARGET].sort_values("_share")
+        L += ["", "## Strongest areas"]
+        L += [f"- {r.Category}: {r.Score}" for r in strong.itertuples()] or ["- —"]
+        L += ["", "## Areas to work on"]
+        L += [f"- {r.Category}: {r.Score}" for r in weak.itertuples()] or ["- None below target"]
+
+    if not a.empty:
+        unexplained = [(r.ride_date, r.batch_code, [i for i in r.issue_items if "(no reason)" in i])
+                       for r in a.itertuples()]
+        unexplained = [u for u in unexplained if u[2]]
+        L += ["", "## Flagged values with no explanation recorded"]
+        L += [f"- {fmt_day(d)} · {c}: {', '.join(i.replace(' (no reason)', '') for i in items)}"
+              for d, c, items in unexplained] or ["- None"]
+
+    if not b.empty:
+        comments = [(r.ride_date, r.supervisor, r.strengths, r.improvements) for r in b.itertuples()
+                    if r.strengths or r.improvements]
+        if comments:
+            L += ["", "## Supervisor comments"]
+            for d, s, st_, im in comments:
+                L.append(f"- {fmt_day(d)} ({s}):" + (f" Strengths: {st_.rstrip('. ')}." if st_ else "")
+                         + (f" To improve: {im.rstrip('. ')}." if im else ""))
+    return "\n".join(L) + "\n"
+
+
+def supervisor_observations(subs: pd.DataFrame):
+    """One row per supervisor form with category scores. Returns (table, css)."""
+    sp = subs[subs["role"] == SUP].sort_values(["ride_date", "submitted_at"])
+    rows = []
+    for _, r in sp.iterrows():
+        row = {"Ride date": fmt_day(r["ride_date"]), "Planned code": _txt(r["batch_code"]),
+               "Enumerator 1": _txt(r["e1_name"]), "Supervisor": _txt(r["person"])}
+        yt = nt = 0
+        for cat, fields in S_CATEGORIES.items():
+            vals = [_code(r.get(f)) for f in fields]
+            y = sum(v == "1" for v in vals); n = sum(v in ("0", "1") for v in vals)
+            row[cat] = f"{y}/{n}" if n else "—"
+            yt += y; nt += n
+        row["Total"]        = f"{yt}/{nt}" if nt else "—"
+        row["Count match"]  = MATCH_LABELS.get(_code(r.get("s17")), "—")
+        row["Ticket match"] = MATCH_LABELS.get(_code(r.get("s20")), "—")
+        row["Strengths"]    = _txt(r.get("sup_feedback_additional_strengths")) or "—"
+        row["Improvements"] = _txt(r.get("sup_feedback_additional_improvements")) or "—"
+        rows.append(row)
+    t = pd.DataFrame(rows)
+    css = _empty_css(t)
+    if t.empty:
+        return t, css
+
+    def imperfect(s):
+        try:
+            y, n = s.split("/"); return int(y) < int(n)
+        except Exception:
+            return False
+    for cat in list(S_CATEGORIES) + ["Total"]:
+        css.loc[t[cat].map(imperfect), cat] = RED
+    for c in ["Count match", "Ticket match"]:
+        css.loc[t[c].str.startswith("✗"), c] = RED
+    return t, css

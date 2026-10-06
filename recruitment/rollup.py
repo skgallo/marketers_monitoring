@@ -53,8 +53,13 @@ SIGNUP_DIFF_MAX      = 2    # Flag 3: max |signup - announcement| discrepancy (m
 PITCH_TARGET_MIN     = 25   # Flag 4a/4b: target pitch/pause duration
 PITCH_TOL_MIN        = 2    # Flag 4a/4b: tolerance either side (±2 → 23–27 min)
 RIDE_MIN_MIN         = 35   # Flag 6: minimum expected ride duration (10 ann/signup + 25 pause/pitch)
+SIGNUP_MIN           = 14   # Flag 7: minimum expected sign-ups
 
 TEST_USERNAMES = {'testing', 'test'}   # drop these submissions
+
+# Supervisor names — choice list "supervisor" in the SurveyCTO form.
+# Update here if the roster changes (-55 = Other → supervisor_oth is used).
+SUPERVISOR_LABELS = {'1': 'Fatu', '2': 'Joseph', '3': 'Kadie', '4': 'Sahr'}
 
 # ---------------------------------------------------------------------------
 # Batch code helpers
@@ -135,11 +140,18 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
     if 'username' in df.columns:
         df = df[~df['username'].str.lower().isin(TEST_USERNAMES)].copy()
 
-    # Keep only Enumerator 1 submissions (role_type = 1).
-    # Supervisor submissions (role_type = 0) are handled separately in Tab 3.
-    # If role_type is absent from the form, all submissions are kept.
+    # Tag every submission with its role — all submissions are kept.
+    # "Enumerator 1" = role_type 1 (or missing/unknown — older forms without the field).
+    # "Supervisor"   = role_type 0.
+    # The display layer uses this column to separate E1 and supervisor rows.
     if 'role_type' in df.columns:
-        df = df[df['role_type'].astype(str).str.strip() == '1'].copy()
+        rt = df['role_type'].astype(str).str.strip()
+        df['role'] = rt.map({
+            '1': 'Enumerator 1', '1.0': 'Enumerator 1',
+            '0': 'Supervisor',   '0.0': 'Supervisor',
+        }).fillna('Enumerator 1')
+    else:
+        df['role'] = 'Enumerator 1'
 
     # Extract submission year for typo fixes
     if 'SubmissionDate' in df.columns:
@@ -350,7 +362,7 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Flag 7: low signups ───────────────────────────────────────────────────
     total_signups = pd.to_numeric(df.get('total_signups', pd.Series(dtype=float)), errors='coerce')
-    df['flag_7_low_signup'] = flag_where(total_signups < 14, total_signups)
+    df['flag_7_low_signup'] = flag_where(total_signups < SIGNUP_MIN, total_signups)
 
     # ── Flag 5: any timing/chronological issue ───────────────────────────────
     timing_flags = [
@@ -362,11 +374,93 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     ]
     df['flag_5_any_timing'] = np.where(
         has_sub,
-        df[timing_flags].apply(lambda row: int(row.fillna(0).eq(1).any()), axis=1),
+        df[timing_flags].apply(lambda row: int(pd.to_numeric(row, errors='coerce').eq(1).any()), axis=1),
         pd.NA
     )
 
     return df
+
+# ---------------------------------------------------------------------------
+# People and dates
+# ---------------------------------------------------------------------------
+
+def _code(v):
+    """Normalise a select_one value: 1.0 → '1', NaN → None."""
+    if v is None or (isinstance(v, float) and np.isnan(v)) or pd.isna(v):
+        return None
+    s = str(v).strip()
+    if s in ('', 'nan', 'None'):
+        return None
+    return s[:-2] if s.endswith('.0') else s
+
+
+def add_people(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Identify the people on each form.
+
+    e1_id / e1_name : Enumerator 1 (a02_1 / a02_1_lab). Recorded on BOTH E1 and
+                      supervisor forms, so a supervisor form says which E1 was observed.
+                      e1_id is the roster code (stable even if name spelling varies);
+                      'Other' (-55) uses the typed name as the id.
+    sup_name        : supervisor (supervisor code → SUPERVISOR_LABELS; -55 → supervisor_oth).
+    person          : who filled THIS form (E1 name on E1 forms, supervisor on supervisor forms).
+    """
+    df = df.copy()
+    idx = df.index
+    username = df.get('username', pd.Series(None, index=idx))
+
+    e1_code = df.get('a02_1', pd.Series(None, index=idx)).map(_code)
+    e1_lab  = df.get('a02_1_lab', pd.Series(None, index=idx)).map(
+        lambda v: str(v).strip() if pd.notna(v) and str(v).strip() not in ('', 'nan') else None)
+    df['e1_id'] = [
+        (f"oth:{lab.lower()}" if c == '-55' and lab else c) if c else (f"user:{u}" if pd.notna(u) else None)
+        for c, lab, u in zip(e1_code, e1_lab, username)
+    ]
+    # Canonical display name per e1_id = most frequent spelling
+    canon = (pd.DataFrame({'id': df['e1_id'], 'lab': e1_lab}).dropna()
+             .groupby('id')['lab'].agg(lambda s: s.value_counts().index[0]).to_dict())
+    df['e1_name'] = [canon.get(i) or (str(u) if pd.notna(u) else None)
+                     for i, u in zip(df['e1_id'], username)]
+
+    sup_code = df.get('supervisor', pd.Series(None, index=idx)).map(_code)
+    sup_oth  = df.get('supervisor_oth', pd.Series(None, index=idx))
+    df['sup_name'] = [
+        (str(o).strip() if c == '-55' and pd.notna(o) else SUPERVISOR_LABELS.get(c, c)) if c else None
+        for c, o in zip(sup_code, sup_oth)
+    ]
+    is_sup = df['role'] == 'Supervisor'
+    df['person'] = np.where(is_sup, df['sup_name'], df['e1_name'])
+    df['person'] = df['person'].where(pd.notna(df['person']), username)
+
+    # Ride date: form date (a01_r) → actual code date → submission date
+    form_date = pd.to_datetime(df.get('a01_r', pd.Series(None, index=idx)), format='mixed', errors='coerce')
+    code_date = pd.to_datetime(df.get('a_date', pd.Series(None, index=idx)), format='%d%m%Y', errors='coerce')
+    sub_date  = pd.to_datetime(df.get('SubmissionDate', pd.Series(None, index=idx)),
+                               format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
+    ride_date = form_date.fillna(code_date).fillna(sub_date.dt.normalize())
+    df['ride_date']  = ride_date.dt.normalize()
+    df['week_start'] = (df['ride_date'] - pd.to_timedelta(df['ride_date'].dt.weekday, unit='D'))
+    df['submitted_at'] = sub_date
+    df['form_id'] = df.get('KEY', pd.Series(None, index=idx)).fillna(pd.Series(idx.astype(str), index=idx))
+    return df
+
+
+def prepare_submissions(submissions_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    All cleaned submissions (E1 and supervisor), one row per form, with batch
+    code flags, timing flags, people, ride date and duplicate-E1 flag.
+    """
+    subs = clean_submissions(submissions_df)
+    subs = add_batch_code_flags(subs)
+    subs = add_timing_flags(subs)
+    subs = add_people(subs)
+
+    # More than one E1 form for the same planned code (mistake, or two E1s on one ride)
+    e1_mask = subs['role'] == 'Enumerator 1'
+    e1_counts = subs[e1_mask].groupby('batch_code').size().to_dict()
+    subs['n_e1_forms'] = subs['batch_code'].map(lambda bc: e1_counts.get(bc, 0))
+    subs['flag_duplicate_submission'] = np.where(e1_mask & (subs['n_e1_forms'] > 1), 1, 0)
+    return subs.reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
 # Main rollup
@@ -374,7 +468,12 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 def rollup(submissions_df: pd.DataFrame, batch_codes_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Core rollup: one row per planned batch code.
+    Core rollup: one row per submission, grouped under planned batch codes.
+
+    A planned batch code may appear multiple times if:
+      - Both an Enumerator 1 and a Supervisor submitted (expected).
+      - More than one E1 submitted for the same ride (flagged as duplicate).
+    Planned codes with no submission appear once with NaN submission fields.
 
     Parameters
     ----------
@@ -383,24 +482,13 @@ def rollup(submissions_df: pd.DataFrame, batch_codes_df: pd.DataFrame) -> pd.Dat
 
     Returns
     -------
-    DataFrame with one row per planned batch_code, all flags attached.
+    DataFrame with one row per submission (or one row per unmatched planned
+    code), all flags attached.
     """
-    subs = clean_submissions(submissions_df)
-    subs = add_batch_code_flags(subs)
-    subs = add_timing_flags(subs)
+    subs = prepare_submissions(submissions_df)
 
-    # Flag batch codes with more than one enumerator submission (ambiguous match)
-    dup_counts = subs.groupby('batch_code').size()
-    subs['flag_duplicate_submission'] = subs['batch_code'].map(
-        lambda bc: 1 if dup_counts.get(bc, 0) > 1 else 0
-    )
-
-    # When duplicates exist, keep the most recent submission per batch_code
-    if 'SubmissionDate' in subs.columns:
-        subs['_sort_date'] = pd.to_datetime(subs['SubmissionDate'], format='mixed', errors='coerce')
-        subs = subs.sort_values('_sort_date').drop_duplicates(subset='batch_code', keep='last')
-
-    # Left-join frame onto submissions (frame is the source of truth)
+    # Left-join frame onto submissions (frame is the source of truth).
+    # Multiple submissions for the same batch_code produce multiple rows.
     result = batch_codes_df.merge(subs, on='batch_code', how='left')
 
     # Status column

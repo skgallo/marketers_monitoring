@@ -21,7 +21,7 @@ Open the Sheet, click the tab → look at the URL: #gid=1234567 is the GID.
 
 import streamlit as st
 import pandas as pd
-from rollup import rollup
+from rollup import rollup, prepare_submissions
 
 # ---------------------------------------------------------------------------
 # Tab URL helpers
@@ -64,17 +64,14 @@ def _read_tab(url: str, tab_name: str) -> pd.DataFrame:
 @st.cache_data(ttl=300)   # refresh every 5 minutes; user can force with Refresh button
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Load submissions and batch_codes from Google Sheets, run the rollup,
-    and return (submissions_raw, batch_codes, result).
-
-    The Streamlit cache means the Sheet is only re-fetched after 5 minutes
-    (or when the user clicks Refresh). The app shows which tab was read and when.
+    Load submissions and batch_codes from Google Sheets and prepare them.
 
     Returns
     -------
     submissions_raw : raw DataFrame straight from the Sheet
     batch_codes     : batch codes frame
-    result          : rollup output — one row per planned batch code
+    subs            : prepare_submissions() output — one row per form (E1 and
+                      supervisor), with flags, people and ride dates
     """
     submissions_url  = _get_url("submissions_url")
     batch_codes_url  = _get_url("batch_codes_url")
@@ -82,30 +79,42 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     submissions_raw = _read_tab(submissions_url,  "submissions")
     batch_codes     = _read_tab(batch_codes_url,  "batch_codes")
 
-    result = rollup(submissions_raw, batch_codes)
-    return submissions_raw, batch_codes, result
+    subs = prepare_submissions(submissions_raw)
+    return submissions_raw, batch_codes, subs
+
+
+@st.cache_data(ttl=300)
+def load_resolutions() -> pd.DataFrame:
+    """
+    Optional 'resolutions' tab: columns batch_code, resolution (free text),
+    and anything else you like (resolved_by, date). Add its CSV export URL as
+    resolutions_url in secrets to enable. Returns an empty frame if not set.
+    """
+    try:
+        url = st.secrets["resolutions_url"]
+    except Exception:
+        return pd.DataFrame()
+    try:
+        return _read_tab(url, "resolutions")
+    except RuntimeError:
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
 # Diagnostics helper (shown in the dashboard's diagnostics section)
 # ---------------------------------------------------------------------------
 
-def diagnostics(submissions_raw: pd.DataFrame, batch_codes: pd.DataFrame, result: pd.DataFrame) -> dict:
-    """
-    Return a dict of diagnostic counts shown in the dashboard footer.
-    Fail loudly: missing columns or unexpected row counts surface here.
-    """
-    submitted    = result["submission_status"].eq("Submitted").sum()
-    no_sub       = result["submission_status"].eq("No submission").sum()
-
-    diag = {
-        "submissions_tab_rows"  : len(submissions_raw),
-        "batch_codes_tab_rows"  : len(batch_codes),
-        "rollup_rows"           : len(result),
-        "submitted"             : int(submitted),
-        "no_submission"         : int(no_sub),
+def diagnostics(submissions_raw: pd.DataFrame, batch_codes: pd.DataFrame, subs: pd.DataFrame) -> dict:
+    """Counts shown in the dashboard footer — if something looks off, start here."""
+    role = subs.get("role", pd.Series(dtype=str))
+    return {
+        "submissions_tab_rows" : len(submissions_raw),
+        "batch_codes_tab_rows" : len(batch_codes),
+        "forms_after_cleaning" : len(subs),
+        "e1_forms"             : int((role == "Enumerator 1").sum()),
+        "supervisor_forms"     : int((role == "Supervisor").sum()),
+        "dropped_as_test"      : len(submissions_raw) - len(subs),
     }
-    return diag
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +141,5 @@ if __name__ == "__main__":
     bc = _read_tab(bc_url, "batch_codes")
     print(f"  {len(bc)} rows × {len(bc.columns)} cols")
 
-    from rollup import rollup
-    result = rollup(subs, bc)
-    print(f"Rollup: {len(result)} rows")
-    print(diagnostics(subs, bc, result))
+    prepared = prepare_submissions(subs)
+    print(diagnostics(subs, bc, prepared))
