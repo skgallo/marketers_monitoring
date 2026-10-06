@@ -177,6 +177,10 @@ form** — not only the planned code picked from the list. A ride can carry seve
 | ⚪ **Not submitted** | No form describes this ride | Check whether the ride happened |
 | 🟢 **Done as planned** | One E1 form, filed under the right code, actual code = planned code | — |
 
+**Date … Treatment** show what actually happened (from the actual batch code on the E1 form, or the
+supervisor form if there is no E1 form). 🔴 Red = treatment or route differs from plan; 🔵 blue = date, team,
+marketer ID or ride # differs. If forms disagree, both values are shown ("A / B"). "—" = no form yet.
+
 **E1 form / Supervisor form** show who submitted for the ride (✗ = missing).
 **What changed** lists planned → actual for each part that differs (one entry per form when there are several).
 **Forms that don't match** lists forms whose selected planned code is not in the batch_codes tab.

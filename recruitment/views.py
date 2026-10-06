@@ -378,37 +378,63 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             e1_col = "✗ none" + (f" (supervisor observed {observed})" if observed else "")
         sup_col = f"✓ {_names(sp['person'])}" if len(sp) else "✗ none"
 
+        # Actual components (what happened), from the forms describing this ride.
+        # E1 forms take precedence; supervisor forms are used when there is no E1 form.
+        def actual(col, fmt=lambda x: x):
+            vals = [fmt(_txt(x)) for x in basis.get(col, pd.Series(dtype=str))] if len(basis) else []
+            vals = [x for x in dict.fromkeys(vals) if x]
+            return " / ".join(vals) if vals else "—"
+
+        def differs(col, planned_val):
+            vals = {_txt(x) for x in basis.get(col, pd.Series(dtype=str))} - {""} if len(basis) else set()
+            return bool(vals) and vals != {planned_val or ""}
+
         last = d["submitted_at"].max() if not d.empty else pd.NaT
         rows.append({
             "Status":         " + ".join(tags),
             "Planned code":   code,
-            "Date":           fmt_code_date(p["date"]),
-            "Team":           p["team"] or "",
-            "Mkt ID":         p["mkt_id"] or "",
-            "Route":          p["route"] or "",
-            "Ride #":         p["ride_num"] or "",
-            "Treatment":      TREAT.get(p["treatment"], p["treatment"] or ""),
+            "Actual code(s)": ", ".join(_txt(c) for c in basis["actual_batch_code"]) or "—",
+            "Date":           actual("a_date", fmt_code_date),
+            "Team":           actual("a_team"),
+            "Mkt ID":         actual("a_mkt_id"),
+            "Route":          actual("a_route"),
+            "Ride #":         actual("a_ride_num"),
+            "Treatment":      actual("a_treatment", lambda x: TREAT.get(x, x)),
             "E1 form":        e1_col,
             "Supervisor form": sup_col,
             "Code selection": "; ".join(notes) or "—",
-            "Actual code(s)": ", ".join(_txt(c) for c in basis["actual_batch_code"]),
             "What changed":   what,
             "Last submitted": last.strftime("%d %b %H:%M") if pd.notna(last) else "",
             "Resolution":     res_map.get(code, ""),
             "_tags":          tags,
             "_corridor":      p["corridor"],
             "_date":          pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce"),
+            "_team":          p["team"] or "",
+            "_ride":          p["ride_num"] or "",
             "_rank":          STATUS_RANK[tags[0]],
+            # which actual components differ from plan (for colouring)
+            "_diff": {
+                "Date":   differs("a_date", p["date"]),
+                "Team":   differs("a_team", p["team"]),
+                "Mkt ID": differs("a_mkt_id", p["mkt_id"]),
+                "Ride #": differs("a_ride_num", p["ride_num"]),
+                "Treatment": differs("a_treatment", p["treatment"]),
+                "Route":  differs("a_route", p["route"]),
+            },
         })
 
     t = pd.DataFrame(rows)
     if t.empty:
         return t, _empty_css(t)
-    t = t.sort_values(["_date", "Team", "Ride #", "Planned code"]).reset_index(drop=True)
+    t = t.sort_values(["_date", "_team", "_ride", "Planned code"]).reset_index(drop=True)
     css = _empty_css(t)
     not_sub = t["_tags"].map(lambda x: x == ["Not submitted"])
     css.loc[not_sub] = GRAY
     css["Status"] = t["_tags"].map(lambda x: STATUS_STYLE.get(x[0], ""))
+    # Actual components: red = wrong ride for the design (treatment, route); blue = confirm
+    for col, style in [("Treatment", RED), ("Route", RED),
+                       ("Date", BLUE), ("Team", BLUE), ("Mkt ID", BLUE), ("Ride #", BLUE)]:
+        css.loc[t["_diff"].map(lambda dd: dd[col]), col] = style
     css.loc[t["Code selection"] != "—", "Code selection"] = RED
     css.loc[t["E1 form"].str.startswith("✗") & ~not_sub, "E1 form"] = RED
     css.loc[t["E1 form"].str.contains("×", regex=False), "E1 form"] = RED
