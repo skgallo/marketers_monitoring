@@ -19,6 +19,8 @@ How to find the GID
 Open the Sheet, click the tab → look at the URL: #gid=1234567 is the GID.
 """
 
+import re
+
 import streamlit as st
 import pandas as pd
 from rollup import rollup, prepare_submissions
@@ -83,14 +85,100 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return submissions_raw, batch_codes, subs
 
 
+# ---------------------------------------------------------------------------
+# Reviews tab — read, and write back from the dashboard
+# ---------------------------------------------------------------------------
+# Writing needs a Google service account (a "robot" login) in secrets:
+#
+#   [gcp_service_account]
+#   type = "service_account"
+#   project_id = "..."
+#   private_key_id = "..."
+#   private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+#   client_email = "hfc-dashboard@PROJECT.iam.gserviceaccount.com"
+#   client_id = "..."
+#   token_uri = "https://oauth2.googleapis.com/token"
+#
+# and the Sheet shared with client_email as Editor. The Sheet ID is taken from
+# submissions_url (or set sheet_id = "..." explicitly).
+# Without it, reviews are read-only from reviews_url (a CSV export link).
+
+REVIEWS_TAB = "reviews"
+REVIEW_COLUMNS = ["timestamp", "batch_code", "issue", "decision", "note", "reviewed_by",
+                  "form_id", "field", "correct_value"]
+
+
+def can_write_reviews() -> bool:
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
+def _sheet_id() -> str:
+    try:
+        return st.secrets["sheet_id"]
+    except Exception:
+        pass
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", _get_url("submissions_url"))
+    if not m:
+        raise RuntimeError("Could not find the Sheet ID in submissions_url — add sheet_id to secrets.")
+    return m.group(1)
+
+
+@st.cache_resource
+def _sheets_client():
+    import gspread
+    return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+
+
+def _reviews_worksheet():
+    """The reviews worksheet, created (with headers) if it doesn't exist yet."""
+    import gspread
+    sh = _sheets_client().open_by_key(_sheet_id())
+    try:
+        ws = sh.worksheet(REVIEWS_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(REVIEWS_TAB, rows=1000, cols=len(REVIEW_COLUMNS))
+    header = ws.row_values(1)
+    missing = [c for c in REVIEW_COLUMNS if c not in header]
+    if missing:
+        header = header + missing
+        if ws.col_count < len(header):
+            ws.add_cols(len(header) - ws.col_count)
+        ws.update(values=[header], range_name="A1")
+    return ws, header
+
+
+def append_reviews(rows: list) -> int:
+    """Append decision rows (dicts keyed by REVIEW_COLUMNS) to the reviews tab."""
+    if not rows:
+        return 0
+    ws, header = _reviews_worksheet()
+    ws.append_rows([[str(r.get(c, "") or "") for c in header] for r in rows],
+                   value_input_option="RAW")
+    load_reviews.clear()
+    return len(rows)
+
+
 @st.cache_data(ttl=300)
 def load_reviews() -> pd.DataFrame:
     """
-    Optional 'reviews' tab — your decisions about flagged differences:
-        batch_code | issue | decision | note | reviewed_by | date
-    (see views.review_map for accepted values). Add the tab's CSV export URL as
-    reviews_url in secrets to enable. Returns an empty frame if not set.
+    Your decisions about flagged differences, one row per decision
+    (see REVIEW_COLUMNS). Read through the service account when configured,
+    otherwise from reviews_url. Empty frame if neither is set or the tab is empty.
     """
+    if can_write_reviews():
+        try:
+            ws, _ = _reviews_worksheet()
+            values = ws.get_all_values()
+            if len(values) <= 1:
+                return pd.DataFrame(columns=values[0] if values else REVIEW_COLUMNS)
+            return pd.DataFrame(values[1:], columns=values[0]).replace({"": None})
+        except Exception as e:
+            out = pd.DataFrame()
+            out.attrs["error"] = f"Could not read the reviews tab: {e}"
+            return out
     url = None
     for key in ("reviews_url", "resolutions_url"):
         try:
@@ -102,8 +190,10 @@ def load_reviews() -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return _read_tab(url, "reviews")
-    except RuntimeError:
-        return pd.DataFrame()
+    except RuntimeError as e:
+        out = pd.DataFrame()
+        out.attrs["error"] = str(e)
+        return out
 
 
 # ---------------------------------------------------------------------------

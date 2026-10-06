@@ -23,7 +23,8 @@ import pandas as pd
 import streamlit as st
 
 from auth import require_password
-from data_io import load_data, load_reviews, diagnostics
+from data_io import load_data, load_reviews, append_reviews, can_write_reviews, diagnostics
+import datetime as dt
 from rollup import CORRIDORS, DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX, \
                    PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN
 import views as v
@@ -112,8 +113,40 @@ def filter_subs(df):
 subs_f = filter_subs(subs)
 st.sidebar.caption("Tab 3 uses all dates — pick weeks inside the tab.")
 
-tab1, tab2, tab3 = st.tabs(["1 · Ride verification", "2 · Implementation fidelity",
-                            "3 · Enumerator performance"])
+tab0, tab1, tab2, tab3 = st.tabs(["Today", "1 · Ride verification", "2 · Implementation fidelity",
+                                  "3 · Enumerator performance"])
+
+# ---------------------------------------------------------------------------
+# TODAY — what needs action now (phone-friendly)
+# ---------------------------------------------------------------------------
+
+with tab0:
+    day_opts = sorted(ledger_all["_date"].dropna().unique()) if not ledger_all.empty else []
+    if not day_opts:
+        st.info("No planned rides in the batch_codes tab.")
+    else:
+        today = pd.Timestamp.now(tz="Africa/Freetown").normalize().tz_localize(None)
+        with_forms = sorted(set(subs["ride_date"].dropna()) & set(day_opts))
+        default = today if today in day_opts else (with_forms[-1] if with_forms else day_opts[-1])
+        day = st.selectbox("Day", day_opts, index=day_opts.index(default),
+                           format_func=lambda d: v.fmt_day(pd.Timestamp(d)) + (" (today)" if d == today else ""),
+                           key="today_day")
+        board = v.today_board(ledger_all, day)
+        forms_day = subs[subs["ride_date"] == day]
+        n_rides = int((ledger_all["_date"] == day).sum())
+        states = pd.concat([t["State"] for t, _ in board.values()]) if board else pd.Series(dtype=str)
+        c = st.columns(4)
+        c[0].metric("Rides planned", n_rides)
+        c[1].metric("Forms in", len(forms_day))
+        c[2].metric("Need action", int(states.isin(["Action", "Overdue"]).sum()))
+        last = forms_day["submitted_at"].max() if not forms_day.empty else pd.NaT
+        c[3].metric("Last form", (last.tz_localize("UTC").tz_convert("Africa/Freetown").strftime("%H:%M")
+                                  if pd.notna(last) else "—"))
+        st.caption("🔴 Action / Overdue — call the team · 🟢 OK / Reviewed · ⚪ Waiting — ride not done yet. "
+                   "Press 🔄 Refresh for the newest forms. Record decisions in tab 1.")
+        for team, (t, css) in board.items():
+            st.markdown(f"##### Team {team}")
+            show(t, css)
 
 # ---------------------------------------------------------------------------
 # TAB 1 — Ride verification
@@ -155,17 +188,90 @@ with tab1:
         m &= ledger["Review status"].str.startswith("✓")
     elif sel_review == "Fix needed":
         m &= ledger["_fix_needed"]
-    if reviews.empty:
-        st.info("To approve planned changes or mark fixes, add a **reviews** tab to the Google Sheet "
-                "and its CSV link as `reviews_url` in the Streamlit secrets — see *How to record decisions* below.")
+    if reviews.attrs.get("error"):
+        st.warning(reviews.attrs["error"])
     show(ledger[m], ledger_css[m])
     download(ledger[m], "ride_verification.csv", "dl_ledger")
+
+    # ---- Record decisions --------------------------------------------------
+    st.markdown("#### Record decisions")
+    writable = can_write_reviews()
+    st.caption("One row per open issue. Choose a decision, add a note (what happened / what to tell the "
+               "enumerator) and, if the data should be corrected, the correct value. Saved rows go to the "
+               "**reviews** tab of the Sheet — the flag stays visible and is marked as reviewed. "
+               "Decisions are never deleted: to change one, save a new decision for the same issue.")
+    if not writable:
+        st.info("Saving from the dashboard isn't set up yet — it needs a Google service account in the "
+                "Streamlit secrets (see *How to record decisions* below). Until then this table is read-only.")
+    d1, d2 = st.columns([2, 3])
+    with d1:
+        reviewer = st.text_input("Your name", key="reviewer", placeholder="e.g. Sofia")
+    with d2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        include_reviewed = st.toggle("Also show issues already reviewed (to change a decision)", value=False)
+    pend = v.pending_decisions(ledger, include_reviewed)
+    if pend.empty:
+        st.success("No open issues to decide for the selected rides. 🎉")
+    else:
+        ver = st.session_state.get("dec_ver", 0)
+        edited = st.data_editor(
+            pend, key=f"decisions_{ver}", hide_index=True, width="stretch",
+            disabled=["Planned code", "Ride", "Issue", "Details", "Current decision"],
+            column_config={
+                "_form_id": None,
+                "Decision": st.column_config.SelectboxColumn(
+                    "Decision", options=v.DECISION_OPTIONS, width="small",
+                    help="Approved = planned/accepted change · Fix needed = tell the enumerator / correct it · "
+                         "Fixed = dealt with"),
+                "Note": st.column_config.TextColumn("Note", width="large"),
+                "Field": st.column_config.TextColumn("Field", width="small",
+                                                     help="Variable to correct in cleaning (e.g. batch_code_pre)"),
+                "Correct value": st.column_config.TextColumn("Correct value", width="medium",
+                                                             help="Leave blank if no data correction is needed"),
+                "Details": st.column_config.TextColumn("Details", width="large"),
+            },
+        )
+        chosen = edited[edited["Decision"].fillna("") != ""]
+        b1, b2 = st.columns([1, 4])
+        with b1:
+            save = st.button(f"💾 Save {len(chosen)} decision(s)", type="primary",
+                             disabled=not writable or chosen.empty)
+        with b2:
+            if not chosen.empty and not reviewer.strip():
+                st.caption("Add your name before saving.")
+        if save:
+            if not reviewer.strip():
+                st.error("Please add your name first.")
+            else:
+                now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                rows = [{
+                    "timestamp": now, "batch_code": r["Planned code"], "issue": r["Issue"],
+                    "decision": r["Decision"], "note": r["Note"] or "", "reviewed_by": reviewer.strip(),
+                    "form_id": r["_form_id"] or "",
+                    "field": (r["Field"] or "") if (r["Correct value"] or "") else "",
+                    "correct_value": r["Correct value"] or "",
+                } for _, r in chosen.iterrows()]
+                try:
+                    n = append_reviews(rows)
+                    st.session_state["dec_ver"] = ver + 1
+                    st.toast(f"Saved {n} decision(s) to the reviews tab.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save to the Sheet: {e}")
 
     fixes = v.fixes_to_communicate(subs, batch_codes, reviews)
     if not fixes.empty:
         with st.expander(f"🔧 Fixes to communicate to enumerators ({len(fixes)})", expanded=True):
             show(fixes)
             download(fixes, "fixes_to_communicate.csv", "dl_fixes")
+
+    corr = v.corrections_table(reviews)
+    if not corr.empty:
+        with st.expander(f"🧹 Corrections for the cleaning do-file ({len(corr)})"):
+            st.caption("Latest correction per form and variable. The do-file `apply_reviews.do` reads the "
+                       "reviews tab and applies these — `form_id` is the SurveyCTO KEY.")
+            show(corr)
+            download(corr, "corrections.csv", "dl_corr")
 
     st.markdown("#### Forms that don't match any planned ride")
     unmatched = v.unmatched_submissions(filter_subs(subs), batch_codes)
@@ -209,27 +315,24 @@ history is kept, but you know it's been dealt with. **Review status** sums this 
 **Needs decision on** lists the issues on that ride you haven't reviewed yet — use these exact names in the reviews tab.
 """)
 
-    with st.expander("How to record decisions (approve planned changes, mark fixes)"):
+    with st.expander("How to record decisions"):
         st.markdown("""
-Add a tab called **reviews** to the Google Sheet with these columns, one row per decision:
+**Daily routine:** set the *Review* filter to *Not reviewed yet*, then go through **Record decisions**:
 
-| batch_code | issue | decision | note | reviewed_by | date |
-|---|---|---|---|---|---|
-| 051020261000EPCT2N | Route | Approved | Route blocked — team moved to EEBL | Sofia | 05/10/2026 |
-| 051020262000MTEP1N | Treatment | Fix needed | Remind Daniel: ride 1 was Normal, not Script | Sofia | 06/10/2026 |
-| 051020261000CTEP3N | Wrong code | Fixed | Cecil told; code corrected in cleaning | Sofia | 06/10/2026 |
+| Decision | Use when | What happens |
+|---|---|---|
+| **Approved** | The difference was planned or is acceptable (e.g. the team was moved to another route) | Flag gets a ✓; doesn't count against the enumerator |
+| **Fix needed** | A mistake to tell the enumerator about and/or correct | Appears in *Fixes to communicate* and the enumerator's feedback card |
+| **Fixed** | The mistake has been communicated / corrected | Flag gets a ✓; still counts in the enumerator's batch-code score |
 
-- **batch_code** — the *planned* code (first column of the table above).
-- **issue** — `Route`, `Treatment`, `Date`, `Team`, `Mkt ID`, `Ride #`, `Batch code`, `Wrong code`,
-  `Duplicate E1`, `Missing form`, or `All` (everything on that ride).
-- **decision** — the flag always stays visible; the decision marks it as reviewed:
-  `Approved` (planned change — doesn't count against the enumerator) ·
-  `Fix needed` (to communicate — appears in *Fixes to communicate* and the enumerator's feedback card) ·
-  `Fixed` (dealt with — still counts in the enumerator's batch-code score).
-- If you add a later row for the same batch_code + issue, the later one wins — so you can go Fix needed → Fixed.
+**Note** — what happened, or what to tell the enumerator. **Field / Correct value** — fill these when the
+data itself must change in cleaning (for a wrong planned code they're pre-filled, e.g.
+`batch_code_pre → 051020261000CTEP3N`). Every saved decision is a new row in the Sheet's **reviews**
+tab with your name and the time, so the full history is kept; the newest decision for an issue counts.
 
-Then publish that tab as CSV (same way as the other tabs) and add the link as `reviews_url` in
-Streamlit → Settings → Secrets. Changes show up within 5 minutes, or press 🔄 Refresh.
+**Setup (once):** create a Google service account, share the Sheet with its e-mail as *Editor*, and paste
+its key into Streamlit → Settings → Secrets under `[gcp_service_account]`. The reviews tab is created
+automatically on the first save.
 """)
 
 # ---------------------------------------------------------------------------
