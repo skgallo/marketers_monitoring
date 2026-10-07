@@ -163,17 +163,22 @@ with tab1:
                "One row per planned batch code.")
     ledger, ledger_css = filter_ledger(ledger_all, ledger_css_all)
 
-    counts = ledger["_tags"].explode().value_counts() if not ledger.empty else pd.Series(dtype=int)
+    # Counts use OPEN issues: differences marked OK or corrected no longer count as issues
+    counts = ledger["_open_tags"].explode().value_counts() if not ledger.empty else pd.Series(dtype=int)
+    n_not_sub = int(ledger["_tags"].map(lambda x: x == ["Not submitted"]).sum()) if not ledger.empty else 0
+    n_done = int(ledger.apply(lambda r: not r["_open_tags"] and r["_tags"] != ["Not submitted"], axis=1).sum()) \
+        if not ledger.empty else 0
     cols = st.columns(6)
     cols[0].metric("Planned rides", len(ledger))
-    cols[1].metric("Done as planned", int(counts.get("Done as planned", 0)))
+    cols[1].metric("Done / OK", n_done,
+                   help="Done as planned, or every difference marked OK – planned/allowed or corrected")
     cols[2].metric("Not reviewed yet", int(ledger["_needs_decision"].sum()) if not ledger.empty else 0,
                    help="Rides with a flagged difference that has no decision in the reviews tab")
     cols[3].metric("Reviewed", int(ledger["Review status"].str.startswith("✓").sum()) if not ledger.empty else 0,
-                   help="Every flagged difference on the ride has a decision (approved / fixed)")
-    cols[4].metric("Fix needed", int(ledger["_fix_needed"].sum()) if not ledger.empty else 0,
-                   help="You decided this needs communicating to the enumerator(s)")
-    cols[5].metric("Not submitted", int(counts.get("Not submitted", 0)))
+                   help="Every flagged difference on the ride has a decision (OK / corrected)")
+    cols[4].metric("To correct in cleaning", int(ledger["_fix_needed"].sum()) if not ledger.empty else 0,
+                   help="Mistakes you marked 'Correct in cleaning' that aren't marked 'Corrected' yet")
+    cols[5].metric("Not submitted", n_not_sub)
     st.caption(" · ".join(f"{k}: {int(counts.get(k, 0))}" for k in
                           ["Wrong code selected", "Design problem", "Duplicate E1", "To confirm", "Supervisor only"]
                           if counts.get(k, 0)) or "No open flags.")
@@ -183,7 +188,7 @@ with tab1:
         sel_status = st.multiselect("Show status", list(v.STATUS_RANK), default=[],
                                     placeholder="All statuses", key="status_f")
     with f2:
-        sel_review = st.selectbox("Review", ["All rides", "Not reviewed yet", "Reviewed", "Fix needed"],
+        sel_review = st.selectbox("Review", ["All rides", "Not reviewed yet", "Reviewed", "Correct in cleaning"],
                                   key="review_f")
     m = pd.Series(True, index=ledger.index)
     if sel_status:
@@ -192,7 +197,7 @@ with tab1:
         m &= ledger["_needs_decision"]
     elif sel_review == "Reviewed":
         m &= ledger["Review status"].str.startswith("✓")
-    elif sel_review == "Fix needed":
+    elif sel_review == "Correct in cleaning":
         m &= ledger["_fix_needed"]
     if reviews.attrs.get("error"):
         st.warning(reviews.attrs["error"])
@@ -227,8 +232,8 @@ with tab1:
                 "_form_id": None,
                 "Decision": st.column_config.SelectboxColumn(
                     "Decision", options=v.DECISION_OPTIONS, width="small",
-                    help="Approved = planned/accepted change · Fix needed = tell the enumerator / correct it · "
-                         "Fixed = dealt with"),
+                    help="OK – planned/allowed = not a mistake · Correct in cleaning = mistake, fill in the correct value · "
+                         "Corrected = the correction is now in the cleaning code"),
                 "Note": st.column_config.TextColumn("Note", width="large"),
                 "Field": st.column_config.TextColumn("Field", width="small",
                                                      help="Variable to correct in cleaning (e.g. batch_code_pre)"),
@@ -267,7 +272,9 @@ with tab1:
 
     fixes = v.fixes_to_communicate(subs, batch_codes, reviews)
     if not fixes.empty:
-        with st.expander(f"🔧 Fixes to communicate to enumerators ({len(fixes)})", expanded=True):
+        with st.expander(f"🧹 Corrections to make in cleaning ({len(fixes)})", expanded=True):
+            st.caption("Mistakes marked 'Correct in cleaning'. Once the correction is in your do-file, "
+                       "save 'Corrected' for the same issue and it drops off this list.")
             show(fixes)
             download(fixes, "fixes_to_communicate.csv", "dl_fixes")
 
@@ -298,7 +305,7 @@ form** — not only the planned code picked from the list. A ride can carry seve
 
 | Status | Meaning | What to do |
 |---|---|---|
-| 🔴 **Wrong code selected** | A form describing this ride (by its date, team and ride #) was filed under another planned code. The form is counted here only; the row it was filed under shows a grey note in *Code selection* but is not flagged | Decide: Fix needed or Fixed |
+| 🔴 **Wrong code selected** | A form describing this ride (by its date, team and ride #) was filed under another planned code. The form is counted here only; the row it was filed under shows a grey note in *Code selection* but is not flagged | Decide: Correct in cleaning, or Corrected |
 | 🔴 **Design problem** | The actual code has a different treatment, corridor or direction, or no readable code | Act now: the ride may not count for the design |
 | 🔴 **Duplicate E1** | More than one E1 form describes this ride | Same person → keep one; different people → two E1s on one ride, or a wrong code |
 | 🔵 **To confirm** | Date, team, marketer ID or ride # differ from plan | Confirm with the team |
@@ -315,7 +322,7 @@ marketer ID or ride # differs. If forms disagree, both values are shown ("A / B"
 **Forms that don't match** lists forms whose selected planned code is not in the batch_codes tab.
 A **✓** after a status means you've recorded a decision for every issue behind it — the flag stays, so the
 history is kept, but you know it's been dealt with. **Review status** sums this up per ride: *Not reviewed*,
-*Partly reviewed*, *✓ Reviewed (approved / fixed)* or 🟣 *Fix needed* (still to communicate or correct).
+*Partly reviewed*, *✓ Reviewed (OK / corrected)* or 🟣 *🧹 Correct in cleaning* (correction still to add to the cleaning code).
 **Review notes** shows each decision and its note.
 
 **Needs decision on** lists the issues on that ride you haven't reviewed yet — use these exact names in the reviews tab.
@@ -327,9 +334,9 @@ history is kept, but you know it's been dealt with. **Review status** sums this 
 
 | Decision | Use when | What happens |
 |---|---|---|
-| **Approved** | The difference was planned or is acceptable (e.g. the team was moved to another route) | Flag gets a ✓; doesn't count against the enumerator |
-| **Fix needed** | A mistake to tell the enumerator about and/or correct | Appears in *Fixes to communicate* and the enumerator's feedback card |
-| **Fixed** | The mistake has been communicated / corrected | Flag gets a ✓; still counts in the enumerator's batch-code score |
+| **OK – planned/allowed** | The difference was planned or is allowed (e.g. the team was moved to another route) | Flag gets a ✓; doesn't count against the enumerator |
+| **Correct in cleaning** | It's a mistake and the data must be corrected (e.g. wrong planned code selected) — fill in **Correct value** | Appears in *Corrections to make in cleaning*; shown in the enumerator's feedback card |
+| **Corrected** | The correction is now in your cleaning code | Flag gets a ✓; drops off the corrections list; still counts in the enumerator's batch-code score |
 
 **Note** — what happened, or what to tell the enumerator. **Field / Correct value** — fill these when the
 data itself must change in cleaning (for a wrong planned code they're pre-filled, e.g.

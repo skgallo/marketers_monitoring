@@ -250,7 +250,7 @@ def _changes_text(ch: list) -> str:
 # issue    : Route, Treatment, Date, Team, Mkt ID, Ride #, Batch code,
 #            Wrong code, Duplicate E1, Missing form — or All
 # decision : Approved   — a planned/accepted change: no longer a flag
-#            Fix needed — a mistake to communicate to the enumerator(s): stays flagged
+#            Fix needed — a mistake to correct in the cleaning code (shown as "Correct in cleaning")
 #            Fixed      — the mistake has been dealt with / data corrected: no longer a flag
 # Later rows override earlier ones for the same batch_code + issue.
 
@@ -270,6 +270,9 @@ DECISION_ALIASES = {
     "ok": "Approved", "accepted": "Approved",
     "fix needed": "Fix needed", "fix": "Fix needed", "communicate": "Fix needed", "to fix": "Fix needed",
     "fixed": "Fixed", "resolved": "Fixed", "corrected": "Fixed", "done": "Fixed",
+    # labels shown in the dashboard (what gets written to the reviews tab)
+    "ok – planned/allowed": "Approved", "ok - planned/allowed": "Approved",
+    "correct in cleaning": "Fix needed",
 }
 DESIGN_PARTS  = {"Treatment", "Route", "Batch code"}
 CONFIRM_PARTS = {"Date", "Team", "Ride #"}
@@ -410,9 +413,9 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             decisions[part] = rv["decision"]
             note = f" — {rv['note']}" if rv["note"] else ""
             by = f" ({rv['by']})" if rv["by"] else ""
-            icon = "🔧" if rv["decision"] == "Fix needed" else "✓"
+            icon = "🧹" if rv["decision"] == "Fix needed" else "✓"
             corr = f" [{rv['field']} → {rv['value']}]" if rv.get("value") else ""
-            review_txt.append(f"{icon} {part}: {rv['decision'].lower()}{note}{corr}{by}")
+            review_txt.append(f"{icon} {part}: {DECISION_LABELS[rv['decision']]}{note}{corr}{by}")
         undecided = sorted(p_ for p_ in parts if p_ not in decisions and p_ != "Missing form")
         fix_needed = "Fix needed" in decisions.values()
 
@@ -434,17 +437,30 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         # A status is "reviewed" (✓) when every issue behind it has a decision
         tag_reviewed = {t_: bool(ps) and all(x in decisions for x in ps) for t_, ps in tag_parts.items()}
 
+        # Is each status still an open issue? OK (all approved) and corrected issues are
+        # resolved: the flag stays visible with a ✓, but it no longer counts as an issue.
+        def _state(ps):
+            ds = [decisions.get(x) for x in ps]
+            if ps and all(d_ == "Approved" for d_ in ds):
+                return "ok"
+            if ps and all(d_ in ("Approved", "Fixed") for d_ in ds):
+                return "corrected"
+            return "open"
+        tag_state = {t_: _state(ps) for t_, ps in tag_parts.items()}
+        open_tags = [t_ for t_ in tags if t_ != "Done as planned" and tag_state[t_] == "open"]
+        resolved_parts = {x for x, d_ in decisions.items() if d_ in ("Approved", "Fixed")}
+
         relevant = {p_ for p_ in parts if p_ != "Missing form" or p_ in decisions}
         if not relevant:
             review_status = "—"
         elif fix_needed:
-            review_status = "🔧 Fix needed" + (" · not all reviewed" if undecided else "")
+            review_status = "🧹 Correct in cleaning" + (" · not all reviewed" if undecided else "")
         elif undecided and decisions:
             review_status = "Partly reviewed"
         elif undecided:
             review_status = "Not reviewed"
         else:
-            kinds = sorted({d_.lower() for d_ in decisions.values()})
+            kinds = sorted({{"Approved": "OK", "Fixed": "corrected"}[d_] for d_ in decisions.values()})
             review_status = "✓ Reviewed (" + " / ".join(kinds) + ")"
 
         # Code selection notes
@@ -474,7 +490,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         for part in sorted(parts):
             rv = _review_for(rmap, code, part)
             base = {"code": code, "ride": ride_lbl, "part": part,
-                    "current": f"{rv['decision']}" + (f" — {rv['note']}" if rv and rv['note'] else "") if rv else "",
+                    "current": DECISION_LABELS[rv["decision"]] + (f" — {rv['note']}" if rv["note"] else "") if rv else "",
                     "form_id": "", "field": "", "value": ""}
             if part == "Wrong code":
                 for _, f in came_in.iterrows():
@@ -499,12 +515,19 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 detail = "; ".join(dict.fromkeys(part_text.get(part, []))) or part
             issues.append({**base, "detail": detail})
 
+        def _ann(ch):
+            if not ch:
+                return "As planned"
+            return "; ".join(c[1] + {"Approved": " (OK)", "Fixed": " (corrected)"}.get(decisions.get(c[2]), "")
+                             for c in ch)
         if len(basis) > 1:
-            what = " | ".join(f"Form {i + 1}: {_changes_text(ch)}" for i, ch in enumerate(changes))
+            what = " | ".join(f"Form {i + 1}: {_ann(ch)}" for i, ch in enumerate(changes))
         elif changes:
-            what = _changes_text(changes[0])
+            what = _ann(changes[0])
         else:
             what = ""
+        open_what = "; ".join(dict.fromkeys(c[1] for ch in changes for c in ch
+                                            if c[0] != "allowed" and c[2] not in resolved_parts))
 
         if len(e1):
             names = _names(e1["person"])
@@ -527,7 +550,9 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 
         last = d["submitted_at"].max() if not d.empty else pd.NaT
         rows.append({
-            "Status":         " + ".join(f"{t_} ✓" if tag_reviewed[t_] else t_ for t_ in tags),
+            "Status":         " + ".join(f"{t_} ✓ OK" if tag_state[t_] == "ok"
+                                         else f"{t_} ✓ corrected" if tag_state[t_] == "corrected"
+                                         else t_ for t_ in tags),
             "Review status":  review_status,
             "Planned code":   code,
             "Actual code(s)": ", ".join(_txt(c) for c in basis["actual_batch_code"]) or "—",
@@ -549,6 +574,9 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             "_issues":        issues,
             "_fix_needed":    fix_needed,
             "_tags":          tags,
+            "_open_tags":     open_tags,
+            "_open_what":     open_what,
+            "_resolved_parts": resolved_parts,
             "_corridor":      p["corridor"],
             "_date":          pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce"),
             "_team":          p["team"] or "",
@@ -572,17 +600,25 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
     css = _empty_css(t)
     not_sub = t["_tags"].map(lambda x: x == ["Not submitted"])
     css.loc[not_sub] = GRAY
-    css["Status"] = t["_tags"].map(lambda x: STATUS_STYLE.get(x[0], ""))
-    # Actual components: red = wrong ride for the design (treatment, route); blue = confirm
+    # Status colour follows the worst OPEN issue; rides whose issues are all OK/corrected are green
+    css["Status"] = [STATUS_STYLE.get(o[0], "") if o else STATUS_STYLE.get(a[0], GREEN)
+                     if a[0] in ("Not submitted", "Done as planned") else GREEN
+                     for o, a in zip(t["_open_tags"], t["_tags"])]
+    # Actual components: red = wrong ride for the design (treatment, route); blue = confirm;
+    # green = the difference was marked OK or corrected
     for col, style in [("Treatment", RED), ("Route", RED),
                        ("Date", BLUE), ("Team", BLUE), ("Ride #", BLUE)]:
-        css.loc[t["_diff"].map(lambda dd: dd[col]), col] = style
+        diff = t["_diff"].map(lambda dd: dd[col])
+        ok = t["_resolved_parts"].map(lambda rp: col in rp)
+        css.loc[diff & ~ok, col] = style
+        css.loc[diff & ok, col] = GREEN
     css.loc[t["Code selection"] != "—", "Code selection"] = GRAY
     css.loc[t["_code_flag"], "Code selection"] = RED
     css.loc[t["E1 form"].str.startswith("✗") & ~not_sub, "E1 form"] = RED
     css.loc[t["E1 form"].str.contains("×", regex=False), "E1 form"] = RED
-    css.loc[t["_tags"].map(lambda x: "Design problem" in x), "What changed"] = RED
-    css.loc[t["_tags"].map(lambda x: "To confirm" in x), "What changed"] = BLUE
+    css.loc[t["_tags"].map(lambda x: "Design problem" in x or "To confirm" in x), "What changed"] = GREEN
+    css.loc[t["_open_tags"].map(lambda x: "To confirm" in x), "What changed"] = BLUE
+    css.loc[t["_open_tags"].map(lambda x: "Design problem" in x), "What changed"] = RED
     css.loc[t["Review status"].str.startswith("✓"), "Review status"] = GREEN
     css.loc[t["Review status"].isin(["Not reviewed", "Partly reviewed"]), "Review status"] = RED
     css.loc[t["_fix_needed"], "Review status"] = PURPLE
@@ -590,7 +626,11 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
     return t, css
 
 
-DECISION_OPTIONS = ["", "Approved", "Fix needed", "Fixed"]
+# Internal decision → label shown in the dashboard and written to the reviews tab
+DECISION_LABELS = {"Approved": "OK – planned/allowed",
+                   "Fix needed": "Correct in cleaning",
+                   "Fixed": "Corrected"}
+DECISION_OPTIONS = [""] + list(DECISION_LABELS.values())
 
 
 def pending_decisions(ledger: pd.DataFrame, include_reviewed: bool = False) -> pd.DataFrame:
@@ -633,7 +673,7 @@ def corrections_table(reviews: pd.DataFrame | None) -> pd.DataFrame:
 
 def fixes_to_communicate(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                          reviews: pd.DataFrame | None) -> pd.DataFrame:
-    """One row per 'Fix needed' decision, with the E1(s) on that ride — the list to share."""
+    """One row per 'Correct in cleaning' decision still open, with the E1(s) on that ride."""
     rmap = review_map(reviews)
     if not rmap:
         return pd.DataFrame()
@@ -651,7 +691,8 @@ def fixes_to_communicate(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             rows.append({"Ride date": fmt_code_date(p["date"]), "Planned code": code,
                          "Enumerator 1": _names(d["e1_name"]) or "—",
                          "Supervisor": _names(d.loc[d["role"] == SUP, "person"]) or "—",
-                         "Issue": issue, "What to communicate": rv["note"] or "—",
+                         "Issue": issue, "Correction": (f"{rv['field']} → {rv['value']}" if rv.get("value") else "—"),
+                         "Note": rv["note"] or "—",
                          "Decided by": rv["by"] or "—",
                          "_e1_ids": list(dict.fromkeys(d["e1_id"].dropna()))})
     return pd.DataFrame(rows)
@@ -679,7 +720,8 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
         last_in = submitted.max() if not submitted.empty else -1
         rows, styles = [], []
         for _, r in g.iterrows():
-            tags = r["_tags"]
+            tags = r["_open_tags"] if r["_tags"] != ["Not submitted"] else ["Not submitted"]
+            had_issues = r["_tags"] != ["Done as planned"]
             p = parse_batch_code(r["Planned code"])
             acts = []
             if tags == ["Not submitted"]:
@@ -691,19 +733,17 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
                 if "Wrong code selected" in tags:
                     acts += [n for n in r["Code selection"].split("; ") if "filed under" in n][:1]
                 if "Design problem" in tags:
-                    acts.append(f"Design: {r['What changed']}")
+                    acts.append(f"Design: {r['_open_what']}")
                 if "Duplicate E1" in tags:
                     acts.append("Two E1 forms — check which one to keep")
                 if "To confirm" in tags:
-                    acts.append(f"Check: {r['What changed']}")
+                    acts.append(f"Check: {r['_open_what']}")
                 if "Supervisor only" in tags:
                     acts.append("Chase the E1 form")
-                if not acts:
-                    state = "OK"
-                elif r["Review status"].startswith("✓"):
-                    state = "Reviewed"
-                else:
+                if acts:
                     state = "Action"
+                else:
+                    state = "Reviewed" if had_issues else "OK"
             rows.append({
                 "Ride":       r["_ride"],
                 "Planned":    f"{p['route'] or ''} · {TREAT.get(p['treatment'], p['treatment'] or '')}",
@@ -1277,7 +1317,8 @@ def feedback_card(e1m, supm, pid, weeks=None, fixes: pd.DataFrame | None = None)
         mine = fixes[fixes["_e1_ids"].map(lambda ids: pid in ids)]
         if not mine.empty:
             L += ["", "## Batch code / form corrections"]
-            L += [f"- {r['Ride date']} · {r['Planned code']} — {r['Issue']}: {r['What to communicate']}"
+            L += [f"- {r['Ride date']} · {r['Planned code']} — {r['Issue']}"
+                  + (f": {r['Note']}" if r['Note'] != "—" else "")
                   for _, r in mine.iterrows()]
 
     if not b.empty:
