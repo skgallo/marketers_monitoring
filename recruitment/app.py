@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-10-07"
+EXPECTED_VIEWS_VERSION = "2026-10-07c"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -53,6 +53,11 @@ with st.spinner("Loading data…"):
     try:
         submissions_raw, batch_codes, subs = load_data()
         reviews = load_reviews()
+        # Corrections about who filled in a form (e.g. a supervisor form saved as E1)
+        # are applied in the dashboard straight away; the Sheet itself is not changed.
+        raw_fixed, live_applied = v.apply_live_corrections(submissions_raw, reviews)
+        if live_applied:
+            subs = _rollup.prepare_submissions(raw_fixed)
     except RuntimeError as e:
         st.error(str(e))
         st.stop()
@@ -161,7 +166,8 @@ with tab0:
         last = forms_day["submitted_at"].max() if not forms_day.empty else pd.NaT
         c[3].metric("Last form", (last.tz_localize("UTC").tz_convert("Africa/Freetown").strftime("%H:%M")
                                   if pd.notna(last) else "—"))
-        st.caption("🔴 Action / Overdue — call the team · 🟢 OK / Reviewed · ⚪ Waiting — ride not done yet. "
+        st.caption("🔴 Action / Overdue — not reviewed yet · 🟣 To correct — reviewed, correction still to make · "
+                   "🟢 OK / Reviewed · ⚪ Waiting — ride not done yet. "
                    "Press 🔄 Refresh for the newest forms. Record decisions in tab 1.")
         for team, (t, css) in board.items():
             st.markdown(f"##### Team {team}")
@@ -540,6 +546,8 @@ Sign-up totals are deliberately left out: they depend heavily on route and passe
 
 with st.expander("Diagnostics"):
     diag = diagnostics(submissions_raw, batch_codes, subs)
+    if live_applied:
+        st.caption("Form corrections applied from the reviews tab: " + "; ".join(live_applied))
     st.markdown("\n".join(["| | |", "|---|---|"] + [f"| {k.replace('_', ' ').capitalize()} | {val} |"
                                                      for k, val in diag.items()]))
     st.caption("If rows = 0, check the Sheet is shared as 'Anyone with link → Viewer' "

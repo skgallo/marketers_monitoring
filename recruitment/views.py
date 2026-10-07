@@ -30,7 +30,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-10-07"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-10-07c"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -447,9 +447,12 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 return "ok"
             if ps and all(d_ in ("Approved", "Fixed") for d_ in ds):
                 return "corrected"
-            return "open"
+            if ps and all(d_ is not None for d_ in ds):
+                return "pending"      # reviewed: correction still to make in cleaning
+            return "open"             # not (fully) reviewed yet
         tag_state = {t_: _state(ps) for t_, ps in tag_parts.items()}
-        open_tags = [t_ for t_ in tags if t_ != "Done as planned" and tag_state[t_] == "open"]
+        open_tags = [t_ for t_ in tags if t_ != "Done as planned" and tag_state[t_] in ("open", "pending")]
+        undecided_tags = [t_ for t_ in tags if t_ != "Done as planned" and tag_state[t_] == "open"]
         resolved_parts = {x for x, d_ in decisions.items() if d_ in ("Approved", "Fixed")}
 
         relevant = {p_ for p_ in parts if p_ != "Missing form" or p_ in decisions}
@@ -507,8 +510,9 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                     t_ = f["submitted_at"].strftime("%d %b %H:%M") if pd.notna(f["submitted_at"]) else "?"
                     issues.append({**base,
                                    "detail": f"E1 form {k_}/{len(e1)} by {_txt(f['person'])}, submitted {t_}, "
-                                             f"actual code {_txt(f['actual_batch_code'])} — put 1 in Correct "
-                                             f"value to drop this form in cleaning",
+                                             f"actual code {_txt(f['actual_batch_code'])}. If a supervisor filled "
+                                             f"this in: Field supervisor_form, Correct value = their name. "
+                                             f"To ignore it: Field drop_form, Correct value 1",
                                    "form_id": _txt(f.get("form_id")), "field": "drop_form", "value": ""})
                 continue
             if part == "Missing form":
@@ -577,6 +581,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             "_fix_needed":    fix_needed,
             "_tags":          tags,
             "_open_tags":     open_tags,
+            "_undecided_tags": undecided_tags,
             "_open_what":     open_what,
             "_resolved_parts": resolved_parts,
             "_corridor":      p["corridor"],
@@ -603,9 +608,10 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
     not_sub = t["_tags"].map(lambda x: x == ["Not submitted"])
     css.loc[not_sub] = GRAY
     # Status colour follows the worst OPEN issue; rides whose issues are all OK/corrected are green
-    css["Status"] = [STATUS_STYLE.get(o[0], "") if o else STATUS_STYLE.get(a[0], GREEN)
-                     if a[0] in ("Not submitted", "Done as planned") else GREEN
-                     for o, a in zip(t["_open_tags"], t["_tags"])]
+    # red = not reviewed yet · purple = reviewed, correction still to make · green = resolved
+    css["Status"] = [STATUS_STYLE.get(u[0], RED) if u else PURPLE if o
+                     else STATUS_STYLE.get(a[0], GREEN) if a[0] in ("Not submitted", "Done as planned") else GREEN
+                     for u, o, a in zip(t["_undecided_tags"], t["_open_tags"], t["_tags"])]
     # Actual components: red = wrong ride for the design (treatment, route); blue = confirm;
     # green = the difference was marked OK or corrected
     for col, style in [("Treatment", RED), ("Route", RED),
@@ -616,11 +622,14 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         css.loc[diff & ok, col] = GREEN
     css.loc[t["Code selection"] != "—", "Code selection"] = GRAY
     css.loc[t["_code_flag"], "Code selection"] = RED
+    css.loc[t["_code_flag"] & ~t["_undecided_tags"].map(lambda x: "Wrong code selected" in x),
+            "Code selection"] = PURPLE
     css.loc[t["E1 form"].str.startswith("✗") & ~not_sub, "E1 form"] = RED
     css.loc[t["E1 form"].str.contains("×", regex=False), "E1 form"] = RED
     css.loc[t["_tags"].map(lambda x: "Design problem" in x or "To confirm" in x), "What changed"] = GREEN
-    css.loc[t["_open_tags"].map(lambda x: "To confirm" in x), "What changed"] = BLUE
-    css.loc[t["_open_tags"].map(lambda x: "Design problem" in x), "What changed"] = RED
+    css.loc[t["_open_tags"].map(lambda x: "To confirm" in x or "Design problem" in x), "What changed"] = PURPLE
+    css.loc[t["_undecided_tags"].map(lambda x: "To confirm" in x), "What changed"] = BLUE
+    css.loc[t["_undecided_tags"].map(lambda x: "Design problem" in x), "What changed"] = RED
     css.loc[t["Review status"].str.startswith("✓"), "Review status"] = GREEN
     css.loc[t["Review status"].isin(["Not reviewed", "Partly reviewed"]), "Review status"] = RED
     css.loc[t["_fix_needed"], "Review status"] = PURPLE
@@ -671,6 +680,67 @@ def corrections_table(reviews: pd.DataFrame | None) -> pd.DataFrame:
     r = r.drop_duplicates(subset=["form_id", "field"], keep="last")
     return r[["form_id", "field", "correct_value", "batch_code", "issue", "decision", "note",
               "reviewed_by", "timestamp"]].reset_index(drop=True)
+
+
+# Corrections about WHO filled in a form are applied straight away in the dashboard
+# (so rides, supervisor pairing and enumerator performance are attributed correctly).
+# Batch-code corrections are NOT applied here: they stay visible as flags.
+#   supervisor_form = <supervisor name>  → the form was filled in by that supervisor
+#   role_type       = 0 / 1 (or Supervisor / E1)
+#   supervisor      = <supervisor name or code>
+#   a02_1           = <Enumerator 1 name or roster code>
+#   drop_form       = 1  → ignore this form (e.g. a test or a true duplicate)
+LIVE_FIELDS = {"supervisor_form", "role_type", "supervisor", "a02_1", "drop_form"}
+
+
+def apply_live_corrections(raw: pd.DataFrame, reviews: pd.DataFrame | None):
+    """Return (corrected copy of the raw submissions, list of applied corrections as text)."""
+    corr = corrections_table(reviews)
+    if corr.empty or raw is None or raw.empty or "KEY" not in raw.columns:
+        return raw, []
+    from rollup import SUPERVISOR_LABELS
+    sup_codes = {n.lower(): c for c, n in SUPERVISOR_LABELS.items()}
+    out = raw.copy()
+    applied = []
+    for _, c in corr.iterrows():
+        field = _txt(c["field"]).lower()
+        val = _txt(c["correct_value"])
+        dec = DECISION_ALIASES.get(_txt(c["decision"]).lower())
+        if field not in LIVE_FIELDS or dec not in ("Fix needed", "Fixed") or not val:
+            continue
+        m = out["KEY"].map(_txt) == _txt(c["form_id"])
+        if m.sum() != 1:
+            continue
+
+        def set_supervisor(name_or_code):
+            code = name_or_code if name_or_code.lstrip("-").isdigit() else sup_codes.get(name_or_code.lower())
+            if code:
+                out.loc[m, "supervisor"] = code
+            else:
+                out.loc[m, "supervisor"] = "-55"
+                out.loc[m, "supervisor_oth"] = name_or_code
+
+        if field == "drop_form":
+            if val == "1":
+                out = out[~m]
+                applied.append(f"form {_txt(c['form_id'])[-8:]} ignored")
+            continue
+        if field == "supervisor_form":
+            out.loc[m, "role_type"] = "0"
+            set_supervisor(val)
+        elif field == "role_type":
+            out.loc[m, "role_type"] = {"supervisor": "0", "e1": "1", "enumerator 1": "1"}.get(val.lower(), val)
+        elif field == "supervisor":
+            set_supervisor(val)
+        elif field == "a02_1":
+            if val.lstrip("-").isdigit():
+                out.loc[m, "a02_1"] = val
+            else:
+                same = raw.loc[raw.get("a02_1_lab", pd.Series(dtype=str)).map(_txt).str.lower() == val.lower(), "a02_1"]
+                out.loc[m, "a02_1"] = _txt(same.iloc[0]) if len(same) else "-55"
+                out.loc[m, "a02_1_lab"] = val
+        applied.append(f"form {_txt(c['form_id'])[-8:]}: {field} → {val}")
+    return out, applied
 
 
 def fixes_to_communicate(subs: pd.DataFrame, batch_codes: pd.DataFrame,
@@ -742,8 +812,10 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
                     acts.append(f"Check: {r['_open_what']}")
                 if "Supervisor only" in tags:
                     acts.append("Chase the E1 form")
-                if acts:
+                if acts and r["_undecided_tags"]:
                     state = "Action"
+                elif acts:
+                    state = "To correct"
                 else:
                     state = "Reviewed" if had_issues else "OK"
             rows.append({
@@ -758,11 +830,14 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
             styles.append(state)
         t = pd.DataFrame(rows)
         css = _empty_css(t)
-        state_css = {"OK": GREEN, "Reviewed": GREEN, "Action": RED, "Overdue": RED, "Waiting": GRAY}
+        state_css = {"OK": GREEN, "Reviewed": GREEN, "Action": RED, "Overdue": RED, "Waiting": GRAY,
+                     "To correct": PURPLE}
         for i, st_ in enumerate(styles):
             css.at[i, "State"] = state_css.get(st_, "")
             if st_ in ("Action", "Overdue"):
                 css.at[i, "Action"] = RED
+            if st_ == "To correct":
+                css.at[i, "Action"] = PURPLE
             if st_ == "Waiting":
                 css.loc[i] = GRAY
         css.loc[t["E1"].str.startswith("✗") & (t["State"] != "Waiting"), "E1"] = RED
