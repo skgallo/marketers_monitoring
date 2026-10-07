@@ -27,7 +27,14 @@ from data_io import load_data, load_reviews, append_reviews, can_write_reviews, 
 import datetime as dt
 from rollup import CORRIDORS, DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX, \
                    PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN
+import importlib
+import rollup as _rollup
 import views as v
+# Always use the newest rollup.py / views.py on disk — Streamlit can otherwise keep
+# an older copy in memory after a push, so app.py and views.py stop matching.
+importlib.reload(_rollup)
+importlib.reload(v)
+EXPECTED_VIEWS_VERSION = "2026-10-07"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -35,6 +42,12 @@ import views as v
 
 st.set_page_config(page_title="Recruitment HFC Dashboard", page_icon="🚌", layout="wide")
 require_password()
+
+if getattr(v, "VIEWS_VERSION", None) != EXPECTED_VIEWS_VERSION:
+    st.error(f"views.py on the server is out of date (version {getattr(v, 'VIEWS_VERSION', 'unknown')}, "
+             f"expected {EXPECTED_VIEWS_VERSION}). Copy the latest views.py into recruitment/, push it, "
+             f"and reboot the app. Loaded from: {v.__file__}")
+    st.stop()
 
 with st.spinner("Loading data…"):
     try:

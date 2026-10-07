@@ -30,6 +30,8 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
+VIEWS_VERSION = "2026-10-07"   # app.py checks this to catch an out-of-date views.py
+
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
 
