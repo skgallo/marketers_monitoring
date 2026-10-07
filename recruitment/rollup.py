@@ -96,6 +96,15 @@ def fix_batch_code(code, submission_year: int = 2026) -> str:
     return code
 
 
+_CODE_RE = re.compile(r"^(\d{8})(\d)(\d+)([A-Z]{4})(\d+)([A-Z])$")
+
+
+def _corridor(route: str) -> str:
+    """Non-directional corridor for any 4-letter route: CTEP and EPCT → 'CT-EP'."""
+    a, b = route[:2], route[2:]
+    return "-".join(sorted([a, b]))
+
+
 def parse_batch_code(code) -> dict:
     """
     Parse a (cleaned) batch code into its components.
@@ -106,6 +115,18 @@ def parse_batch_code(code) -> dict:
     if pd.isna(code):
         return empty
     code = str(code).strip()
+
+    # Structure: DDMMYYYY + team (1 digit) + marketer ID (digits) + route (4 letters)
+    #            + ride # (digits) + treatment (1 letter). Any 4-letter route is accepted,
+    #            so new routes don't need to be added to ROUTE_CODES first.
+    m = _CODE_RE.match(code.upper())
+    if m:
+        date, team, mkt, route, ride, treat = m.groups()
+        return dict(date=date, team=team, mkt_id=mkt, route=route,
+                    corridor=CORRIDORS.get(route) or _corridor(route),
+                    ride_num=ride, treatment=treat, parse_ok=True)
+
+    # Fallback for irregular codes: locate a known route code
     route, route_pos = _find_route(code)
     if route is None or route_pos < 9:   # need at least 8-char date + 1-char team
         return empty

@@ -90,7 +90,8 @@ dates = sorted(set(ledger_all["_date"].dropna()) | set(subs["ride_date"].dropna(
 date_labels = {v.fmt_day(d): d for d in dates}
 sel_dates = st.sidebar.multiselect("Ride date", list(date_labels), default=[],
                                    placeholder="All dates")
-all_corridors = sorted(set(CORRIDORS.values()))
+all_corridors = sorted(set(CORRIDORS.values())
+                       | (set(ledger_all["_corridor"].dropna()) if not ledger_all.empty else set()))
 sel_corr = st.sidebar.multiselect("Corridor", all_corridors, default=[], placeholder="All corridors")
 
 def filter_ledger(t, css):
@@ -132,6 +133,11 @@ with tab0:
                            format_func=lambda d: v.fmt_day(pd.Timestamp(d)) + (" (today)" if d == today else ""),
                            key="today_day")
         board = v.today_board(ledger_all, day)
+        unreadable = ledger_all.loc[ledger_all["_date"].isna(), "Planned code"].tolist() if not ledger_all.empty else []
+        if unreadable:
+            st.warning(f"{len(unreadable)} planned code(s) in the batch_codes tab can't be read, so they don't "
+                       f"appear on any day: {', '.join(unreadable[:10])}" + (" …" if len(unreadable) > 10 else "")
+                       + ". Expected format: DDMMYYYY + team + marketer ID + 4-letter route + ride # + N/S/P.")
         forms_day = subs[subs["ride_date"] == day]
         n_rides = int((ledger_all["_date"] == day).sum())
         states = pd.concat([t["State"] for t, _ in board.values()]) if board else pd.Series(dtype=str)
