@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-10-07c"
+EXPECTED_VIEWS_VERSION = "2026-10-08"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -58,6 +58,15 @@ with st.spinner("Loading data…"):
         raw_fixed, live_applied = v.apply_live_corrections(submissions_raw, reviews)
         if live_applied:
             subs = _rollup.prepare_submissions(raw_fixed)
+        # Only monitor rides from the start date onward (training and earlier days are ignored).
+        # Change it in Streamlit -> Settings -> Secrets with:  monitor_from = "2026-10-22"
+        try:
+            MONITOR_FROM = pd.Timestamp(st.secrets.get("monitor_from", "2026-10-22"))
+        except Exception:
+            MONITOR_FROM = pd.Timestamp("2026-10-22")
+        subs = subs[subs["ride_date"].isna() | (subs["ride_date"] >= MONITOR_FROM)].reset_index(drop=True)
+        _bc_dates = pd.to_datetime(batch_codes["batch_code"].astype(str).str[:8], format="%d%m%Y", errors="coerce")
+        batch_codes = batch_codes[_bc_dates.isna() | (_bc_dates >= MONITOR_FROM)].reset_index(drop=True)
     except RuntimeError as e:
         st.error(str(e))
         st.stop()
@@ -102,6 +111,7 @@ with col_refresh:
 
 ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, reviews)
 
+st.sidebar.caption(f"Showing rides from {MONITOR_FROM.strftime('%d %b %Y')} onward.")
 st.sidebar.header("Filters (tabs 1 & 2)")
 dates = sorted(set(ledger_all["_date"].dropna()) | set(subs["ride_date"].dropna())) if not ledger_all.empty else \
         sorted(set(subs["ride_date"].dropna()))
@@ -130,10 +140,10 @@ def filter_subs(df):
     return df[m]
 
 subs_f = filter_subs(subs)
-st.sidebar.caption("Tab 3 uses all dates — pick weeks inside the tab.")
+st.sidebar.caption("Tab 3 uses every day from the start date, regardless of these filters.")
 
 tab0, tab1, tab2, tab3 = st.tabs(["Today", "1 · Ride verification", "2 · Implementation fidelity",
-                                  "3 · Enumerator performance"])
+                                  "3 · Enumerators"])
 
 # ---------------------------------------------------------------------------
 # TODAY — what needs action now (phone-friendly)
@@ -384,8 +394,8 @@ with tab2:
         c = st.columns(5)
         c[0].metric("E1 forms", len(fid))
         c[1].metric("No issues", int(st_counts.get("No issues", 0)))
-        c[2].metric("All explained", int(st_counts.get("All explained", 0)))
-        c[3].metric("Unexplained / partly", int(st_counts.get("Unexplained", 0) + st_counts.get("Partly explained", 0)))
+        c[2].metric("Outside target, reason given", int(st_counts.get("Outside target, reason given", 0)))
+        c[3].metric("Outside target, reason missing", int(st_counts.get("Outside target, no reason", 0) + st_counts.get("Outside target, some reasons missing", 0)))
         c[4].metric("Observed by supervisor", int((xc["Supervisor"] != "— not observed —").sum()))
 
         only_issues = st.toggle("Only rides with issues", value=False)
@@ -416,9 +426,8 @@ with tab2:
 | Ride dur. | < {RIDE_MIN_MIN} min |
 | Signups | < {SIGNUP_MIN} |
 
-**Issue status** — *All explained*: every flagged value has a reason, or an external disruption was
-reported (bus/route, passenger, marketer/pitch interruption, recruitment paused). *Unexplained*: flagged
-with no reason and no external disruption. A reason being given is not a judgement that it is valid.
+**Issue status** — whether any value is outside its target, and whether the enumerator wrote a reason
+(*reason given* / *no reason*). A reason is context only: it does not make the value acceptable.
 
 **Recording problems** — impossible or inconsistent timestamps (data quality, not protocol).
 
@@ -430,115 +439,156 @@ with no reason and no external disruption. A reason being given is not a judgeme
 # ---------------------------------------------------------------------------
 
 with tab3:
-    st.caption("How is each enumerator doing, and are they improving? Three separate signal families — "
-               "never blended into one score: **data quality** (their own forms), **protocol** "
-               "(supervisor observations) and **agreement** (supervisor's independent record vs theirs). "
-               f"Shares below {v.PERF_TARGET:.0%} are red.")
-
-    e1m, supm = v.performance_records(subs, batch_codes, reviews)
-    weeks = sorted(set(e1m["week_start"].dropna() if not e1m.empty else [])
-                   | set(supm["week_start"].dropna() if not supm.empty else []))
-    if not weeks:
-        st.info("No E1 or supervisor forms yet.")
+    st.caption("How is each enumerator doing, day by day? Start delay, pause/pitch length and ride length depend "
+               "on the routes, so they are shown but not counted against anyone. Your review decisions apply.")
+    rs = v.ride_summary(subs, batch_codes, reviews)
+    if rs.empty:
+        st.info("No E1 forms yet.")
     else:
-        week_opts = ["All weeks"] + [f"Week of {v.fmt_day(w)}" for w in reversed(weeks)]
-        week_map = {f"Week of {v.fmt_day(w)}": w for w in weeks}
-        sel_week = st.selectbox("Period", week_opts, index=0)
-        sel_weeks = None if sel_week == "All weeks" else [week_map[sel_week]]
+        st.markdown("#### At a glance")
+        grid, grid_css = v.day_grid(rs)
+        show(grid, grid_css)
+        st.caption("Each cell: share of supervisor checklist behaviours done that day · recording problems "
+                   "(wrong code, late form, timing). Green = 93%+ and clean · amber = minor issues · "
+                   "red = half or more rides with a recording problem · grey = not E1 that day.")
 
-        summ, summ_css, ids = v.performance_summary(e1m, supm, sel_weeks)
-        show(summ, summ_css)
-        download(summ, "enumerator_performance.csv", "dl_perf")
+        f1, f2 = st.columns(2)
+        people = sorted(rs["person"].unique())
+        days_all = sorted(rs["date"].dropna().unique())
+        with f1:
+            who = st.selectbox("Enumerator", ["All enumerators"] + people, key="enum_who")
+        with f2:
+            day_sel = st.selectbox("Day", ["All days"] + days_all, key="enum_day",
+                                   format_func=lambda d: d if isinstance(d, str) else v.fmt_day(pd.Timestamp(d)))
+        m = pd.Series(True, index=rs.index)
+        if who != "All enumerators":
+            m &= rs["person"] == who
+        if day_sel != "All days":
+            m &= rs["date"] == day_sel
+        sel = rs[m].reset_index(drop=True)
 
-        with st.expander("What each measure means"):
-            st.markdown(f"""
-| Measure | Share of … | Source |
-|---|---|---|
-| Batch code correct | E1 forms filed under the right planned code with an actual code matching the plan (differences you approved as planned changes don't count against) | E1 form |
-| Timing targets met | E1 forms with no timing flag (delay, ann./signup, pause/pitch, ride length) | E1 form |
-| Flags explained | E1 forms with flags where every flag has a reason or external disruption | E1 form |
-| Complete data | E1 forms with all core values present and no impossible timestamps | E1 form |
-| Recorded = auto timing | E1 forms where recorded and auto durations agree within {SIGNUP_DIFF_MAX} min | E1 form |
-| Protocol (sup. obs.) | Observed behaviours (s01–s26) marked Yes, pooled across rides | Supervisor form |
-| Sign-up count agrees | Supervisor-verified rides where the counts matched | Supervisor form |
-| Times agree | Observed rides where the supervisor said all times matched | Supervisor form |
-| No E1 recording error | Rides where a timing mismatch was not attributed to E1 | Supervisor form |
+        st.markdown("#### Ride by ride")
+        t_num, c_num = v.ride_numbers_table(sel)
+        show(t_num, c_num)
+        st.caption("Red = wrong code, form sent late, announcement/sign-up outside 8–12 min, recorded time not "
+                   "matching the form's own timing, or times not matching the supervisor's. Grey = shown for "
+                   "reference, not counted.")
 
-Sign-up totals are deliberately left out: they depend heavily on route and passengers.
-""")
-
-        st.markdown("#### Ride by ride — each enumerator's performance on each ride")
-        st.caption("One row per ride × enumerator: their E1 form and, when observed, the paired supervisor "
-                   "form. ✓ met · ✗ not met · — not assessed. The table above pools these rows.")
-        sel_people = st.multiselect("Enumerators", list(summ["Enumerator"]), default=[],
-                                    placeholder="All enumerators", key="ride_people")
-        pid_map = dict(zip(summ["Enumerator"], ids))
-        by_ride, by_ride_css = v.performance_by_ride(
-            subs, e1m, supm, sel_weeks, [pid_map[p] for p in sel_people] if sel_people else None)
-        show(by_ride, by_ride_css)
-        if not by_ride.empty:
-            download(by_ride, "performance_by_ride.csv", "dl_by_ride")
+        st.markdown("#### Supervisor observations and feedback")
+        t_q, c_q = v.qualitative_table(sel)
+        show(t_q, c_q)
 
         st.divider()
-        if ids:
-            names = dict(zip(summ["Enumerator"], ids))
-            who = st.selectbox("Enumerator detail", list(names))
-            pid = names[who]
+        if st.toggle("Show more: weekly measures, trends and feedback cards", value=False, key="more_meas"):
+            st.caption("How is each enumerator doing, and are they improving? Three separate signal families — "
+                       "never blended into one score: **data quality** (their own forms), **protocol** "
+                       "(supervisor observations) and **agreement** (supervisor's independent record vs theirs). "
+                       f"Shares below {v.PERF_TARGET:.0%} are red.")
 
-            left, right = st.columns([3, 2])
-            with left:
-                st.markdown(f"#### {who} — weekly trend")
-                trend = v.performance_trend(e1m, supm, pid)
-                if len(trend) >= 2:
-                    st.line_chart(trend * 100, height=260)
-                elif not trend.empty:
-                    st.caption("Only one week so far — the chart appears from the second week.")
-                if not trend.empty:
-                    tr = trend.copy()
-                    tr.index = [v.fmt_day(w) for w in tr.index]
-                    st.dataframe(tr.apply(lambda col: col.map(lambda x: "—" if pd.isna(x) else f"{x:.0%}")),
-                                 width="stretch")
-            with right:
-                st.markdown("#### Supervisor observation by category")
-                cats = v.category_scores(supm, pid, sel_weeks)
-                if cats.empty or cats["_share"].isna().all():
-                    st.caption("No supervisor observations in this period.")
-                else:
-                    ccss = pd.DataFrame("", index=cats.index, columns=cats.columns)
-                    ccss.loc[cats["_share"] < v.PERF_TARGET, "Score"] = v.RED
-                    show(cats, ccss)
+            e1m, supm = v.performance_records(subs, batch_codes, reviews)
+            weeks = sorted(set(e1m["week_start"].dropna() if not e1m.empty else [])
+                           | set(supm["week_start"].dropna() if not supm.empty else []))
+            if not weeks:
+                st.info("No E1 or supervisor forms yet.")
+            else:
+                week_opts = ["All weeks"] + [f"Week of {v.fmt_day(w)}" for w in reversed(weeks)]
+                week_map = {f"Week of {v.fmt_day(w)}": w for w in weeks}
+                sel_week = st.selectbox("Period", week_opts, index=0)
+                sel_weeks = None if sel_week == "All weeks" else [week_map[sel_week]]
 
-            st.markdown(f"#### {who} — rides")
-            pr, pr_css = v.performance_by_ride(subs, e1m, supm, sel_weeks, [pid])
-            show(pr, pr_css)
+                summ, summ_css, ids = v.performance_summary(e1m, supm, sel_weeks)
+                show(summ, summ_css)
+                download(summ, "enumerator_performance.csv", "dl_perf")
 
-            card = v.feedback_card(e1m, supm, pid, sel_weeks, fixes)
-            with st.expander("📝 Feedback card (to share with the enumerator)", expanded=False):
-                st.markdown(card)
-            safe = "".join(ch if ch.isalnum() else "_" for ch in who)
-            st.download_button("⬇ Download feedback card", card.encode("utf-8"),
-                               file_name=f"feedback_{safe}.md", mime="text/markdown", key="dl_card")
+                with st.expander("What each measure means"):
+                    st.markdown(f"""
+        | Measure | Share of … | Source |
+        |---|---|---|
+        | Batch code correct | E1 forms filed under the right planned code with an actual code matching the plan (differences you approved as planned changes don't count against) | E1 form |
+        | Timing targets met | E1 forms with no timing flag (delay, ann./signup, pause/pitch, ride length) | E1 form |
+        | Complete data | E1 forms with all core values present and no impossible timestamps | E1 form |
+        | Recorded = auto timing | E1 forms where recorded and auto durations agree within {SIGNUP_DIFF_MAX} min | E1 form |
+        | Protocol (sup. obs.) | Observed behaviours (s01–s26) marked Yes, pooled across rides | Supervisor form |
+        | Sign-up count agrees | Supervisor-verified rides where the counts matched | Supervisor form |
+        | Times agree | Observed rides where the supervisor said all times matched | Supervisor form |
+        | No E1 recording error | Rides where a timing mismatch was not attributed to E1 | Supervisor form |
 
-        st.divider()
-        with st.expander("All supervisor observations (one row per supervisor form)"):
-            obs, obs_css = v.supervisor_observations(subs)
-            show(obs, obs_css)
-            if not obs.empty:
-                download(obs, "supervisor_observations.csv", "dl_obs")
-            st.markdown("""
-| Category | Indicators |
-|---|---|
-| Preparation | s01 Sat in assigned position |
-| Form use | s03 Followed SurveyCTO in real time |
-| Announcement | s04 Script · s05 Voice · s06 Eye contact · s07 Persuasive · s08 Active stance · s09 Displayed card · s10 Correct pause/resume |
-| Pax questions | s11 Answered correctly · s12 Avoided guessing |
-| Pause period | s15 Respected the pause |
-| Cards | s16 Checked cards for missing info |
-| Tickets | s19 Gave apprentice ticket bag |
-| Payment | s21 Agreed fare count · s22 Got signed receipt |
-| Close-out | s23 Completed recruitment form · s24 Completed RIDE form |
-| Materials | s25 Labelled/stored ride bag · s26 Stored all materials |
-""")
+        Sign-up totals are deliberately left out: they depend heavily on route and passengers.
+        """)
+
+                st.markdown("#### Ride by ride — each enumerator's performance on each ride")
+                st.caption("One row per ride × enumerator: their E1 form and, when observed, the paired supervisor "
+                           "form. ✓ met · ✗ not met · — not assessed. The table above pools these rows.")
+                sel_people = st.multiselect("Enumerators", list(summ["Enumerator"]), default=[],
+                                            placeholder="All enumerators", key="ride_people")
+                pid_map = dict(zip(summ["Enumerator"], ids))
+                by_ride, by_ride_css = v.performance_by_ride(
+                    subs, e1m, supm, sel_weeks, [pid_map[p] for p in sel_people] if sel_people else None)
+                show(by_ride, by_ride_css)
+                if not by_ride.empty:
+                    download(by_ride, "performance_by_ride.csv", "dl_by_ride")
+
+                st.divider()
+                if ids:
+                    names = dict(zip(summ["Enumerator"], ids))
+                    who = st.selectbox("Enumerator detail", list(names))
+                    pid = names[who]
+
+                    left, right = st.columns([3, 2])
+                    with left:
+                        st.markdown(f"#### {who} — weekly trend")
+                        trend = v.performance_trend(e1m, supm, pid)
+                        if len(trend) >= 2:
+                            st.line_chart(trend * 100, height=260)
+                        elif not trend.empty:
+                            st.caption("Only one week so far — the chart appears from the second week.")
+                        if not trend.empty:
+                            tr = trend.copy()
+                            tr.index = [v.fmt_day(w) for w in tr.index]
+                            st.dataframe(tr.apply(lambda col: col.map(lambda x: "—" if pd.isna(x) else f"{x:.0%}")),
+                                         width="stretch")
+                    with right:
+                        st.markdown("#### Supervisor observation by category")
+                        cats = v.category_scores(supm, pid, sel_weeks)
+                        if cats.empty or cats["_share"].isna().all():
+                            st.caption("No supervisor observations in this period.")
+                        else:
+                            ccss = pd.DataFrame("", index=cats.index, columns=cats.columns)
+                            ccss.loc[cats["_share"] < v.PERF_TARGET, "Score"] = v.RED
+                            show(cats, ccss)
+
+                    st.markdown(f"#### {who} — rides")
+                    pr, pr_css = v.performance_by_ride(subs, e1m, supm, sel_weeks, [pid])
+                    show(pr, pr_css)
+
+                    card = v.feedback_card(e1m, supm, pid, sel_weeks, fixes)
+                    with st.expander("📝 Feedback card (to share with the enumerator)", expanded=False):
+                        st.markdown(card)
+                    safe = "".join(ch if ch.isalnum() else "_" for ch in who)
+                    st.download_button("⬇ Download feedback card", card.encode("utf-8"),
+                                       file_name=f"feedback_{safe}.md", mime="text/markdown", key="dl_card")
+
+                st.divider()
+                with st.expander("All supervisor observations (one row per supervisor form)"):
+                    obs, obs_css = v.supervisor_observations(subs)
+                    show(obs, obs_css)
+                    if not obs.empty:
+                        download(obs, "supervisor_observations.csv", "dl_obs")
+                    st.markdown("""
+        | Category | Indicators |
+        |---|---|
+        | Preparation | s01 Sat in assigned position |
+        | Form use | s03 Followed SurveyCTO in real time |
+        | Announcement | s04 Script · s05 Voice · s06 Eye contact · s07 Persuasive · s08 Active stance · s09 Displayed card · s10 Correct pause/resume |
+        | Pax questions | s11 Answered correctly · s12 Avoided guessing |
+        | Pause period | s15 Respected the pause |
+        | Cards | s16 Checked cards for missing info |
+        | Tickets | s19 Gave apprentice ticket bag |
+        | Payment | s21 Agreed fare count · s22 Got signed receipt |
+        | Close-out | s23 Completed recruitment form · s24 Completed RIDE form |
+        | Materials | s25 Labelled/stored ride bag · s26 Stored all materials |
+        """)
+
 
 # ---------------------------------------------------------------------------
 # Diagnostics

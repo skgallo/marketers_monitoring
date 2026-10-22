@@ -150,6 +150,50 @@ def _reviews_worksheet():
     return ws, header
 
 
+FEEDBACK_TAB = "feedback_log"
+FEEDBACK_COLUMNS = ["timestamp", "date", "enumerator", "rides", "supervised", "message", "sent_by"]
+
+
+def _worksheet(tab: str, columns: list):
+    """Any tab in the Sheet, created with headers if it doesn't exist yet."""
+    import gspread
+    sh = _sheets_client().open_by_key(_sheet_id())
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(tab, rows=1000, cols=len(columns))
+    header = ws.row_values(1)
+    missing = [c for c in columns if c not in header]
+    if missing:
+        header = header + missing
+        if ws.col_count < len(header):
+            ws.add_cols(len(header) - ws.col_count)
+        ws.update(values=[header], range_name="A1")
+    return ws, header
+
+
+def append_feedback(row: dict) -> None:
+    """Record a daily feedback message as sent (feedback_log tab)."""
+    ws, header = _worksheet(FEEDBACK_TAB, FEEDBACK_COLUMNS)
+    ws.append_rows([[str(row.get(c, "") or "") for c in header]], value_input_option="RAW")
+    load_feedback_log.clear()
+
+
+@st.cache_data(ttl=300)
+def load_feedback_log() -> pd.DataFrame:
+    """Messages already marked as sent (empty if saving isn't set up)."""
+    if not can_write_reviews():
+        return pd.DataFrame(columns=FEEDBACK_COLUMNS)
+    try:
+        ws, _ = _worksheet(FEEDBACK_TAB, FEEDBACK_COLUMNS)
+        values = ws.get_all_values()
+        if len(values) <= 1:
+            return pd.DataFrame(columns=values[0] if values else FEEDBACK_COLUMNS)
+        return pd.DataFrame(values[1:], columns=values[0])
+    except Exception:
+        return pd.DataFrame(columns=FEEDBACK_COLUMNS)
+
+
 def append_reviews(rows: list) -> int:
     """Append decision rows (dicts keyed by REVIEW_COLUMNS) to the reviews tab."""
     if not rows:
