@@ -157,6 +157,10 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
+    # Each SurveyCTO form once: if publishing re-sent forms, keep the latest copy of each KEY
+    if 'KEY' in df.columns:
+        df = df[~(df['KEY'].notna() & df.duplicated(subset='KEY', keep='last'))].copy()
+
     # Drop test rows
     if 'username' in df.columns:
         df = df[~df['username'].str.lower().isin(TEST_USERNAMES)].copy()
