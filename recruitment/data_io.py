@@ -56,6 +56,14 @@ def _read_tab(url: str, tab_name: str) -> pd.DataFrame:
         )
     # Replace empty strings with None so pd.isna() works downstream
     df = df.replace({"": None, "nan": None})
+    # Tidy headers: Google's name-based export can add spaces or merge the first
+    # data row into the header (e.g. "batch_code 2210...") — keep the first word.
+    df.columns = [str(c).strip() for c in df.columns]
+    if "batch_code" not in df.columns:
+        for c in df.columns:
+            if c.lower().startswith("batch_code"):
+                df = df.rename(columns={c: "batch_code"})
+                break
     return df
 
 

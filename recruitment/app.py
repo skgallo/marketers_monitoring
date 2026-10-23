@@ -65,6 +65,11 @@ with st.spinner("Loading data…"):
         except Exception:
             MONITOR_FROM = pd.Timestamp("2026-10-22")
         subs = subs[subs["ride_date"].isna() | (subs["ride_date"] >= MONITOR_FROM)].reset_index(drop=True)
+        if "batch_code" not in batch_codes.columns:
+            st.error("The batch_codes tab was read, but it has no 'batch_code' column. Check that its first row "
+                     "is the header (batch_code, ride_day, …) and that batch_codes_url points to that tab. "
+                     f"Columns found: {', '.join(map(str, batch_codes.columns[:8]))}")
+            st.stop()
         _bc_dates = pd.to_datetime(batch_codes["batch_code"].astype(str).str[:8], format="%d%m%Y", errors="coerce")
         batch_codes = batch_codes[_bc_dates.isna() | (_bc_dates >= MONITOR_FROM)].reset_index(drop=True)
     except RuntimeError as e:
