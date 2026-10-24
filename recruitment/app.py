@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-10-08"
+EXPECTED_VIEWS_VERSION = "2026-10-24"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -389,8 +389,8 @@ automatically on the first save.
 with tab2:
     st.caption("Were timings, sign-ups and procedures followed, and why not when they weren't? "
                "One row per Enumerator 1 form.")
-    fid, fid_css = v.fidelity_table(subs_f)
-    xc, xc_css = v.crosscheck_table(subs_f)
+    fid, fid_css = v.fidelity_table(subs_f, batch_codes, reviews)
+    xc, xc_css = v.crosscheck_table(subs_f, batch_codes, reviews)
 
     if fid.empty:
         st.info("No E1 forms for the selected filters.")

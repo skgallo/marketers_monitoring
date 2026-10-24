@@ -30,7 +30,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-10-08"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-10-24"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -46,7 +46,7 @@ TIME_GAP_MAX    = 2    # min — E1 vs supervisor checkpoint gap that needs revi
 PAIR_WINDOW_MIN = 20   # min — supervisor form paired with an E1 form if ride starts are this close
 PERF_TARGET     = 0.80 # performance rates below this are shown in red
 
-TREAT = {"S": "Script", "N": "Normal", "P": "Peddling"}
+TREAT = {"S": "Sit down", "N": "Normal", "P": "Peddling"}
 
 STATUS_RANK = {
     "Wrong code selected": 0, "Design problem": 1, "Duplicate E1": 2, "To confirm": 3,
@@ -355,6 +355,70 @@ def effective_codes(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFra
     out["misfiled"] = out["likely_code"].notna() & (out["likely_code"] != sel)
     out["eff_code"] = out["likely_code"].where(out["likely_code"].notna(), sel)
     return out
+
+
+RIDE_FIELDS = {"batch_code_pre", "batch_code", "actual_batch_code", "a01_r", "a02a_r", "a04_r"}
+
+
+def ride_identity(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+                  reviews: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    For each form: the planned ride it really belongs to and the actual code, after
+    the reviewer's corrections. Order of evidence for the planned ride:
+      1. a 'Correct in cleaning' / 'Corrected' value for batch_code_pre on this form
+      2. date + team + ride # on the form (with any corrections to a01_r/a02a_r/a04_r)
+      3. the planned code selected on the form
+    Columns: planned, actual, selected, date, team, ride, note.
+    """
+    corr = {}
+    ct = corrections_table(reviews)
+    if not ct.empty:
+        for _, c in ct.iterrows():
+            if DECISION_ALIASES.get(_txt(c["decision"]).lower()) in ("Fix needed", "Fixed"):
+                f = _txt(c["field"]).lower()
+                if f in RIDE_FIELDS:
+                    corr.setdefault(_txt(c["form_id"]), {})[f] = _txt(c["correct_value"])
+    lookup = _ride_lookup(batch_codes) if batch_codes is not None else {}
+    rows = []
+    for i, r in subs.iterrows():
+        cf = corr.get(_txt(r.get("form_id") or r.get("KEY")), {})
+        selected = _txt(r.get("batch_code"))
+        actual = cf.get("batch_code") or cf.get("actual_batch_code") or _txt(r.get("actual_batch_code"))
+        date = r.get("ride_date")
+        if "a01_r" in cf:
+            date = pd.to_datetime(cf["a01_r"], format="mixed", errors="coerce")
+        team = _code(cf.get("a02a_r", r.get("a02a_r")))
+        ride = _code(cf.get("a04_r", r.get("a04_r")))
+        likely = lookup.get((date, team, ride)) if team and ride and pd.notna(date) else None
+        if cf.get("batch_code_pre"):
+            planned, note = cf["batch_code_pre"], f"Selected {selected} → corrected (review)"
+        elif likely and likely != selected:
+            planned, note = likely, f"Filed under {selected} (form says ride {ride})"
+        else:
+            planned, note = selected, ""
+        if planned == selected and note.startswith("Selected"):
+            note = ""
+        p = parse_batch_code(planned)
+        if p.get("parse_ok"):
+            p_date = pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce")
+            if note or not (team and ride and pd.notna(date)):
+                team, ride, date = p["team"], p["ride_num"], p_date
+            elif (team, ride) != (p["team"], p["ride_num"]) or date != p_date:
+                # Not in the plan list, but the form and the code selected disagree:
+                # show the ride the form describes and say so
+                note = (f"Selected {selected} (team {p['team']}, ride {p['ride_num']}) "
+                        f"but form says team {team}, ride {ride} — check")
+        rows.append({"planned": planned, "actual": actual, "selected": selected,
+                     "date": date, "team": team, "ride": ride, "note": note})
+    return pd.DataFrame(rows, index=subs.index)
+
+
+def _ride_sort_key(ident: pd.DataFrame, subs: pd.DataFrame) -> list:
+    num = lambda x: int(x) if str(x).isdigit() else 999
+    return sorted(ident.index, key=lambda i: (
+        ident.at[i, "date"] if pd.notna(ident.at[i, "date"]) else pd.Timestamp.max,
+        num(ident.at[i, "team"]), num(ident.at[i, "ride"]),
+        subs.at[i, "submitted_at"] if pd.notna(subs.at[i, "submitted_at"]) else pd.Timestamp.max))
 
 
 def code_changes_vs(row, planned: str) -> list:
@@ -964,17 +1028,36 @@ def assess_issues(row) -> dict:
             "recording": recording}
 
 
-def fidelity_table(subs: pd.DataFrame):
-    """One row per E1 form: values next to reasons. Returns (table, css)."""
-    d = subs[subs["role"] == E1].sort_values(["ride_date", "batch_code", "submitted_at"])
+def _ride_cols(ident_row) -> dict:
+    """Ride columns shared by the Tab 2 tables (planned ride after corrections + actual code)."""
+    pt = parse_batch_code(ident_row["planned"]).get("treatment", "")
+    at = parse_batch_code(ident_row["actual"]).get("treatment", "") if ident_row["actual"] else ""
+    treat = TREAT.get(at or pt, at or pt)
+    if at and pt and at != pt:
+        treat = f"{treat} (planned {TREAT.get(pt, pt)})"
+    return {
+        "Ride date":     fmt_day(ident_row["date"]),
+        "Team":          ident_row["team"] or "—",
+        "Ride #":        ident_row["ride"] or "—",
+        "Planned code":  ident_row["planned"] or "—",
+        "Actual code":   ident_row["actual"] or "—",
+        "Code note":     ident_row["note"] or "—",
+        "Treatment":     treat or "—",
+    }
+
+
+def fidelity_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+                   reviews: pd.DataFrame | None = None):
+    """One row per E1 form, on its real planned ride (after corrections): values next to reasons."""
+    d = subs[subs["role"] == E1]
+    ident = ride_identity(d, batch_codes, reviews)
+    d = d.loc[_ride_sort_key(ident, d)]
     rows, flags = [], []
     for i, r in d.iterrows():
         a = assess_issues(r)
         sig, ann = _num(r.get("signup_duration")), _num(r.get("announcement_duration"))
         rows.append({
-            "Planned code":        _txt(r["batch_code"]),
-            "Ride date":           fmt_day(r["ride_date"]),
-            "Treatment":           TREAT.get(_txt(r.get("p_treatment")), _txt(r.get("p_treatment"))),
+            **_ride_cols(ident.loc[i]),
             "Enumerator 1":        _txt(r["person"]),
             "Issue status":        a["status"],
             "Flagged values":      "; ".join(a["items"]) or "—",
@@ -1020,20 +1103,22 @@ def fidelity_table(subs: pd.DataFrame):
          "Outside target, reason given": BLUE, "No issues": GREEN}).fillna("")
     css.loc[t["Recording problems"] != "—", "Recording problems"] = RED
     css.loc[t["Completion"] == "Not fully completed", "Completion"] = RED
+    css.loc[t["Code note"] != "—", "Code note"] = PURPLE
     return t, css
 
 
-def crosscheck_table(subs: pd.DataFrame):
+def crosscheck_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+                     reviews: pd.DataFrame | None = None):
     """One row per E1 form with the paired supervisor's independent record. Returns (table, css)."""
     pairs = pair_supervisors(subs)
-    d = subs[subs["role"] == E1].sort_values(["ride_date", "batch_code", "submitted_at"])
+    d = subs[subs["role"] == E1]
+    ident = ride_identity(d, batch_codes, reviews)
+    d = d.loc[_ride_sort_key(ident, d)]
     rows = []
     for i, r in d.iterrows():
-        row = {
-            "Planned code": _txt(r["batch_code"]),
-            "Ride date":    fmt_day(r["ride_date"]),
-            "Enumerator 1": _txt(r["person"]),
-        }
+        rc = _ride_cols(ident.loc[i])
+        row = {k: rc[k] for k in ["Ride date", "Team", "Ride #", "Planned code"]}
+        row["Enumerator 1"] = _txt(r["person"])
         if i not in pairs:
             row.update({"Supervisor": "— not observed —"})
             rows.append(row)
@@ -1059,7 +1144,7 @@ def crosscheck_table(subs: pd.DataFrame):
         row["Completion match"]    = {"1": "✓ Match", "0": "✗ Differs"}.get(_code(s.get("sup_completion_matches_e1")), "—")
         rows.append(row)
 
-    cols = (["Planned code", "Ride date", "Enumerator 1", "Supervisor", "Paired by"]
+    cols = (["Ride date", "Team", "Ride #", "Planned code", "Enumerator 1", "Supervisor", "Paired by"]
             + [f"Gap: {l}" for l, _ in CHECKPOINTS]
             + ["Max gap (min)", "Largest at", "Sign-ups E1 / Sup", "Sup: times match", "Mismatched times",
                "Discrepancy source", "E1 recording issue", "Count match", "Ticket match", "Completion match"])
