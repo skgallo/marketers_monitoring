@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07m"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07n"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -93,7 +93,7 @@ RECORDING_ISSUE = {"1": "E1 recording error", "0": "Not attributed to E1", "-1":
 
 # Supervisor behavioural observations (s-field → category)
 S_CATEGORIES = {
-    "Preparation":   ["s01"],
+    "Preparation":   ["s01", "s02"],
     "Form use":      ["s03"],
     "Announcement":  ["s04", "s05", "s06", "s07", "s08", "s09", "s10"],
     "Pax questions": ["s11", "s12"],
@@ -509,6 +509,10 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         other_mkt = [f for _, f in d.iterrows() if _code(f.get("other_marketer")) == "1"]
         if other_mkt:
             parts.add("Other marketer")
+        # Sit down: the supervisor saw the team's own marketer speak or sell during the pause (s27 = No)
+        mkt_spoke = [f for _, f in d.iterrows() if _code(f.get("s27")) == "0"]
+        if mkt_spoke:
+            parts.add("Marketer spoke in pause")
         if len(came_in):
             parts.add("Wrong code")
         if len(e1) > 1:
@@ -533,8 +537,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 
         # Which issue parts produce which status
         tag_parts = {}
-        if "Other marketer" in parts:
-            tag_parts["Validity at risk"] = {"Other marketer"}
+        if parts & {"Other marketer", "Marketer spoke in pause"}:
+            tag_parts["Validity at risk"] = parts & {"Other marketer", "Marketer spoke in pause"}
         if "Wrong code" in parts:
             tag_parts["Wrong code selected"] = {"Wrong code"}
         if parts & DESIGN_PARTS:
@@ -603,6 +607,10 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 part_text.setdefault(part, []).append(txt_)
         if unreported:
             part_text["Unreported change"] = unreported
+        if mkt_spoke:
+            part_text["Marketer spoke in pause"] = [
+                "Supervisor: the marketer spoke or sold during the Sit down pause"
+                + (f" ({_txt(f.get('s27a'))})" if _txt(f.get('s27a')) else "") for f in mkt_spoke]
         if other_mkt:
             part_text["Other marketer"] = [
                 f"Another marketer marketed on the bus ({_role_short(f['role'])} form, {_txt(f['person'])}"
@@ -655,7 +663,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         open_what = "; ".join(dict.fromkeys([c[1] for ch in changes for c in ch
                                              if c[0] != "allowed" and c[2] not in resolved_parts]
                                             + (unreported if "Unreported change" not in resolved_parts else [])
-                                            + (part_text.get("Other marketer", []) if "Other marketer" not in resolved_parts else [])))
+                                            + (part_text.get("Other marketer", []) if "Other marketer" not in resolved_parts else [])
+                                            + (part_text.get("Marketer spoke in pause", []) if "Marketer spoke in pause" not in resolved_parts else [])))
 
         if len(e1):
             names = _names(e1["person"])
@@ -710,9 +719,9 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 checks.append(txt_)
             if _code(f.get("sp_when")) == "3":
                 checks.append("Announcement started AFTER the strategic point")
-            ann_ = _num(f.get("announcement_duration"))
+            ann_ = _ann_signup(f)
             if not np.isnan(ann_) and not (ANN_DUR_MIN <= round(ann_, 1) <= ANN_DUR_MAX):
-                checks.append(f"Announcement {ann_:.1f} min")
+                checks.append(f"Announcement + sign-up {ann_:.1f} min")
             gap_ = _diff_minutes(_parse_time(f.get("b04")),
                                  _parse_time(f.get("b05")) if pd.notna(_parse_time(f.get("b05"))) else _parse_time(f.get("b06")))
             if not np.isnan(gap_) and round(gap_, 1) > DELAY_MAX_MIN:
@@ -983,7 +992,7 @@ def today_board(ledger: pd.DataFrame, day, extra_checks: dict | None = None) -> 
                     state = "Waiting"
             else:
                 if "Validity at risk" in tags:
-                    acts.append("Another marketer marketed on the bus — decide if the ride is valid")
+                    acts.append(f"Validity at risk ({r['_open_what'] or 'marketer'}) — decide if the ride is valid")
                 if "Wrong code selected" in tags:
                     acts += [n for n in r["Code selection"].split("; ") if "filed under" in n][:1]
                 if "Not-allowed change" in tags:
@@ -1688,12 +1697,12 @@ def supervisor_observations(subs: pd.DataFrame):
 #   * "pitch/pause end after ride end" is treated as a form issue, not E1 error.
 
 CHECK_LABELS = {
-    "s01": "Sat in assigned seat", "s03": "Followed SurveyCTO correctly and in real time",
+    "s01": "Sat in assigned seat", "s02": "Started the announcement at the right moment", "s03": "Followed SurveyCTO correctly and in real time",
     "s04": "Followed the script instructions", "s05": "Loud, clear voice",
     "s06": "Natural delivery and eye contact", "s07": "Persuasive, proactive attitude",
     "s08": "Active stance at the front", "s09": "Displayed the sign-up card",
     "s10": "Paused and resumed at the right points", "s11": "Addressed passenger questions appropriately",
-    "s12": "Avoided guessing answers", "s15": "Respected the 25-minute period",
+    "s12": "Avoided guessing answers", "s15": "Stayed quiet after the announcement (pitch/pause)",
     "s16": "Checked cards for missing information", "s19": "Gave the apprentice the ticket bag",
     "s21": "Agreed the fare count with the apprentice", "s22": "Apprentice signed the payment receipt",
     "s23": "Completed recruitment questions before ride end", "s24": "RIDE form completed before ride end",
@@ -1701,14 +1710,16 @@ CHECK_LABELS = {
 }
 # How each missed checklist item is phrased as advice in a message
 CHECK_ADVICE = {
-    "s01": "sit in your assigned seat (B1)", "s03": "follow SurveyCTO step by step while you announce",
+    "s01": "sit in your assigned seat (B1)",
+    "s02": "start the announcement as soon as the ride starts if the bus is at least half full, and never after the strategic point",
+    "s03": "follow SurveyCTO step by step while you announce",
     "s04": "read the full script without skipping lines", "s05": "speak louder so everyone can hear",
     "s06": "speak naturally and keep eye contact rather than reading", "s07": "be more persuasive and proactive",
     "s08": "stand at the front and engage the passengers", "s09": "show the sign-up card to passengers",
     "s10": "pause at the right point and resume once most cards are handed out or collected",
     "s11": "answer passenger questions using the approved guidance",
     "s12": "if you don't know an answer, say you'll check with the supervisor instead of guessing",
-    "s15": "stay seated and don't restart recruitment during the 25-minute period",
+    "s15": "stay seated and don't restart recruitment after the announcement ends",
     "s16": "check every card for missing information", "s19": "give the apprentice the ticket bag",
     "s21": "agree the number of fares with the apprentice", "s22": "make sure the apprentice signs the receipt",
     "s23": "finish the recruitment questions in SurveyCTO before the ride ends",
@@ -1981,7 +1992,7 @@ def daily_message(rs: pd.DataFrame, person: str, day, sender: str = "") -> str:
 BUS_FULLNESS = {"1": "< half full", "2": "≥ half full", "3": "Full (seated)", "4": "Full + standing"}
 YESNO_SHORT = {"1": "Yes", "0": "No"}
 MEDIA_FIELDS = [   # (column in the data, label)
-    ("signup_check",      "Sign-up photo"),
+    ("signup_check",      "Sign-up photos"),
     ("signup_photo_e2",   "E2 cards photo"),
     ("signup_photo_e3",   "E3 cards photo"),
     ("aa_1_ann_start",    "Audio 1: ann. start"),
@@ -1994,6 +2005,14 @@ MEDIA_FIELDS = [   # (column in the data, label)
 
 def _clock(t) -> str:
     return t.strftime("%H:%M") if pd.notna(t) else "—"
+
+
+def _ann_signup(r) -> float:
+    """Announcement + sign-up, b03 → b04 (minutes): the form's signup_duration, else from the times."""
+    x = _num(r.get("signup_duration"))
+    if np.isnan(x):
+        x = _diff_minutes(_parse_time(r.get("b03")), _parse_time(r.get("b04")))
+    return x
 
 
 def _start_check(r) -> tuple[str, str]:
@@ -2018,7 +2037,7 @@ def _start_check(r) -> tuple[str, str]:
 
 
 CLOCK_PREFIX = "🕒 "
-COL_ANN   = f"Announcement ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+COL_ANN   = f"Announcement + sign-up ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_LAG   = "Ann. end → sign-up end (min)"
 COL_SGAP  = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
 COL_PP    = "Pitch/pause (min)"
@@ -2096,8 +2115,9 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         # judged on the value shown (1 decimal), so "2.0" never shows as over a 2-min limit
         bad = lambda x, lo=None, hi=None: not np.isnan(x) and ((lo is not None and round(x, 1) < lo) or
                                                                (hi is not None and round(x, 1) > hi))
-        if bad(round(ann, 1) if not np.isnan(ann) else np.nan, ANN_DUR_MIN, ANN_DUR_MAX):
-            issues.append(f"Announcement {ann:.1f} min")
+        annsu = _ann_signup(r)                         # announcement + sign-up (b03 → b04): the 8–12 min rule
+        if bad(annsu, ANN_DUR_MIN, ANN_DUR_MAX):
+            issues.append(f"Announcement + sign-up {annsu:.1f} min")
         if bad(du["gap"], hi=DELAY_MAX_MIN):
             issues.append(f"Pitch/pause {du['gap']:.1f} min after sign-up")
         pp_txt = _txt(r.get("pitch_pause_check"))      # treatment-specific rule (rollup.pitch_pause_check)
@@ -2121,7 +2141,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             "Strategic point": {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—"),
             "Bus at start": BUS_FULLNESS.get(_code(r.get("b02a")), "—"),
             COL_PREV: fmt_val(prev.get(i, np.nan), 0),
-            COL_ANN: fmt_val(ann, 1),
+            COL_ANN: fmt_val(annsu, 1),
             COL_LAG: fmt_val(lag, 1),
             COL_SGAP: fmt_val(du["gap"], 1),
             COL_PP: fmt_val(pp, 1),
@@ -2454,7 +2474,8 @@ def media_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
 METRICS = [   # (column in ride_facts, label, decimals, threshold for "far from the average")
     ("signups",  "Sign-ups",                         1, 3.0),
     ("delay",    "Start delay (min)",                1, 1.0),
-    ("ann",      f"Announcement (min, {ANN_DUR_MIN}–{ANN_DUR_MAX})", 1, 1.0),
+    ("ann",      f"Announcement + sign-up (min, {ANN_DUR_MIN}–{ANN_DUR_MAX})", 1, 1.0),
+    ("script",   "Script screens (min)",             1, 1.0),
     ("lag",      "Ann. end → sign-up end (min)",     1, 1.0),
     ("gap",      "Sign-up end → pitch/pause (min)",  1, 1.0),
     ("pitch",    "Pitch, Normal/Peddling (min)",     1, 3.0),
@@ -2509,7 +2530,7 @@ def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             "treatment": TREAT.get(trt, trt), "marketer": mkt,
             # measures
             "signups": _num(r.get("total_signups")), "delay": _num(r.get("announcement_start_delay")),
-            "ann": ann, "lag": _diff_minutes(ann_end, t["b04"]), "gap": du["gap"],
+            "ann": _ann_signup(r), "script": ann, "lag": _diff_minutes(ann_end, t["b04"]), "gap": du["gap"],
             "pitch": du["pp"] if trt in ("N", "P") else np.nan,
             "pause": du["pp"] if trt == "S" else np.nan,
             "ride": du["ride"], "between": between.get(i, np.nan),
@@ -2524,7 +2545,7 @@ def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             "indep_ok": None if not vd or vd[1] == GRAY else vd[1] == GREEN,
             "start_ok": None if start_css == GRAY else start_css == GREEN,
             "sp_ok": None if not sp else sp != "3",
-            "ann_ok": None if np.isnan(ann) else ANN_DUR_MIN <= round(ann, 1) <= ANN_DUR_MAX,
+            "ann_ok": (None if np.isnan(_ann_signup(r)) else ANN_DUR_MIN <= round(_ann_signup(r), 1) <= ANN_DUR_MAX),
             "obs_yes": sr.get("obs_yes", 0), "obs_n": sr.get("obs_n", 0),
             "grade": sr.get("grade", np.nan),
             "no_rec_err": None if not sr.get("supervised") else not sr.get("rec_err", False),
@@ -2540,7 +2561,7 @@ INDICATORS = [   # (column, label)
     ("indep_ok",   "Confirmed by E4/supervisor"),
     ("start_ok",   "Start on time / justified"),
     ("sp_ok",      "At/before strategic point"),
-    ("ann_ok",     f"Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min"),
+    ("ann_ok",     f"Announcement + sign-up {ANN_DUR_MIN}–{ANN_DUR_MAX} min"),
     ("no_rec_err", "No recording error (sup.)"),
     ("counts_ok",  "Counts verified (sup.)"),
 ]
@@ -2675,14 +2696,14 @@ def e2e3_signups(subs: pd.DataFrame, f: pd.DataFrame, by: str = "person"):
 BALANCE_ROWS = [   # (column, label, kind)
     ("signups",  "Sign-ups per ride",                 "mean"),
     ("delay",    "Start delay (min)",                 "mean"),
-    ("ann",      "Announcement (min)",                "mean"),
+    ("ann",      "Announcement + sign-up (min)",      "mean"),
     ("lag",      "Ann. end → sign-up end (min)",      "mean"),
     ("gap",      "Sign-up end → pitch/pause (min)",   "mean"),
     ("ride",     "Ride (min)",                        "mean"),
     ("between",  "Between rides (min)",               "mean"),
     ("bus_half", "Bus at least half full at start",   "share"),
     ("start_ok", "Start on time / justified",         "share"),
-    ("ann_ok",   f"Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min", "share"),
+    ("ann_ok",   f"Announcement + sign-up {ANN_DUR_MIN}–{ANN_DUR_MAX} min", "share"),
     ("seat",     "Apprentice gave up seat",           "share"),
     ("other_mkt", "Another marketer on the bus",      "share"),
     ("other_spk", "Someone else spoke to passengers", "share"),
@@ -2789,8 +2810,9 @@ COLUMN_HELP = {
                                  "waited for the bus to fill (less than half full at the start)",
     "At/before strategic point": "When the start was late: the announcement began before or at the route's "
                                  "strategic point, not after it",
-    f"Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min": "Length of the announcement (time on the script screens) "
-                                                     f"between {ANN_DUR_MIN} and {ANN_DUR_MAX} minutes",
+    f"Announcement + sign-up {ANN_DUR_MIN}–{ANN_DUR_MAX} min": "From the start of the announcement to the end of sign-up "
+                                                               f"(b03 → b04) between {ANN_DUR_MIN} and {ANN_DUR_MAX} minutes "
+                                                               "(target 10)",
     "No recording error (sup.)": "The supervisor did not attribute a timing mismatch to the E1. Supervised rides only.",
     "Counts verified (sup.)": "The supervisor's count of sign-ups (and tickets) matched the E1's. Supervised rides only.",
     "Checklist (sup.)": "Share of the supervisor's checklist behaviours (s01–s26) the E1 did, pooled over rides",
@@ -2798,9 +2820,13 @@ COLUMN_HELP = {
     # averages
     "Sign-ups": "Average normal sign-ups per ride (total on the E1 form)",
     "Start delay (min)": "Minutes from the bus leaving the park to the start of the announcement",
-    f"Announcement (min, {ANN_DUR_MIN}–{ANN_DUR_MAX})": "Length of the announcement (script screens), minutes",
-    "Ann. end → sign-up end (min)": "Minutes between the end of the announcement and the end of sign-up "
-                                    "(time spent collecting sign-ups after the script)",
+    f"Announcement + sign-up (min, {ANN_DUR_MIN}–{ANN_DUR_MAX})": "Start of the announcement → end of sign-up (b03 → b04); "
+                                                                  "target 10 minutes, allowed 8–12",
+    "Script screens (min)": "Time spent on the script screens (the announcement itself, measured by the form)",
+    f"Announcement + sign-up ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)": "Start of the announcement → end of sign-up (b03 → b04); "
+                                                                "target 10 minutes, allowed 8–12",
+    "Ann. end → sign-up end (min)": "Minutes between the end of the script screens and the end of sign-up "
+                                    "(the gap: time spent collecting sign-ups after the script)",
     "Sign-up end → pitch/pause (min)": "Minutes between the end of sign-up and the start of the marketer's pitch "
                                        "(Normal/Peddling) or of the pause (Sit down); should be 2 or less",
     "Pitch, Normal/Peddling (min)": "Length of the marketer's pitch (pitch start → pitch end)",

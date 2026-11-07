@@ -35,7 +35,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07m"
+EXPECTED_VIEWS_VERSION = "2026-11-07n"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -355,7 +355,7 @@ form** — not only the planned code picked from the list. A ride can carry seve
 
 | Status | Meaning | What to do |
 |---|---|---|
-| 🔴 **Validity at risk** | The E1 or supervisor reported that **another marketer** got on the bus and marketed during the ride — this can invalidate the ride (e.g. a Sit down ride is no longer a control) | Decide: *OK – planned/allowed* = the ride still counts; *Correct in cleaning* = mark it invalid in cleaning |
+| 🔴 **Validity at risk** | The E1 or supervisor reported that **another marketer** got on the bus and marketed during the ride, or the supervisor saw **the team's marketer speak or sell during a Sit down pause** (s27) — this can invalidate the ride (e.g. a Sit down ride is no longer a control) | Decide: *OK – planned/allowed* = the ride still counts; *Correct in cleaning* = mark it invalid in cleaning |
 | 🔴 **Wrong code selected** | A form describing this ride (by its date, team and ride #) was filed under another planned code. The form is counted here only; the row it was filed under shows a grey note in *Code selection* but is not flagged | Decide: Correct in cleaning, or Corrected |
 | 🔴 **Not-allowed change** | The actual code has a different date, route/direction, ride number or treatment, or no readable code | Act now: the E1 should have stopped and called the supervisor; the ride may not count |
 | 🔴 **Duplicate E1** | More than one E1 form describes this ride | Same person → keep one; different people → two E1s on one ride, or a wrong code |
