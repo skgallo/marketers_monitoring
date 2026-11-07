@@ -104,6 +104,27 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return submissions_raw, batch_codes, subs
 
 
+@st.cache_data(ttl=300)
+def load_e4() -> pd.DataFrame:
+    """
+    Script Checklist (Enumerator 4) forms, published by SurveyCTO to their own tab/Sheet.
+    Secret: e4_url = "<CSV export link of that tab>". Empty frame if not set yet.
+    """
+    from rollup import prepare_e4
+    try:
+        url = st.secrets.get("e4_url")
+    except Exception:
+        url = None
+    if not url:
+        return pd.DataFrame()
+    try:
+        return prepare_e4(_read_tab(url, "Script Checklist (E4)"))
+    except RuntimeError as e:
+        out = pd.DataFrame()
+        out.attrs["error"] = str(e)
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Reviews tab — read, and write back from the dashboard
 # ---------------------------------------------------------------------------

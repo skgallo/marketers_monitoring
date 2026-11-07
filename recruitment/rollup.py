@@ -630,3 +630,66 @@ if __name__ == '__main__':
         'flag_4a_pause_dur', 'flag_4b_pitch_dur', 'flag_4c_after_ride', 'flag_5_any_timing',
     ]
     print(result[cols].to_string())
+
+
+# ---------------------------------------------------------------------------
+# Script Checklist (Enumerator 4) — independent timing record of the same ride
+# ---------------------------------------------------------------------------
+# Form "Script Checklist November 2026" (script_checklist_nov2026). Filled by the
+# Enumerator 4 (role_type 1) or a supervisor (role_type 0). Only field activities
+# (activity 3 = Field Training, 4 = Field Observation) describe a ride.
+E4_OBSERVER_LABELS = {'41': 'Aminata Kamara', '42': 'Davida A L Yambasu', '43': 'Mamusu Bangura',
+                      '44': 'Fatorma Sheriff', '14': 'Daniel T G Sesay'}
+E4_SUPERVISOR_LABELS = {'1': 'Daniella Mansaray', '2': 'Kadiatu Nabay', '3': 'Sahr Fasuluku',
+                        '4': 'Joseph Samuels', '5': 'Fatu Conteh'}
+E1_LABELS_NOV = {'11': 'Misheal Sellu', '12': 'Cecil Massaquoi', '13': 'Kadija Esther Kamara',
+                 '14': 'Daniel T G Sesay', '44': 'Fatorma Sheriff'}
+
+
+def prepare_e4(raw: pd.DataFrame) -> pd.DataFrame:
+    """One row per Script Checklist form that describes a field ride, with the same
+    planned/actual code columns as the recruitment forms (batch_code = planned)."""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    if 'KEY' in df.columns:
+        df = df[~(df['KEY'].notna() & df.duplicated(subset='KEY', keep='last'))].copy()
+    if 'username' in df.columns:
+        df = df[~df['username'].astype(str).str.lower().isin(TEST_USERNAMES)].copy()
+    if 'activity' in df.columns:
+        act = pd.to_numeric(df['activity'], errors='coerce')
+        df = df[act.isna() | (act > 2)].copy()
+    if df.empty:
+        return df
+    years = pd.to_datetime(df.get('SubmissionDate'), format='mixed', errors='coerce').dt.year.fillna(2026).astype(int)
+    for c in ['batch_code', 'batch_code_pre']:
+        if c not in df.columns:
+            df[c] = None
+        df[c] = [fix_batch_code(x, y) for x, y in zip(df[c], years)]
+    df = df.rename(columns={'batch_code': 'actual_batch_code', 'batch_code_pre': 'batch_code'})
+    p = df['batch_code'].apply(parse_batch_code).apply(pd.Series).add_prefix('p_')
+    a = df['actual_batch_code'].apply(parse_batch_code).apply(pd.Series).add_prefix('a_')
+    df = pd.concat([df, p, a], axis=1)
+
+    rt = df.get('role_type', pd.Series(None, index=df.index)).map(_code)
+    obs = [E4_SUPERVISOR_LABELS.get(_code(s), _code(s)) if r == '0' else E4_OBSERVER_LABELS.get(_code(e), _code(e))
+           for r, s, e in zip(rt, df.get('supervisor', pd.Series(None, index=df.index)),
+                              df.get('e4_name', pd.Series(None, index=df.index)))]
+    for oth_col, mask in [('supervisor_oth', rt == '0'), ('e4_name_oth', rt != '0')]:
+        if oth_col in df.columns:
+            obs = [str(o).strip() if (m and str(x) == '-55' and pd.notna(o)) else x
+                   for x, o, m in zip(obs, df[oth_col], mask)]
+    df['observer'] = obs
+    df['observer_role'] = np.where(rt == '0', 'Supervisor (checklist)', 'E4')
+    lab = df.get('a02_1_lab', pd.Series(None, index=df.index))
+    df['e1_name'] = [str(l).strip() if pd.notna(l) and str(l).strip() else E1_LABELS_NOV.get(_code(c), _code(c))
+                     for l, c in zip(lab, df.get('a02_1', pd.Series(None, index=df.index)))]
+    form_date = pd.to_datetime(df.get('a01_r', pd.Series(None, index=df.index)), format='mixed', errors='coerce')
+    code_date = pd.to_datetime(df.get('a_date', pd.Series(None, index=df.index)), format='%d%m%Y', errors='coerce')
+    df['ride_date'] = form_date.fillna(code_date).dt.normalize()
+    df['submitted_at'] = pd.to_datetime(df.get('SubmissionDate'), format='mixed', errors='coerce',
+                                        utc=True).dt.tz_localize(None)
+    df['form_id'] = df.get('KEY', pd.Series(None, index=df.index))
+    df['person'] = df['observer']
+    df['role'] = 'E4'
+    return df.reset_index(drop=True)

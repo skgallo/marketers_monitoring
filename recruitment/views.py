@@ -30,7 +30,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07b"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07c"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -1978,11 +1978,50 @@ def _start_check(r) -> tuple[str, str]:
     return f"Waited {delay:.1f} min, no reason recorded", RED
 
 
+CLOCK_PREFIX = "🕒 "
+COL_ANN   = f"Announcement ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+COL_LAG   = "Ann. end → sign-up end (min)"
+COL_SGAP  = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
+COL_PP    = f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+COL_RIDE2 = f"Ride ({RIDE_MIN_MIN}+ min)"
+COL_PREV  = "Since team's previous ride (min)"
+
+
+def _times(r) -> dict:
+    """Parsed clock times of one form (any source) with pitch/pause start/end resolved."""
+    t = {k: _parse_time(r.get(k)) for k in ["b02_r", "b03", "b04", "b05", "b06", "b09", "b10", "b11"]}
+    t["pp_start"] = t["b05"] if pd.notna(t["b05"]) else t["b06"]
+    t["pp_end"] = t["b09"] if pd.notna(t["b09"]) else t["b10"]
+    return t
+
+
+def _durations(t: dict) -> dict:
+    """Durations computed the same way for every source (E1, E4, supervisor)."""
+    return {"delay": _diff_minutes(t["b02_r"], t["b03"]),
+            "signup": _diff_minutes(t["b03"], t["b04"]),
+            "gap": _diff_minutes(t["b04"], t["pp_start"]),
+            "pp": _diff_minutes(t["pp_start"], t["pp_end"]),
+            "ride": _diff_minutes(t["b02_r"], t["b11"])}
+
+
+def _order_problems(t: dict) -> list:
+    """Steps recorded in an impossible order (more than 1 min backwards)."""
+    seq = [("Ride start", t["b02_r"]), ("Ann. start", t["b03"]), ("Sign-up end", t["b04"]),
+           ("Pitch/pause start", t["pp_start"]), ("Pitch/pause end", t["pp_end"]), ("Ride end", t["b11"])]
+    seq = [(n, x) for n, x in seq if pd.notna(x)]
+    out = []
+    for (n1, x1), (n2, x2) in zip(seq, seq[1:]):
+        dm = _diff_minutes(x1, x2)
+        if not np.isnan(dm) and dm < -1:
+            out.append(f"{n2} before {n1.lower()}")
+    return out
+
+
 def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
                         reviews: pd.DataFrame | None = None):
     """
-    One row per E1 form: clock times of each step of the ride, the start checks
-    (bus fullness, strategic point) and the durations/gaps between steps.
+    One row per E1 form. Issues first (start checks, durations and gaps against their
+    targets, impossible order), then — in columns starting with 🕒 — the clock times.
     Returns (table, css).
     """
     d = subs[subs["role"] == E1]
@@ -1990,74 +2029,203 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         return pd.DataFrame(), pd.DataFrame()
     ident = ride_identity(d, batch_codes, reviews)
     d = d.loc[_ride_sort_key(ident, d)]
+    T = {i: _times(r) for i, r in d.iterrows()}
+    # time since the team's previous ride (previous ride end → this ride start), same day
+    prev = {}
+    keyed = sorted(d.index, key=lambda i: (ident.at[i, "date"] if pd.notna(ident.at[i, "date"]) else pd.Timestamp.max,
+                                           str(ident.at[i, "team"]), T[i]["b02_r"] if pd.notna(T[i]["b02_r"]) else pd.Timestamp.max))
+    for a_, b_ in zip(keyed, keyed[1:]):
+        if ident.at[a_, "date"] == ident.at[b_, "date"] and str(ident.at[a_, "team"]) == str(ident.at[b_, "team"]):
+            prev[b_] = _diff_minutes(T[a_]["b11"], T[b_]["b02_r"])
     rows, sty = [], []
     for i, r in d.iterrows():
-        t = {k: _parse_time(r.get(k)) for k in ["b02_r", "b03", "b04", "b05", "b06", "b09", "b10", "b11"]}
-        p_start = t["b05"] if pd.notna(t["b05"]) else t["b06"]
-        p_end = t["b09"] if pd.notna(t["b09"]) else t["b10"]
+        t = T[i]
+        du = _durations(t)
         ann = _num(r.get("announcement_duration"))            # automatic: script screens
         ann_end = t["b03"] + pd.Timedelta(minutes=ann) if pd.notna(t["b03"]) and not np.isnan(ann) else pd.NaT
-        lag = _diff_minutes(ann_end, t["b04"])                 # announcement end → sign-up end
-        gap = _diff_minutes(t["b04"], p_start)                 # sign-up end → pitch/pause start
-        pp = _num(r.get("pause_duration"))
-        if np.isnan(pp):
-            pp = _diff_minutes(p_start, p_end)
-        ride = _num(r.get("ride_duration"))
-        if np.isnan(ride):
-            ride = _diff_minutes(t["b02_r"], t["b11"])
+        lag = _diff_minutes(ann_end, t["b04"])
+        pp = _num(r.get("pause_duration"));  pp = du["pp"] if np.isnan(pp) else pp
+        ride = _num(r.get("ride_duration")); ride = du["ride"] if np.isnan(ride) else ride
         start_txt, start_css = _start_check(r)
         sp = _code(r.get("sp_when"))
-        sp_txt = {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—")
+        order = _order_problems(t)
+        issues = []
+        if start_css in (RED, AMBER):
+            issues.append(start_txt)
+        if sp == "3":
+            issues.append("Started after strategic point")
+        bad = lambda x, lo=None, hi=None: not np.isnan(x) and ((lo is not None and x < lo) or (hi is not None and x > hi))
+        if bad(round(ann, 1) if not np.isnan(ann) else np.nan, ANN_DUR_MIN, ANN_DUR_MAX):
+            issues.append(f"Announcement {ann:.1f} min")
+        if bad(du["gap"], hi=DELAY_MAX_MIN):
+            issues.append(f"Pitch/pause {du['gap']:.1f} min after sign-up")
+        if bad(pp, PITCH_TARGET_MIN - PITCH_TOL_MIN, PITCH_TARGET_MIN + PITCH_TOL_MIN):
+            issues.append(f"Pitch/pause {pp:.1f} min")
+        if bad(ride, lo=RIDE_MIN_MIN):
+            issues.append(f"Ride {ride:.1f} min")
+        issues += [f"Order: {o}" for o in order]
         row = {
             **{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #", "Treatment")},
             "Enumerator 1": _txt(r["person"]),
-            "Ride start": _clock(t["b02_r"]),
-            "Bus at start": BUS_FULLNESS.get(_code(r.get("b02a")), "—"),
-            "Ann. start": _clock(t["b03"]),
+            "Timeline issues": " · ".join(issues) or "None",
             "Start check": start_txt,
-            "Strategic point": sp_txt,
-            f"Announcement ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)": fmt_val(ann, 1),
-            "Sign-up end": _clock(t["b04"]),
-            "Ann. end → sign-up end (min)": fmt_val(lag, 1),
-            "Pitch/pause start": _clock(p_start),
-            f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)": fmt_val(gap, 1),
-            "Pitch/pause end": _clock(p_end),
-            f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)": fmt_val(pp, 1),
-            "Ride end": _clock(t["b11"]),
-            f"Ride ({RIDE_MIN_MIN}+ min)": fmt_val(ride, 1),
+            "Strategic point": {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—"),
+            "Bus at start": BUS_FULLNESS.get(_code(r.get("b02a")), "—"),
+            COL_PREV: fmt_val(prev.get(i, np.nan), 0),
+            COL_ANN: fmt_val(ann, 1),
+            COL_LAG: fmt_val(lag, 1),
+            COL_SGAP: fmt_val(du["gap"], 1),
+            COL_PP: fmt_val(pp, 1),
+            COL_RIDE2: fmt_val(ride, 1),
             "Apprentice gave seat": YESNO_SHORT.get(_code(r.get("apprentice_seat")), "—"),
+            CLOCK_PREFIX + "Ride start": _clock(t["b02_r"]),
+            CLOCK_PREFIX + "Ann. start": _clock(t["b03"]),
+            CLOCK_PREFIX + "Sign-up end": _clock(t["b04"]),
+            CLOCK_PREFIX + "Pitch/pause start": _clock(t["pp_start"]),
+            CLOCK_PREFIX + "Pitch/pause end": _clock(t["pp_end"]),
+            CLOCK_PREFIX + "Ride end": _clock(t["b11"]),
         }
         s = {k: "" for k in row}
+        s["Timeline issues"] = RED if issues else GREEN
         s["Start check"] = start_css
         if sp == "3":
             s["Strategic point"] = RED
-        k_ann = f"Announcement ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
-        if not np.isnan(ann) and not (ANN_DUR_MIN <= round(ann, 1) <= ANN_DUR_MAX):
-            s[k_ann] = RED
-        k_gap = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
-        if not np.isnan(gap) and gap > DELAY_MAX_MIN:
-            s[k_gap] = RED
-        k_pp = f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
-        if not np.isnan(pp) and abs(pp - PITCH_TARGET_MIN) > PITCH_TOL_MIN:
-            s[k_pp] = RED
-        k_ride = f"Ride ({RIDE_MIN_MIN}+ min)"
-        if not np.isnan(ride) and ride < RIDE_MIN_MIN:
-            s[k_ride] = RED
+        if bad(round(ann, 1) if not np.isnan(ann) else np.nan, ANN_DUR_MIN, ANN_DUR_MAX):
+            s[COL_ANN] = RED
+        if bad(du["gap"], hi=DELAY_MAX_MIN):
+            s[COL_SGAP] = RED
+        if bad(pp, PITCH_TARGET_MIN - PITCH_TOL_MIN, PITCH_TARGET_MIN + PITCH_TOL_MIN):
+            s[COL_PP] = RED
+        if bad(ride, lo=RIDE_MIN_MIN):
+            s[COL_RIDE2] = RED
         if not np.isnan(lag) and lag < -1:
-            s["Ann. end → sign-up end (min)"] = RED     # sign-up "ended" well before the announcement did
+            s[COL_LAG] = RED
+        if order:
+            for k in row:
+                if k.startswith(CLOCK_PREFIX):
+                    s[k] = RED
         for k, val in row.items():
             if val in ("—", MISSING) and not s[k]:
                 s[k] = GRAY
         rows.append(row); sty.append(s)
     t = pd.DataFrame(rows).replace({MISSING: "—"})
     css = pd.DataFrame(sty)
-    # hide columns for questions not in the forms in view
     for col, src in [("Apprentice gave seat", "apprentice_seat"), ("Strategic point", "sp_when"),
-                     ("Sign-up end", "b04"), ("Ann. end → sign-up end (min)", "b04"),
-                     (f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)", "b04")]:
+                     (CLOCK_PREFIX + "Sign-up end", "b04"), (COL_LAG, "b04"), (COL_SGAP, "b04")]:
         if not d.get(src, pd.Series(dtype=str)).notna().any() and col in t.columns:
             t = t.drop(columns=[col]); css = css.drop(columns=[col])
     return t, css
+
+
+# ---------------------------------------------------------------------------
+# TAB 2 — Timing cross-check: E1 vs E4 (Script Checklist) vs supervisor
+# ---------------------------------------------------------------------------
+CHECK_POINTS = [("Ride start", "b02_r"), ("Ann. start", "b03"), ("Sign-up end", "b04"),
+                ("Pitch/pause start", "pp_start"), ("Pitch/pause end", "pp_end"), ("Ride end", "b11")]
+DUR_LABELS = [("delay", f"Start delay (≤{DELAY_MAX_MIN})"), ("signup", "Ann.+sign-up (b03→b04)"),
+              ("gap", f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN})"),
+              ("pp", f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN})"),
+              ("ride", f"Ride ({RIDE_MIN_MIN}+)")]
+
+
+def _dur_flag(key, x) -> bool:
+    if np.isnan(x):
+        return False
+    if key in ("delay", "gap"):
+        return x > DELAY_MAX_MIN
+    if key == "pp":
+        return abs(x - PITCH_TARGET_MIN) > PITCH_TOL_MIN
+    if key == "ride":
+        return x < RIDE_MIN_MIN
+    return False
+
+
+def _match_e4(e1_planned: dict, e1_times: dict, e4: pd.DataFrame, e4_ident: pd.DataFrame) -> dict:
+    """{E1 row index: E4 row index} — same planned ride; if several, closest ride start."""
+    out, used = {}, set()
+    for i, code in e1_planned.items():
+        cand = [j for j in e4_ident.index if e4_ident.at[j, "planned"] == code and j not in used]
+        if not cand:
+            continue
+        def gap(j):
+            g = _diff_minutes(e1_times[i]["b02_r"], _parse_time(e4.at[j, "b02_r"]))
+            return abs(g) if not np.isnan(g) else 999
+        best = min(cand, key=gap)
+        out[i] = best; used.add(best)
+    return out
+
+
+def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: pd.DataFrame | None = None,
+                      reviews: pd.DataFrame | None = None):
+    """
+    One row per E1 form: the same ride as recorded by the E4 (Script Checklist) and by the
+    supervisor (recruitment form, role 0). Differences at each step and the durations from each
+    source, with the same targets. Returns (table, css, unmatched E4 forms).
+    """
+    d = subs[subs["role"] == E1]
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    ident = ride_identity(d, batch_codes, reviews)
+    d = d.loc[_ride_sort_key(ident, d)]
+    T = {i: _times(r) for i, r in d.iterrows()}
+    pairs = pair_supervisors(subs)
+    e4 = e4 if e4 is not None else pd.DataFrame()
+    e4_ident = ride_identity(e4, batch_codes, reviews) if not e4.empty else pd.DataFrame()
+    m4 = _match_e4({i: ident.at[i, "planned"] for i in d.index}, T, e4, e4_ident) if not e4.empty else {}
+    rows, sty = [], []
+    for i, r in d.iterrows():
+        srcs = {"E1": (r, T[i])}
+        if i in m4:
+            srcs["E4"] = (e4.loc[m4[i]], _times(e4.loc[m4[i]]))
+        if i in pairs:
+            s_ = subs.loc[pairs[i][0]]
+            srcs["Sup"] = (s_, _times(s_))
+        row = {**{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #")},
+               "Enumerator 1": _txt(r["person"]),
+               "E4": _txt(srcs["E4"][0]["observer"]) if "E4" in srcs else "— no checklist —",
+               "Supervisor": _txt(srcs["Sup"][0]["person"]) if "Sup" in srcs else "— not observed —"}
+        s = {k: "" for k in row}
+        diffs = []
+        for lbl, key in CHECK_POINTS:
+            for src in ("E4", "Sup"):
+                if src in srcs:
+                    g = _diff_minutes(T[i][key], srcs[src][1][key])
+                    if not np.isnan(g) and abs(g) > TIME_GAP_MAX:
+                        diffs.append((abs(g), f"{lbl}: {src} {g:+.1f}"))
+        row["Times differ by > 2 min"] = " · ".join(x for _, x in sorted(diffs, reverse=True)) or (
+            "None" if len(srcs) > 1 else "—")
+        s["Times differ by > 2 min"] = RED if diffs else (GREEN if len(srcs) > 1 else GRAY)
+        only_others = []           # targets missed according to E4/supervisor but not according to E1
+        e1_dur = _durations(T[i])
+        for key, lbl in DUR_LABELS:
+            vals, any_flag = [], False
+            for src in ("E1", "E4", "Sup"):
+                if src in srcs:
+                    x = _durations(srcs[src][1])[key]
+                    if not np.isnan(x):
+                        f = _dur_flag(key, x); any_flag |= f
+                        vals.append(f"{src} {x:.1f}" + (" ⚑" if f else ""))
+                        if f and src != "E1" and not _dur_flag(key, e1_dur[key]):
+                            only_others.append(f"{lbl.split(' (')[0]} ({src})")
+            row[lbl] = " · ".join(vals) or "—"
+            s[lbl] = RED if any_flag else ("" if vals else GRAY)
+        row["Missed target only per E4/supervisor"] = " · ".join(only_others) or "—"
+        s["Missed target only per E4/supervisor"] = RED if only_others else GRAY
+        if "E4" not in srcs: s["E4"] = GRAY
+        if "Sup" not in srcs: s["Supervisor"] = GRAY
+        rows.append(row); sty.append(s)
+    t, css = pd.DataFrame(rows), pd.DataFrame(sty)
+    # E4 checklists that didn't match any E1 form
+    if not e4.empty:
+        left = e4.loc[[j for j in e4.index if j not in set(m4.values())]]
+        unmatched = pd.DataFrame({
+            "Ride date": left["ride_date"].map(fmt_day), "Observer": left["observer"],
+            "Role": left["observer_role"], "Planned code selected": left["batch_code"].map(_txt),
+            "Actual code": left["actual_batch_code"].map(_txt), "E1 named": left["e1_name"].map(_txt),
+        }).reset_index(drop=True)
+    else:
+        unmatched = pd.DataFrame()
+    return t, css, unmatched
 
 
 def media_url(filename, form_id, server: str | None) -> str | None:

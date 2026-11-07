@@ -23,7 +23,7 @@ import pandas as pd
 import streamlit as st
 
 from auth import require_password
-from data_io import load_data, load_reviews, append_reviews, can_write_reviews, diagnostics
+from data_io import load_data, load_reviews, append_reviews, can_write_reviews, diagnostics, load_e4
 import datetime as dt
 from rollup import CORRIDORS, DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX, \
                    PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN
@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07b"
+EXPECTED_VIEWS_VERSION = "2026-11-07c"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -414,11 +414,43 @@ with tab2:
         st.caption("Clock times of each step, whether the announcement started when it should (bus fullness, "
                    "strategic point), and the time between steps. 🔴 = outside target; 🟠 = gap with another reason.")
         tl, tl_css = v.ride_timeline_table(subs_f, batch_codes, reviews)
-        if only_issues and not tl.empty:
-            show(tl[m.values], tl_css[m.values])
-        else:
-            show(tl, tl_css)
-        download(tl, "ride_timeline.csv", "dl_tl")
+        show_clock = st.toggle("Show clock times", value=False, key="tl_clock")
+        if not tl.empty:
+            cols = [c for c in tl.columns if show_clock or not c.startswith(v.CLOCK_PREFIX)]
+            sel = (tl["Timeline issues"] != "None") if only_issues else pd.Series(True, index=tl.index)
+            show(tl.loc[sel, cols], tl_css.loc[sel, cols])
+            download(tl, "ride_timeline.csv", "dl_tl")
+
+        # --- Same ride recorded by the E4 (Script Checklist) and the supervisor
+        e4_all = load_e4()
+        if e4_all.attrs.get("error"):
+            st.warning(e4_all.attrs["error"])
+        e4 = e4_all
+        if not e4.empty:
+            e4 = e4[e4["ride_date"].isna() | (e4["ride_date"] >= MONITOR_FROM)]
+            if not subs_f.empty and subs_f["ride_date"].notna().any():
+                e4 = e4[e4["ride_date"].isna() | e4["ride_date"].isin(subs_f["ride_date"].unique())]
+        st.markdown("#### Timing cross-check — E1 vs E4 (Script Checklist) vs supervisor")
+        st.caption(f"Differences are E4/supervisor minus E1 at each step; listed when more than {v.TIME_GAP_MAX} min. "
+                   "Durations are computed the same way from each source's times, with the same targets "
+                   "(⚑ = outside target). *Missed target only per E4/supervisor* = the E1's own times look fine "
+                   "but an independent record says otherwise.")
+        xt, xt_css, e4_unmatched = v.timing_crosscheck(subs_f, e4, batch_codes, reviews)
+        if not xt.empty:
+            sel = ((xt["Times differ by > 2 min"].str.contains(":", regex=False))
+                   | (xt["Missed target only per E4/supervisor"] != "—")) if only_issues else pd.Series(True, index=xt.index)
+            show(xt[sel], xt_css[sel])
+            download(xt, "timing_crosscheck.csv", "dl_xt")
+        try:
+            _has_e4 = bool(st.secrets.get("e4_url"))
+        except Exception:
+            _has_e4 = False
+        if not _has_e4:
+            st.caption("E4 data isn't connected yet: publish the Script Checklist form to a Google Sheet and add "
+                       "e4_url (its CSV export link) to Secrets.")
+        if not e4_unmatched.empty:
+            with st.expander(f"E4 checklists not matched to an E1 form ({len(e4_unmatched)})"):
+                st.dataframe(e4_unmatched, hide_index=True, width="stretch")
 
         try:
             _server = st.secrets.get("surveycto_server")
@@ -441,7 +473,7 @@ with tab2:
         show(fid[m], fid_css[m])
         download(fid[m], "implementation_fidelity.csv", "dl_fid")
 
-        st.markdown("#### Supervisor cross-check — independent record of the same ride")
+        st.markdown("#### Supervisor cross-check — counts, protocol and timing agreement")
         st.caption(f"Gaps are |E1 − supervisor| minutes at each checkpoint; red above {v.TIME_GAP_MAX} min. "
                    "Supervisor forms are paired with E1 forms by the E1 named on the supervisor form, "
                    f"ride date and ride start time (within {v.PAIR_WINDOW_MIN} min).")
