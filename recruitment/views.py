@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07f"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07g"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -922,7 +922,19 @@ def fixes_to_communicate(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 # TODAY — phone-friendly board of one day's rides
 # ---------------------------------------------------------------------------
 
-def today_board(ledger: pd.DataFrame, day) -> dict:
+def crosscheck_verdicts(xt: pd.DataFrame) -> tuple[dict, dict]:
+    """From timing_crosscheck(): ({E1 form_id: (verdict, css)}, {planned code: [flip texts]})."""
+    if xt is None or xt.empty:
+        return {}, {}
+    by_form = {f: (vd, c) for f, vd, c in zip(xt["_form_id"], xt["_verdict"], xt["_verdict_css"])}
+    flips = {}
+    for p, vd, fl in zip(xt["_planned"], xt["_verdict"], xt["_flip"]):
+        if fl:
+            flips.setdefault(p, []).append("Independent record: " + vd)
+    return by_form, flips
+
+
+def today_board(ledger: pd.DataFrame, day, extra_checks: dict | None = None) -> dict:
     """
     {team: (table, css)} for the planned rides on `day`, in ride order, with one
     'Action' line each. A ride with no forms is 'Waiting' until a later ride of
@@ -974,7 +986,7 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
                 "State":      state,
                 "Action":     " · ".join(acts) or "—",
                 "E1 explanation": r.get("E1 explanation", "—") if acts or had_issues else "—",
-                "Checks":     " · ".join(r.get("_checks") or []) or "—",
+                "Checks":     " · ".join(list(r.get("_checks") or []) + (extra_checks or {}).get(r["Planned code"], [])) or "—",
                 "Review":     r["Review status"],
             })
             styles.append(state)
@@ -2019,7 +2031,7 @@ def _order_problems(t: dict) -> list:
 
 
 def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
-                        reviews: pd.DataFrame | None = None):
+                        reviews: pd.DataFrame | None = None, verdicts: dict | None = None):
     """
     One row per E1 form. Issues first (start checks, durations and gaps against their
     targets, impossible order), then — in columns starting with 🕒 — the clock times.
@@ -2070,6 +2082,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             **{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #", "Treatment")},
             "Enumerator 1": _txt(r["person"]),
             "Timeline issues": " · ".join(issues) or "None",
+            "Independent check": (verdicts or {}).get(_txt(r.get("form_id")), ("No second record", GRAY))[0],
             "Start check": start_txt,
             "Strategic point": {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—"),
             "Bus at start": BUS_FULLNESS.get(_code(r.get("b02a")), "—"),
@@ -2089,6 +2102,8 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         }
         s = {k: "" for k in row}
         s["Timeline issues"] = RED if issues else GREEN
+        s["Independent check"] = (verdicts or {}).get(_txt(r.get("form_id")), ("", GRAY))[1]
+        row["_check_ok"] = s["Independent check"] in (GREEN, GRAY)
         s["Start check"] = start_css
         if sp == "3":
             s["Strategic point"] = RED
@@ -2111,7 +2126,9 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
                 s[k] = GRAY
         rows.append(row); sty.append(s)
     t = pd.DataFrame(rows).replace({MISSING: "—"})
-    css = pd.DataFrame(sty)
+    css = pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
+    if verdicts is None:
+        t, css = t.drop(columns=["Independent check"]), css.drop(columns=["Independent check"])
     for col, src in [("Apprentice gave seat", "apprentice_seat"), ("Strategic point", "sp_when"),
                      (CLOCK_PREFIX + "Sign-up end", "b04"), (COL_LAG, "b04"), (COL_SGAP, "b04")]:
         if not d.get(src, pd.Series(dtype=str)).notna().any() and col in t.columns:
@@ -2163,7 +2180,8 @@ STEP_WORDS = {"Ride start": "ride start", "Ann. start": "announcement start", "S
 _cap = lambda s: s[:1].upper() + s[1:]
 
 
-def _describe_crosscheck(step_diffs: dict, flips_red: list, flips_amber: list, row: dict) -> str:
+def _describe_crosscheck(step_diffs: dict, flips_red: list, flips_amber: list, row: dict,
+                         confirmed: list | None = None) -> str:
     """
     Plain-language reading of one ride's comparison. step_diffs = {source: {step: other − E1 minutes}}.
     Positive = the other person recorded that step LATER than the E1.
@@ -2212,6 +2230,9 @@ def _describe_crosscheck(step_diffs: dict, flips_red: list, flips_amber: list, r
         out.append(f"By the independent record a target is missed ({f} min) but not by the E1's times, so the E1's times may not match what happened.")
     for f in flips_amber:
         out.append(f"The E1's times miss a target but the independent record doesn't ({f} min): possibly an E1 recording slip.")
+    if confirmed:
+        out.append("Target missed by both records — " + "; ".join(dict.fromkeys(confirmed))
+                   + ": the issue is confirmed by an independent record.")
     return " ".join(out) or "Records agree."
 
 
@@ -2268,7 +2289,7 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
                 s[f"Δ {lbl}"] = RED; issue = True
         # 2. durations: other − E1, and target flips
         e1_du = _durations(T[i])
-        flips_red, flips_amber = [], []
+        flips_red, flips_amber, confirmed = [], [], {}
         for key, lbl in DUR_LABELS:
             name = lbl.split(" (")[0]
             bits = []
@@ -2284,6 +2305,8 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
                     f_other, f_e1 = ppc(t_), ppc(T[i])
                 else:
                     f_other, f_e1 = _dur_flag(key, x), _dur_flag(key, e1_du[key])
+                if f_other and f_e1:
+                    confirmed.setdefault(name, [f"E1 {e1_du[key]:.1f}"]).append(f"{src} {x:.1f}")
                 if f_other and not f_e1:
                     flips_red.append(f"{name}: {src} {x:.1f} vs E1 {e1_du[key]:.1f}")
                 elif f_e1 and not f_other:
@@ -2297,7 +2320,32 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
             s["Target missed per E4/Sup, E1 looks fine"] = RED; issue = True
         if flips_amber:
             s["E1 outside target, E4/Sup says fine"] = AMBER; issue = True
-        row["What happened"] = _describe_crosscheck(step_diffs, flips_red, flips_amber, row)
+        # short verdict for the ride timeline ("Independent check") and Today
+        srcs_txt = " + ".join(SRC_NAME[s].replace("the ", "") for s in others) if others else ""
+        big_steps = [(src, k, g) for src, d_ in step_diffs.items() for k, g in d_.items() if abs(g) > TIME_GAP_MAX]
+        dur_diff = [k for k in row if k.startswith("Δ ") and row[k] and k[2:] not in [c for c, _ in CHECK_POINTS]]
+        if not others:
+            verdict, vcss = "No second record", GRAY
+        elif flips_red:
+            verdict, vcss = " · ".join(f"{f.split(':')[0]}: {f.split(': ', 1)[1].split(' vs ')[0]} min, E1 looks fine"
+                                       for f in flips_red), RED
+        elif big_steps or flips_amber or dur_diff:
+            bits = [f"{src} differs on {STEP_WORDS.get(k, k)} ({g:+.1f})" for src, k, g in big_steps[:2]]
+            bits += [f"E1 outside target, {f.split(': ', 1)[1].split(' vs ')[1].split(' ')[0]} within it ({f.split(':')[0]})"
+                     for f in flips_amber]
+            if not bits:
+                bits = ["Durations differ by > 2 min (" + ", ".join(k[2:] for k in dur_diff) + ")"]
+            verdict, vcss = " · ".join(bits), AMBER
+        elif confirmed:
+            verdict, vcss = f"Confirmed by {srcs_txt}: " + ", ".join(k.lower() for k in confirmed) + " also outside target", GREEN
+        else:
+            verdict, vcss = f"Agrees ({srcs_txt})", GREEN
+        row["_verdict"], row["_verdict_css"] = verdict, vcss
+        row["_flip"] = bool(flips_red)
+        row["_form_id"] = _txt(r.get("form_id"))
+        row["_planned"] = _txt(ident.at[i, "planned"])
+        row["What happened"] = _describe_crosscheck(step_diffs, flips_red, flips_amber, row,
+                                                    [f"{n} ({', '.join(vals)} min)" for n, vals in confirmed.items()])
         row["_compared"] = bool(others)
         row["_issue"] = issue
         rows.append(row); sty.append(s)

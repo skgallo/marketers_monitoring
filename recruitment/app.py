@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07f"
+EXPECTED_VIEWS_VERSION = "2026-11-07g"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -116,6 +116,13 @@ with col_refresh:
 
 ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, reviews)
 
+# E4 (Script Checklist) forms — the independent record used in Today and Tab 2
+e4_all = load_e4()
+if not e4_all.empty:
+    e4_all = e4_all[e4_all["ride_date"].isna() | (e4_all["ride_date"] >= MONITOR_FROM)]
+_xt_all, _, _ = v.timing_crosscheck(subs, e4_all, batch_codes, reviews)
+_, flips_by_code = v.crosscheck_verdicts(_xt_all)
+
 st.sidebar.caption(f"Showing rides from {MONITOR_FROM.strftime('%d %b %Y')} onward.")
 st.sidebar.header("Filters (tabs 1 & 2)")
 dates = sorted(set(ledger_all["_date"].dropna()) | set(subs["ride_date"].dropna())) if not ledger_all.empty else \
@@ -165,7 +172,7 @@ with tab0:
         day = st.selectbox("Day", day_opts, index=day_opts.index(default),
                            format_func=lambda d: v.fmt_day(pd.Timestamp(d)) + (" (today)" if d == today else ""),
                            key="today_day")
-        board = v.today_board(ledger_all, day)
+        board = v.today_board(ledger_all, day, flips_by_code)
         unreadable = ledger_all.loc[ledger_all["_date"].isna(), "Planned code"].tolist() if not ledger_all.empty else []
         if unreadable:
             st.warning(f"{len(unreadable)} planned code(s) in the batch_codes tab can't be read, so they don't "
@@ -410,46 +417,48 @@ with tab2:
         if only_issues:
             m |= fid["Recording problems"] != "—"
 
-        st.markdown("#### Ride timeline and start checks")
-        st.caption("Clock times of each step, whether the announcement started when it should (bus fullness, "
-                   "strategic point), and the time between steps. 🔴 = outside target; 🟠 = gap with another reason.")
-        tl, tl_css = v.ride_timeline_table(subs_f, batch_codes, reviews)
-        show_clock = st.toggle("Show clock times", value=False, key="tl_clock")
-        if not tl.empty:
-            cols = [c for c in tl.columns if show_clock or not c.startswith(v.CLOCK_PREFIX)]
-            sel = (tl["Timeline issues"] != "None") if only_issues else pd.Series(True, index=tl.index)
-            show(tl.loc[sel, cols], tl_css.loc[sel, cols])
-            download(tl, "ride_timeline.csv", "dl_tl")
-
-        # --- Same ride recorded by the E4 (Script Checklist) and the supervisor
-        e4_all = load_e4()
+        # Same ride as recorded by the E4 (Script Checklist) and the supervisor
         if e4_all.attrs.get("error"):
             st.warning(e4_all.attrs["error"])
         e4 = e4_all
-        if not e4.empty:
-            e4 = e4[e4["ride_date"].isna() | (e4["ride_date"] >= MONITOR_FROM)]
-            if not subs_f.empty and subs_f["ride_date"].notna().any():
-                e4 = e4[e4["ride_date"].isna() | e4["ride_date"].isin(subs_f["ride_date"].unique())]
-        st.markdown("#### Timing cross-check — E1 vs E4 (Script Checklist) vs supervisor")
-        st.caption(f"Shows only where an independent record disagrees with the E1. **Δ** = E4 or supervisor minus E1, "
-                   f"in minutes, listed when more than {v.TIME_GAP_MAX} min apart (blank = they agree). Targets are not "
-                   "flagged again here (see the timeline above) — only when the second record **flips** the result: "
-                   "🔴 the E4/supervisor's times miss a target but the E1's look fine; 🟠 the reverse.")
+        if not e4.empty and not subs_f.empty and subs_f["ride_date"].notna().any():
+            e4 = e4[e4["ride_date"].isna() | e4["ride_date"].isin(subs_f["ride_date"].unique())]
         xt, xt_css, e4_unmatched = v.timing_crosscheck(subs_f, e4, batch_codes, reviews)
+        verdicts, _ = v.crosscheck_verdicts(xt)
+
+        st.markdown("#### Ride timeline and start checks")
+        st.caption("Issues first: whether the announcement started when it should (bus fullness, strategic point) "
+                   "and the time between steps, against their targets. **Independent check** compares the E1's times "
+                   "with the E4 (Script Checklist) and the supervisor: 🟢 agrees or confirms; 🔴 the independent record "
+                   "misses a target the E1's times don't; 🟠 a time or duration differs by more than "
+                   f"{v.TIME_GAP_MAX} min. Details are in the expander below the table.")
+        tl, tl_css = v.ride_timeline_table(subs_f, batch_codes, reviews, verdicts)
+        show_clock = st.toggle("Show clock times", value=False, key="tl_clock")
+        if not tl.empty:
+            cols = [c for c in tl.columns if show_clock or not c.startswith(v.CLOCK_PREFIX)]
+            sel = ((tl["Timeline issues"] != "None") | ~tl["_check_ok"]) if only_issues \
+                else pd.Series(True, index=tl.index)
+            show(tl.loc[sel, cols], tl_css.loc[sel, [c for c in cols if c in tl_css.columns]])
+            download(tl, "ride_timeline.csv", "dl_tl")
+
         if not xt.empty:
             n_cmp = int(xt["_compared"].sum()); n_iss = int(xt["_issue"].sum())
-            c = st.columns(3)
-            c[0].metric("Rides with a second record", f"{n_cmp} / {len(xt)}")
-            c[1].metric("With differences or flips", n_iss)
-            c[2].metric("No E4 or supervisor record", len(xt) - n_cmp)
-            only_diff = st.toggle("Only rides with differences", value=True, key="xt_only")
-            sel = xt["_issue"] if only_diff else xt["_compared"]
-            if sel.any():
-                show(xt[sel], xt_css[sel])
-            else:
-                st.success("No differences between the E1 and the independent records." if n_cmp else
-                           "No E4 or supervisor records to compare yet.")
-            download(xt, "timing_crosscheck.csv", "dl_xt")
+            with st.expander(f"Details: E1 vs E4 vs supervisor — {n_iss} ride(s) with differences, "
+                             f"{n_cmp}/{len(xt)} with a second record"):
+                st.caption(f"**Δ** = E4 or supervisor minus E1, in minutes (+ = recorded later than the E1), listed when "
+                           f"more than {v.TIME_GAP_MAX} min apart; blank = they agree. **What happened** reads the "
+                           "comparison in plain language.")
+                only_diff = st.toggle("Only rides with differences", value=True, key="xt_only")
+                sel = xt["_issue"] if only_diff else xt["_compared"]
+                if sel.any():
+                    show(xt[sel], xt_css[sel])
+                else:
+                    st.success("No differences between the E1 and the independent records." if n_cmp else
+                               "No E4 or supervisor records to compare yet.")
+                download(xt, "timing_crosscheck.csv", "dl_xt")
+                if not e4_unmatched.empty:
+                    st.markdown(f"**E4 checklists not matched to an E1 form ({len(e4_unmatched)})**")
+                    st.dataframe(e4_unmatched, hide_index=True, width="stretch")
         try:
             _has_e4 = bool(st.secrets.get("e4_url"))
         except Exception:
@@ -457,9 +466,6 @@ with tab2:
         if not _has_e4:
             st.caption("E4 data isn't connected yet: publish the Script Checklist form to a Google Sheet and add "
                        "e4_url (its CSV export link) to Secrets.")
-        if not e4_unmatched.empty:
-            with st.expander(f"E4 checklists not matched to an E1 form ({len(e4_unmatched)})"):
-                st.dataframe(e4_unmatched, hide_index=True, width="stretch")
 
         try:
             _server = st.secrets.get("surveycto_server")
