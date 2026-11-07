@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07g"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07i"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -1734,6 +1734,9 @@ def ride_summary(subs: pd.DataFrame, batch_codes: pd.DataFrame, reviews: pd.Data
                            and not (DURATION_PARTS_NOT_COUNTED and any(k in i_ for k in ("Start delay", "Pause", "Pitch", "Short ride")))]
         impossible = [x for x in a["recording"] if x not in ("Recorded ≠ auto timing", "Pitch/pause ends after ride end")]
         rows.append({
+            "form_id": _txt(r.get("form_id")),
+            "counts_verified": (None if s is None or _code(s.get("s17")) not in ("1", "2") else
+                                _code(s.get("s17")) == "1" and _code(s.get("s20")) in ("1", None)),
             "person": r["person"], "e1_id": r["e1_id"], "date": r["ride_date"], "team": _code(r.get("a02a_r")) or "",
             "ride": _code(r.get("a04_r")) or "", "code": code, "selected": _txt(r["batch_code"]),
             "wrong_code": bool(r["_mis"]) and dec("Wrong code") != "Approved",
@@ -2414,3 +2417,291 @@ def media_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             row[lbl] = media_url(r.get(c), r.get("form_id"), server, surveycto_form) if server else (_txt(r.get(c)).split("/")[-1] or None)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+
+# ---------------------------------------------------------------------------
+# TAB 3 — Enumerators: performance indicators and averages
+# ---------------------------------------------------------------------------
+METRICS = [   # (column in ride_facts, label, decimals, threshold for "far from the average")
+    ("signups",  "Sign-ups",                         1, 3.0),
+    ("delay",    "Start delay (min)",                1, 1.0),
+    ("ann",      f"Announcement (min, {ANN_DUR_MIN}–{ANN_DUR_MAX})", 1, 1.0),
+    ("lag",      "Ann. end → sign-up end (min)",     1, 1.0),
+    ("gap",      "Sign-up end → pitch/pause (min)",  1, 1.0),
+    ("pitch",    "Pitch, Normal/Peddling (min)",     1, 3.0),
+    ("pause",    "Pause, Sit down (min)",            1, 3.0),
+    ("ride",     "Ride (min)",                       1, 5.0),
+    ("between",  "Between rides (min)",              0, 10.0),
+]
+GROUP_BY = {"Enumerator 1": "person", "Route (corridor)": "corridor", "Direction": "direction",
+            "Team": "team", "Treatment": "treatment", "Marketer": "marketer", "Day": "day"}
+
+
+def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+               reviews: pd.DataFrame | None = None, verdicts: dict | None = None) -> pd.DataFrame:
+    """
+    One row per E1 form: the groupers (enumerator, route, direction, team, treatment, marketer, day),
+    the averaged measures and the counted performance indicators (True/False/None = not assessed).
+    """
+    d = subs[subs["role"] == E1]
+    if d.empty:
+        return pd.DataFrame()
+    ident = ride_identity(d, batch_codes, reviews)
+    rmap = review_map(reviews)
+    rs = ride_summary(subs, batch_codes, reviews)
+    rs_by = {f: r for f, r in zip(rs["form_id"], rs.to_dict("records"))} if not rs.empty else {}
+    T = {i: _times(r) for i, r in d.iterrows()}
+    # time since the team's previous ride, same day
+    order = sorted(d.index, key=lambda i: (str(ident.at[i, "date"]), str(ident.at[i, "team"]),
+                                           T[i]["b02_r"] if pd.notna(T[i]["b02_r"]) else pd.Timestamp.max))
+    between = {}
+    for a_, b_ in zip(order, order[1:]):
+        if ident.at[a_, "date"] == ident.at[b_, "date"] and str(ident.at[a_, "team"]) == str(ident.at[b_, "team"]):
+            between[b_] = _diff_minutes(T[a_]["b11"], T[b_]["b02_r"])
+    rows = []
+    for i, r in d.iterrows():
+        t, du = T[i], _durations(T[i])
+        trt = _txt(r.get("treatment_actual")) or _txt(r.get("a_treatment")) or _txt(r.get("p_treatment"))
+        ann = _num(r.get("announcement_duration"))
+        ann_end = t["b03"] + pd.Timedelta(minutes=ann) if pd.notna(t["b03"]) and not np.isnan(ann) else pd.NaT
+        route = _txt(r.get("a_route")) or _txt(r.get("p_route"))
+        sr = rs_by.get(_txt(r.get("form_id")), {})
+        code = _txt(ident.at[i, "planned"])
+        decisions = {x["decision"] for x in rmap.get(code, {}).values()}
+        start_txt, start_css = _start_check(r)
+        sp = _code(r.get("sp_when"))
+        vd = (verdicts or {}).get(_txt(r.get("form_id")))
+        mkt = _txt(r.get("mm_act_mkt")) or _txt(r.get("a_mkt_id")) or _txt(r.get("a03_r"))
+        rows.append({
+            "form_id": _txt(r.get("form_id")), "person": _txt(r["person"]),
+            "date": ident.at[i, "date"], "day": fmt_day(ident.at[i, "date"]),
+            "team": str(ident.at[i, "team"] or ""), "ride_no": str(ident.at[i, "ride"] or ""),
+            "direction": route, "corridor": "–".join(sorted([route[:2], route[2:]])) if len(route) == 4 else route,
+            "treatment": TREAT.get(trt, trt), "marketer": mkt,
+            # measures
+            "signups": _num(r.get("total_signups")), "delay": _num(r.get("announcement_start_delay")),
+            "ann": ann, "lag": _diff_minutes(ann_end, t["b04"]), "gap": du["gap"],
+            "pitch": du["pp"] if trt in ("N", "P") else np.nan,
+            "pause": du["pp"] if trt == "S" else np.nan,
+            "ride": du["ride"], "between": between.get(i, np.nan),
+            "bus_half": None if _code(r.get("b02a")) not in ("1", "2", "3", "4") else _code(r.get("b02a")) != "1",
+            "seat": None if _code(r.get("apprentice_seat")) not in ("0", "1") else _code(r.get("apprentice_seat")) == "1",
+            # counted indicators (None = not assessed)
+            "code_ok": not (sr.get("wrong_code", False) or decisions & {"Fix needed", "Fixed"}),
+            "same_day": sr.get("same_day"),
+            "order_ok": not _order_problems(t),
+            "indep_ok": None if not vd or vd[1] == GRAY else vd[1] == GREEN,
+            "start_ok": None if start_css == GRAY else start_css == GREEN,
+            "sp_ok": None if not sp else sp != "3",
+            "ann_ok": None if np.isnan(ann) else ANN_DUR_MIN <= round(ann, 1) <= ANN_DUR_MAX,
+            "obs_yes": sr.get("obs_yes", 0), "obs_n": sr.get("obs_n", 0),
+            "grade": sr.get("grade", np.nan),
+            "no_rec_err": None if not sr.get("supervised") else not sr.get("rec_err", False),
+            "counts_ok": sr.get("counts_verified"),
+        })
+    return pd.DataFrame(rows)
+
+
+INDICATORS = [   # (column, label)
+    ("code_ok",    "Correct batch code"),
+    ("same_day",   "Sent same day"),
+    ("order_ok",   "Times in possible order"),
+    ("indep_ok",   "Confirmed by E4/supervisor"),
+    ("start_ok",   "Start on time / justified"),
+    ("sp_ok",      "At/before strategic point"),
+    ("ann_ok",     f"Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min"),
+    ("no_rec_err", "No recording error (sup.)"),
+    ("counts_ok",  "Counts verified (sup.)"),
+]
+
+
+def enumerator_indicators(f: pd.DataFrame):
+    """One row per enumerator: share of rides meeting each counted indicator. Returns (table, css)."""
+    if f is None or f.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    rows, sty = [], []
+    for p, g in f.groupby("person", sort=True):
+        row, s = {"Enumerator 1": p, "Rides": len(g)}, {"Enumerator 1": "", "Rides": ""}
+        for col, lbl in INDICATORS:
+            vals = [x for x in g[col] if x is not None and not (isinstance(x, float) and np.isnan(x))]
+            n, yes = len(vals), sum(bool(x) for x in vals)
+            row[lbl] = fmt_rate(yes, n)
+            s[lbl] = GRAY if not n else (RED if yes / n < PERF_TARGET else GREEN if yes == n else "")
+        n_obs, y_obs = g["obs_n"].sum(), g["obs_yes"].sum()
+        row["Checklist (sup.)"] = fmt_rate(y_obs, n_obs)
+        s["Checklist (sup.)"] = GRAY if not n_obs else (GREEN if y_obs / n_obs >= 0.93 else
+                                                         AMBER if y_obs / n_obs >= 0.88 else RED)
+        gr = g["grade"].dropna()
+        row["Grade (sup., 1–10)"] = f"{gr.mean():.1f} ({len(gr)})" if len(gr) else "—"
+        s["Grade (sup., 1–10)"] = "" if len(gr) else GRAY
+        rows.append(row); sty.append(s)
+    return pd.DataFrame(rows), pd.DataFrame(sty)
+
+
+def averages_table(f: pd.DataFrame, by: str = "person"):
+    """
+    Averages of each measure by group (enumerator, route, direction, team, treatment, marketer, day),
+    with the overall average in the last row. A cell is coloured when the group's average is far from
+    the overall one (more than the metric's threshold): red = worse direction, blue = other direction.
+    Returns (table, css).
+    """
+    if f is None or f.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    label = {v_: k for k, v_ in GROUP_BY.items()}.get(by, by)
+    overall = {m: f[m].mean() for m, *_ in METRICS}
+    worse_if_lower = {"signups", "ann", "pitch", "pause", "ride"}   # lower than average is the concern
+    rows, sty = [], []
+    for key, g in f.groupby(by, sort=True):
+        row, s = {label: key or "—", "Rides": len(g)}, {label: "", "Rides": ""}
+        for m, lbl, nd, thr in METRICS:
+            x = g[m].mean()
+            row[lbl] = "—" if np.isnan(x) else f"{x:.{nd}f}"
+            s[lbl] = GRAY if np.isnan(x) else ""
+            if not np.isnan(x) and not np.isnan(overall[m]) and abs(x - overall[m]) > thr:
+                bad = (x < overall[m]) if m in worse_if_lower else (x > overall[m])
+                s[lbl] = RED if bad else BLUE
+        rows.append(row); sty.append(s)
+    tot = {label: "All rides", "Rides": len(f)}
+    for m, lbl, nd, _ in METRICS:
+        tot[lbl] = "—" if np.isnan(overall[m]) else f"{overall[m]:.{nd}f}"
+    rows.append(tot); sty.append({k: "font-weight: 700" for k in tot})
+    t, css = pd.DataFrame(rows), pd.DataFrame(sty).reindex(columns=pd.DataFrame(rows).columns).fillna("")
+    # drop measures that are empty everywhere (e.g. no Sit down rides yet)
+    empty = [lbl for m, lbl, *_ in METRICS if (t[lbl] == "—").all()]
+    return t.drop(columns=empty), css.drop(columns=empty)
+
+
+def e2e3_signups(subs: pd.DataFrame, f: pd.DataFrame, by: str = "person"):
+    """
+    Normal sign-up cards collected by each Enumerator 2 / 3 (E1's count on the E1 form), optionally split
+    by route, direction, team, treatment, marketer or day. Returns (table, css).
+    """
+    d = subs[subs["role"] == E1]
+    if d.empty or f is None or f.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    fx = f.set_index("form_id")
+    rows = []
+    for _, r in d.iterrows():
+        fid = _txt(r.get("form_id"))
+        if fid not in fx.index:
+            continue
+        for who_col, n_col in [("a02_2_lab", "c01_normal_e2"), ("a02_3_lab", "c01_normal_e3")]:
+            name, n = _txt(r.get(who_col)), _num(r.get(n_col))
+            if name and not np.isnan(n):
+                row = {"Enumerator 2/3": name, "n": n}
+                for k, col in GROUP_BY.items():
+                    row[col] = fx.at[fid, col] if col in fx.columns else ""
+                rows.append(row)
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+    x = pd.DataFrame(rows)
+    keys = ["Enumerator 2/3"] + ([by] if by != "person" else [])
+    g = x.groupby(keys).agg(Rides=("n", "size"), avg=("n", "mean")).reset_index()
+    g = g.rename(columns={"avg": "Avg normal sign-ups", by: {v_: k for k, v_ in GROUP_BY.items()}.get(by, by)})
+    overall = x["n"].mean()
+    css = pd.DataFrame("", index=g.index, columns=g.columns)
+    css.loc[g["Avg normal sign-ups"] < overall - 3, "Avg normal sign-ups"] = RED
+    css.loc[g["Avg normal sign-ups"] > overall + 3, "Avg normal sign-ups"] = BLUE
+    g["Avg normal sign-ups"] = g["Avg normal sign-ups"].map(lambda v_: f"{v_:.1f}")
+    return g, css
+
+
+
+# ---------------------------------------------------------------------------
+# TAB 3 — Balance between treatment arms
+# ---------------------------------------------------------------------------
+# Everything the E1 and the ride conditions produce before/around the pitch should look the same in
+# every arm; only the pitch itself differs. Sit down is the control arm.
+BALANCE_ROWS = [   # (column, label, kind)
+    ("signups",  "Sign-ups per ride",                 "mean"),
+    ("delay",    "Start delay (min)",                 "mean"),
+    ("ann",      "Announcement (min)",                "mean"),
+    ("lag",      "Ann. end → sign-up end (min)",      "mean"),
+    ("gap",      "Sign-up end → pitch/pause (min)",   "mean"),
+    ("ride",     "Ride (min)",                        "mean"),
+    ("between",  "Between rides (min)",               "mean"),
+    ("bus_half", "Bus at least half full at start",   "share"),
+    ("start_ok", "Start on time / justified",         "share"),
+    ("ann_ok",   f"Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min", "share"),
+    ("seat",     "Apprentice gave up seat",           "share"),
+]
+BALANCE_MIN_N = 5          # rides per arm before a difference is coloured
+BALANCE_SD_AMBER, BALANCE_SD_RED = 0.25, 0.5
+
+
+def _arm_values(f: pd.DataFrame, col: str, arm: str) -> np.ndarray:
+    x = f.loc[f["treatment"] == arm, col]
+    x = x[x.notna()]
+    return np.array([float(bool(v_)) if isinstance(v_, (bool, np.bool_)) else float(v_) for v_ in x], dtype=float)
+
+
+def balance_table(f: pd.DataFrame, control: str = "Sit down", within: str | None = None):
+    """
+    within = None → all rides together; or a grouping column ("corridor", "direction", "team",
+    "person", …) → the comparison is made separately inside each group (e.g. each route), with the
+    group as the first column. Returns (table, css).
+    """
+    if within and f is not None and not f.empty and within in f.columns:
+        label = {v_: k for k, v_ in GROUP_BY.items()}.get(within, within)
+        parts, cparts = [], []
+        for key, g in f.groupby(within, sort=True):
+            if g["treatment"].nunique() < 2 or control not in set(g["treatment"]):
+                continue                       # nothing to compare inside this group
+            t_, c_ = _balance_one(g, control)
+            if t_.empty or t_.shape[1] <= 2:
+                continue
+            t_.insert(0, label, key or "—"); c_.insert(0, label, "font-weight: 700")
+            parts.append(t_); cparts.append(c_)
+        if not parts:
+            return pd.DataFrame(), pd.DataFrame()
+        t = pd.concat(parts, ignore_index=True)
+        css = pd.concat(cparts, ignore_index=True).reindex(columns=t.columns).fillna("")
+        t = t.fillna("—")
+        return t, css
+    return _balance_one(f, control)
+
+
+def _balance_one(f: pd.DataFrame, control: str = "Sit down"):
+    """
+    Each measure by treatment arm, with the difference from the control arm and the standardised
+    difference (difference ÷ pooled SD). |std. diff| > 0.25 amber, > 0.5 red, once each arm has
+    BALANCE_MIN_N rides. Returns (table, css).
+    """
+    if f is None or f.empty or "treatment" not in f.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    arms = [a for a in ["Sit down", "Normal", "Peddling"] if (f["treatment"] == a).any()]
+    others = [a for a in arms if a != control]
+    rows, sty = [], []
+    for col, lbl, kind in BALANCE_ROWS:
+        if col not in f.columns:
+            continue
+        ctrl = _arm_values(f, col, control)
+        row, s = {"Measure": lbl}, {"Measure": ""}
+        fmt = (lambda x: f"{x:.0%}") if kind == "share" else (lambda x: f"{x:.1f}")
+        any_val = False
+        for a in arms:
+            x = _arm_values(f, col, a)
+            row[f"{a}{' (control)' if a == control else ''}"] = f"{fmt(x.mean())} ({len(x)})" if len(x) else "—"
+            s[f"{a}{' (control)' if a == control else ''}"] = "" if len(x) else GRAY
+            any_val |= bool(len(x))
+        for a in others:
+            x = _arm_values(f, col, a)
+            dkey, skey = f"{a} − control", f"Std. diff ({a})"
+            if len(x) and len(ctrl):
+                diff = x.mean() - ctrl.mean()
+                sd = np.sqrt((x.var(ddof=1) if len(x) > 1 else 0) / 2 + (ctrl.var(ddof=1) if len(ctrl) > 1 else 0) / 2)
+                std = diff / sd if sd > 0 else (0.0 if diff == 0 else float(np.sign(diff)) * 9.99)   # no spread: any gap is total
+                row[dkey] = (f"{diff * 100:+.0f} pp" if kind == "share" else f"{diff:+.1f}")
+                row[skey] = f"{std:+.2f}"
+                enough = len(x) >= BALANCE_MIN_N and len(ctrl) >= BALANCE_MIN_N
+                st_ = GRAY if not enough else RED if abs(std) > BALANCE_SD_RED else AMBER if abs(std) > BALANCE_SD_AMBER else GREEN
+                s[dkey], s[skey] = (st_ if st_ != GREEN else ""), st_
+            else:
+                row[dkey], row[skey] = "—", "—"
+                s[dkey], s[skey] = GRAY, GRAY
+        if any_val:
+            rows.append(row); sty.append(s)
+    t = pd.DataFrame(rows)
+    css = pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
+    return t, css

@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07g"
+EXPECTED_VIEWS_VERSION = "2026-11-07i"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -121,7 +121,7 @@ e4_all = load_e4()
 if not e4_all.empty:
     e4_all = e4_all[e4_all["ride_date"].isna() | (e4_all["ride_date"] >= MONITOR_FROM)]
 _xt_all, _, _ = v.timing_crosscheck(subs, e4_all, batch_codes, reviews)
-_, flips_by_code = v.crosscheck_verdicts(_xt_all)
+verdicts_all, flips_by_code = v.crosscheck_verdicts(_xt_all)
 
 st.sidebar.caption(f"Showing rides from {MONITOR_FROM.strftime('%d %b %Y')} onward.")
 st.sidebar.header("Filters (tabs 1 & 2)")
@@ -534,33 +534,89 @@ appear for Oct forms. **Sup. grade** in the cross-check is the supervisor's 1–
 # ---------------------------------------------------------------------------
 
 with tab3:
-    st.caption("How is each enumerator doing, day by day? Start delay, pause/pitch length and ride length depend "
-               "on the routes, so they are shown but not counted against anyone. Your review decisions apply.")
+    st.caption("How is each enumerator doing? **Performance indicators** = what they are responsible for "
+               "(route-driven durations are not counted). **Averages** = patterns: every enumerator should get "
+               "roughly the same sign-ups, announcement length, ride length… — cells far from the overall "
+               "average are coloured. Your review decisions apply.")
     rs = v.ride_summary(subs, batch_codes, reviews)
-    if rs.empty:
+    facts = v.ride_facts(subs, batch_codes, reviews, verdicts_all)
+    if rs.empty or facts.empty:
         st.info("No E1 forms yet.")
     else:
-        st.markdown("#### At a glance")
-        grid, grid_css = v.day_grid(rs)
-        show(grid, grid_css)
-        st.caption("Each cell: share of supervisor checklist behaviours done that day · recording problems "
-                   "(wrong code, late form, timing). Green = 93%+ and clean · amber = minor issues · "
-                   "red = half or more rides with a recording problem · grey = not E1 that day.")
-
         f1, f2 = st.columns(2)
-        people = sorted(rs["person"].unique())
-        days_all = sorted(rs["date"].dropna().unique())
+        people = sorted(facts["person"].unique())
+        days_all = sorted(facts["date"].dropna().unique())
         with f1:
             who = st.selectbox("Enumerator", ["All enumerators"] + people, key="enum_who")
         with f2:
             day_sel = st.selectbox("Day", ["All days"] + days_all, key="enum_day",
                                    format_func=lambda d: d if isinstance(d, str) else v.fmt_day(pd.Timestamp(d)))
+        fm = pd.Series(True, index=facts.index)
         m = pd.Series(True, index=rs.index)
         if who != "All enumerators":
-            m &= rs["person"] == who
+            fm &= facts["person"] == who; m &= rs["person"] == who
         if day_sel != "All days":
-            m &= rs["date"] == day_sel
+            fm &= facts["date"] == day_sel; m &= rs["date"] == day_sel
+        fsel = facts[fm].reset_index(drop=True)
         sel = rs[m].reset_index(drop=True)
+
+        st.markdown("#### Performance indicators")
+        ind, ind_css = v.enumerator_indicators(fsel)
+        show(ind, ind_css)
+        st.caption(f"Share of rides meeting each indicator (rides assessed in brackets). Red below "
+                   f"{v.PERF_TARGET:.0%}; green = all met; grey = not assessed. Checklist: green 93%+, amber 88–92%, "
+                   "red below 88%.")
+        with st.expander("What each indicator means"):
+            st.markdown(f"""
+| Indicator | Met when |
+|---|---|
+| Correct batch code | Right planned code selected and ride details entered correctly (allowed changes — team, marketer — and differences you marked *OK – planned/allowed* don't count; a not-allowed change the E1 reported to the supervisor doesn't count either) |
+| Sent same day | Form submitted on the ride date |
+| Times in possible order | No step recorded before the previous one |
+| Confirmed by E4/supervisor | The independent record agrees (no flip, no time > {v.TIME_GAP_MAX} min off); only rides with a second record |
+| Start on time / justified | Announcement within {DELAY_MAX_MIN} min of ride start, or waited because the bus was less than half full |
+| At/before strategic point | Not started after the route's strategic point (asked only when the start was late) |
+| Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min | Automatic length of the script screens |
+| No recording error (sup.) | The supervisor didn't attribute a timing mismatch to the E1 |
+| Counts verified (sup.) | Sign-up (and ticket) counts matched the supervisor's |
+| Checklist (sup.) | Observed behaviours done (s01–s26), pooled |
+| Grade (sup.) | Supervisor's 1–10 grade, average (number of rides graded) |
+
+Not counted (see Averages): pitch/pause and ride length, sign-up end → pitch/pause, sign-ups, time between rides.
+""")
+
+        st.markdown("#### Averages — patterns by enumerator, route, team, treatment…")
+        gb_label = st.selectbox("Group by", list(v.GROUP_BY), key="avg_by")
+        av, av_css = v.averages_table(fsel, v.GROUP_BY[gb_label])
+        show(av, av_css)
+        st.caption("Average per ride. 🔴 far from the overall average in the worrying direction (fewer sign-ups, "
+                   "shorter announcement/pitch/ride, longer delays or gaps); 🔵 far in the other direction. "
+                   "'Far' = more than 3 sign-ups, 1 min (delay, announcement, lags), 3 min (pitch/pause), "
+                   "5 min (ride) or 10 min (between rides). Few rides → treat with care.")
+
+        st.markdown("#### Balance between treatment arms")
+        within_lbl = st.radio("Compare", ["All rides together", "Within each route", "Within each direction",
+                                          "Within each team"], horizontal=True, key="bal_within")
+        within = {"All rides together": None, "Within each route": "corridor",
+                  "Within each direction": "direction", "Within each team": "team"}[within_lbl]
+        bal, bal_css = v.balance_table(fsel, within=within)
+        if bal.empty or bal.shape[1] <= 2:
+            st.info("Need rides from at least two treatment arms to compare.")
+        else:
+            show(bal, bal_css)
+            st.caption("Everything before and around the pitch should look the same in every arm — only the pitch "
+                       "differs. Sit down is the control. Each cell: average or share (rides). **Std. diff** = "
+                       "difference ÷ pooled standard deviation: 🟢 within ±0.25, 🟠 0.25–0.5, 🔴 above 0.5 — coloured "
+                       f"only once each arm has {v.BALANCE_MIN_N}+ rides (grey = too few to judge). Pick one enumerator "
+                       "in the filter above to see whether *they* behave differently by treatment.")
+
+        e23, e23_css = v.e2e3_signups(subs[subs["form_id"].isin(fsel["form_id"])], fsel, v.GROUP_BY[gb_label])
+        if not e23.empty:
+            st.markdown("#### Sign-ups collected by Enumerators 2 and 3")
+            show(e23, e23_css)
+            st.caption("Normal sign-up cards counted by the E1 for each E2/E3 (c01_normal_e2/e3), split by the same "
+                       "'Group by'. 🔴/🔵 = more than 3 below/above the overall average. To check that the right "
+                       "sign-up cards were used, open the sign-up photos in Tab 2 → Photos and audio audits.")
 
         st.markdown("#### Ride by ride")
         t_num, c_num = v.ride_numbers_table(sel)
