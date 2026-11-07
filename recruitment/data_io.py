@@ -302,6 +302,83 @@ def load_reviews() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Patterns export → tabs in a Google Sheet (through the service account)
+# ---------------------------------------------------------------------------
+# Service accounts can't own files in a personal Google Drive, so instead of uploading an Excel file
+# the tables are written as tabs ("P · …") of a Google Sheet the service account can edit:
+# patterns_sheet_id in Secrets, or the HFC Sheet itself. File → Download → Excel gives the .xlsx.
+
+def patterns_sheet_id() -> str:
+    try:
+        return st.secrets.get("patterns_sheet_id") or _sheet_id()
+    except Exception:
+        return _sheet_id()
+
+
+def write_patterns(tables: dict, stamp: str) -> str:
+    """Overwrite one tab per table (prefixed 'P · ') plus a 'P · README' with the time. Returns the Sheet URL."""
+    import gspread
+    sid = patterns_sheet_id()
+    sh = _sheets_client().open_by_key(sid)
+    existing = {ws.title: ws for ws in sh.worksheets()}
+    items = [("README", pd.DataFrame({"Patterns snapshot": [f"Saved from the HFC dashboard on {stamp}",
+                                                            "Each 'P · ' tab is overwritten on every save."]}))]
+    items += list(tables.items())
+    for name, t in items:
+        title = f"P · {name}"[:99]
+        t = t.copy().astype(object).where(pd.notna(t), "")
+        values = [list(map(str, t.columns))] + [[str(x) for x in row] for row in t.values.tolist()]
+        ws = existing.get(title)
+        if ws is None:
+            ws = sh.add_worksheet(title, rows=max(len(values) + 10, 50), cols=max(len(t.columns) + 2, 8))
+        else:
+            ws.clear()
+            if ws.row_count < len(values) or ws.col_count < len(t.columns):
+                ws.resize(rows=max(len(values) + 10, ws.row_count), cols=max(len(t.columns) + 2, ws.col_count))
+        ws.update(values=values, range_name="A1")
+    return f"https://docs.google.com/spreadsheets/d/{sid}"
+
+
+# ---------------------------------------------------------------------------
+# SurveyCTO attachments (photos, audio audits) — fetched by the app and shown inside the dashboard
+# ---------------------------------------------------------------------------
+# Secrets:  surveycto_server = "salone"
+#           surveycto_username = "<a SurveyCTO user with permission to download this form's data>"
+#           surveycto_password = "<that user's password>"
+# Viewers of the dashboard never see these; files are only shown to people logged in to the dashboard.
+
+def can_fetch_media() -> bool:
+    try:
+        return bool(st.secrets.get("surveycto_server") and st.secrets.get("surveycto_username")
+                    and st.secrets.get("surveycto_password"))
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=300)
+def fetch_attachment(form_id: str, submission_key: str, filename: str) -> tuple[bytes | None, str]:
+    """(file bytes or None, message). Tries the API v2 attachment URL with basic, then digest login."""
+    import requests
+    from urllib.parse import quote
+    server = st.secrets["surveycto_server"]
+    user, pwd = st.secrets["surveycto_username"], st.secrets["surveycto_password"]
+    fn = str(filename).split("/")[-1]
+    url = (f"https://{server}.surveycto.com/api/v2/forms/{form_id}/submissions/"
+           f"{quote(str(submission_key), safe='')}/attachments/{quote(fn)}")
+    last = ""
+    for auth in (requests.auth.HTTPBasicAuth(user, pwd), requests.auth.HTTPDigestAuth(user, pwd)):
+        try:
+            r = requests.get(url, auth=auth, timeout=30)
+        except Exception as e:
+            last = f"Could not reach SurveyCTO: {e}"
+            continue
+        if r.status_code == 200 and r.content:
+            return r.content, "ok"
+        last = f"SurveyCTO answered {r.status_code}: {r.text[:200]}"
+    return None, last
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics helper (shown in the dashboard's diagnostics section)
 # ---------------------------------------------------------------------------
 

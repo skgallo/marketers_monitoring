@@ -23,7 +23,8 @@ import pandas as pd
 import streamlit as st
 
 from auth import require_password
-from data_io import load_data, load_reviews, append_reviews, can_write_reviews, diagnostics, load_e4
+from data_io import load_data, load_reviews, append_reviews, can_write_reviews, diagnostics, load_e4, \
+    write_patterns, patterns_sheet_id, can_fetch_media, fetch_attachment
 import datetime as dt
 from rollup import CORRIDORS, DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX, \
                    PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN
@@ -34,7 +35,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07k"
+EXPECTED_VIEWS_VERSION = "2026-11-07m"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -160,8 +161,8 @@ def filter_subs(df):
 subs_f = filter_subs(subs)
 st.sidebar.caption("Tab 3 uses every day from the start date, regardless of these filters.")
 
-tab0, tab1, tab2, tab3 = st.tabs(["Today", "1 · Ride verification", "2 · Implementation fidelity",
-                                  "3 · Enumerators"])
+tab0, tab1, tab2, tab3, tab4 = st.tabs(["Today", "1 · Ride verification", "2 · Implementation fidelity",
+                                        "3 · Enumerators", "4 · Patterns"])
 
 # ---------------------------------------------------------------------------
 # TODAY — what needs action now (phone-friendly)
@@ -229,7 +230,7 @@ with tab1:
                    help="Mistakes you marked 'Correct in cleaning' that aren't marked 'Corrected' yet")
     cols[5].metric("Not submitted", n_not_sub)
     st.caption(" · ".join(f"{k}: {int(counts.get(k, 0))}" for k in
-                          ["Wrong code selected", "Not-allowed change", "Duplicate E1", "To confirm", "Supervisor only"]
+                          ["Validity at risk", "Wrong code selected", "Not-allowed change", "Duplicate E1", "To confirm", "Supervisor only"]
                           if counts.get(k, 0)) or "No open flags.")
 
     f1, f2 = st.columns([3, 2])
@@ -354,6 +355,7 @@ form** — not only the planned code picked from the list. A ride can carry seve
 
 | Status | Meaning | What to do |
 |---|---|---|
+| 🔴 **Validity at risk** | The E1 or supervisor reported that **another marketer** got on the bus and marketed during the ride — this can invalidate the ride (e.g. a Sit down ride is no longer a control) | Decide: *OK – planned/allowed* = the ride still counts; *Correct in cleaning* = mark it invalid in cleaning |
 | 🔴 **Wrong code selected** | A form describing this ride (by its date, team and ride #) was filed under another planned code. The form is counted here only; the row it was filed under shows a grey note in *Code selection* but is not flagged | Decide: Correct in cleaning, or Corrected |
 | 🔴 **Not-allowed change** | The actual code has a different date, route/direction, ride number or treatment, or no readable code | Act now: the E1 should have stopped and called the supervisor; the ride may not count |
 | 🔴 **Duplicate E1** | More than one E1 form describes this ride | Same person → keep one; different people → two E1s on one ride, or a wrong code |
@@ -481,18 +483,30 @@ with tab2:
             _form = st.secrets.get("recruitment_form_id", "rec_form_nov2026")
         except Exception:
             _form = "rec_form_nov2026"
-        media = v.media_table(subs_f, batch_codes, reviews, _server, _form)
-        if not media.empty:
-            with st.expander("📷 🎧 Photos and audio audits per ride"):
-                if _server:
-                    st.caption("Links open on the SurveyCTO server (log in to SurveyCTO first).")
-                    st.dataframe(media, hide_index=True, width="stretch", column_config={
-                        c: st.column_config.LinkColumn(c, display_text="open")
-                        for c in media.columns if c not in ("Ride date", "Team", "Ride #", "Enumerator 1")})
+        media_rides = v.media_index(subs_f, batch_codes, reviews)
+        if media_rides:
+            with st.expander(f"📷 🎧 Photos and audio audits ({len(media_rides)} rides)"):
+                if can_fetch_media():
+                    pick = st.selectbox("Ride", range(len(media_rides)), key="media_ride",
+                                        format_func=lambda k: media_rides[k]["label"])
+                    ride = media_rides[pick]
+                    for lbl, fn in ride["files"]:
+                        st.markdown(f"**{lbl}** · `{fn}`")
+                        data, msg = fetch_attachment(_form, ride["form_id"], fn)
+                        if data is None:
+                            st.warning(msg)
+                        elif fn.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                            st.image(data, width=420)
+                        else:
+                            st.audio(data)
+                    st.caption("Files are fetched from SurveyCTO by the dashboard (with the login in Secrets) and "
+                               "shown only here. Audio includes passengers' voices — don't download or share it.")
                 else:
-                    st.caption("File names only. Add surveycto_server = \"yourserver\" to Secrets "
-                               "(the part before .surveycto.com) to get clickable links.")
-                    st.dataframe(media, hide_index=True, width="stretch")
+                    st.caption("To view photos and audio here, add surveycto_username and surveycto_password "
+                               "(a SurveyCTO user allowed to download this form's data) to Secrets, next to "
+                               "surveycto_server. Until then, file names only:")
+                    st.dataframe(v.media_table(subs_f, batch_codes, reviews, None, _form),
+                                 hide_index=True, width="stretch")
 
         st.markdown("#### Implementation — values and the reasons given")
         show(fid[m], fid_css[m])
@@ -573,40 +587,6 @@ with tab3:
                    f"{v.PERF_TARGET:.0%}; green = all met; grey = not assessed. Checklist: green 93%+, amber 88–92%, "
                    "red below 88%. Not counted here (see Averages): pitch/pause and ride length, sign-up end → pitch/pause, "
                    "sign-ups and time between rides — they depend on the marketer, route and passengers.")
-
-        st.markdown("#### Averages — patterns by enumerator, route, team, treatment…")
-        gb_label = st.selectbox("Group by", list(v.GROUP_BY), key="avg_by")
-        av, av_css = v.averages_table(fsel, v.GROUP_BY[gb_label])
-        show(av, av_css, legend=True)
-        st.caption("Average per ride. Shading = how far a group's average is from the overall average, measured "
-                   "in standard deviations (SD) of the individual rides (the grey bottom row shows 1 SD for each "
-                   f"measure): 🟠 {v.AVG_SD_AMBER}–{v.AVG_SD_RED} SD away, 🔴 more than {v.AVG_SD_RED} SD away; "
-                   "▲ above / ▼ below the average. Groups with fewer than "
-                   f"{v.AVG_MIN_RIDES} rides are not shaded — a couple of rides can be far off by chance.")
-
-        st.markdown("#### Balance between treatment arms")
-        within_lbl = st.radio("Compare", ["All rides together", "Within each route", "Within each direction",
-                                          "Within each team"], horizontal=True, key="bal_within")
-        within = {"All rides together": None, "Within each route": "corridor",
-                  "Within each direction": "direction", "Within each team": "team"}[within_lbl]
-        bal, bal_css = v.balance_table(fsel, within=within)
-        if bal.empty or bal.shape[1] <= 2:
-            st.info("Need rides from at least two treatment arms to compare.")
-        else:
-            show(bal, bal_css, legend=True)
-            st.caption("Everything before and around the pitch should look the same in every arm — only the pitch "
-                       "differs. Sit down is the control. Each cell: average or share (rides). **Std. diff** = "
-                       "difference ÷ pooled standard deviation: 🟢 within ±0.25, 🟠 0.25–0.5, 🔴 above 0.5 — coloured "
-                       f"only once each arm has {v.BALANCE_MIN_N}+ rides (grey = too few to judge). Pick one enumerator "
-                       "in the filter above to see whether *they* behave differently by treatment.")
-
-        e23, e23_css = v.e2e3_signups(subs[subs["form_id"].isin(fsel["form_id"])], fsel, v.GROUP_BY[gb_label])
-        if not e23.empty:
-            st.markdown("#### Sign-ups collected by Enumerators 2 and 3")
-            show(e23, e23_css)
-            st.caption("Normal sign-up cards counted by the E1 for each E2/E3 (c01_normal_e2/e3), split by the same "
-                       "'Group by'. Shaded the same way as the averages (🟠 0.5–1 SD, 🔴 more than 1 SD from the overall average). To check that the right "
-                       "sign-up cards were used, open the sign-up photos in Tab 2 → Photos and audio audits.")
 
         st.markdown("#### Ride by ride")
         t_num, c_num = v.ride_numbers_table(sel)
@@ -743,3 +723,110 @@ with st.expander("Diagnostics"):
                                                      for k, val in diag.items()]))
     st.caption("If rows = 0, check the Sheet is shared as 'Anyone with link → Viewer' "
                "and the URLs in secrets point to the correct tabs.")
+
+
+# ---------------------------------------------------------------------------
+# TAB 4 — Patterns (weekly look-back): averages, balance, E2/E3, trends, export
+# ---------------------------------------------------------------------------
+
+with tab4:
+    st.caption("Look back over several days to spot patterns: does an enumerator, route, team or marketer stand "
+               "out, are the treatment arms balanced, and is anything getting better or worse over time?")
+    facts_p = v.ride_facts(subs, batch_codes, reviews, verdicts_all)
+    if facts_p.empty:
+        st.info("No E1 forms yet.")
+    else:
+        d_min, d_max = facts_p["date"].min().date(), facts_p["date"].max().date()
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            rng = st.date_input("Period", value=(d_min, d_max), min_value=d_min, max_value=d_max, key="pat_rng")
+        with pc2:
+            who_p = st.multiselect("Enumerators", sorted(facts_p["person"].unique()), default=[],
+                                   placeholder="All enumerators", key="pat_who")
+        lo, hi = (rng if isinstance(rng, (list, tuple)) and len(rng) == 2 else (d_min, d_max))
+        fp = facts_p[(facts_p["date"].dt.date >= lo) & (facts_p["date"].dt.date <= hi)]
+        if who_p:
+            fp = fp[fp["person"].isin(who_p)]
+        fp = fp.reset_index(drop=True)
+        st.caption(f"{len(fp)} rides selected.")
+
+        st.markdown("#### Averages — patterns by enumerator, route, team, treatment…")
+        gb_label = st.selectbox("Group by", list(v.GROUP_BY), key="avg_by")
+        av, av_css = v.averages_table(fp, v.GROUP_BY[gb_label])
+        show(av, av_css, legend=True)
+        st.caption("Average per ride. Shading = how far a group's average is from the overall average, measured "
+                   "in standard deviations (SD) of the individual rides (the grey bottom row shows 1 SD for each "
+                   f"measure): 🟠 {v.AVG_SD_AMBER}–{v.AVG_SD_RED} SD away, 🔴 more than {v.AVG_SD_RED} SD away; "
+                   "▲ above / ▼ below the average. **Sign-ups:** more is better, so above the average is 🟢 green "
+                   "(below is still 🟠/🔴). Groups with fewer than "
+                   f"{v.AVG_MIN_RIDES} rides are not shaded — a couple of rides can be far off by chance.")
+
+        st.markdown("#### Balance between treatment arms")
+        within_lbl = st.radio("Compare", ["All rides together", "Within each route", "Within each direction",
+                                          "Within each team"], horizontal=True, key="bal_within")
+        within = {"All rides together": None, "Within each route": "corridor",
+                  "Within each direction": "direction", "Within each team": "team"}[within_lbl]
+        bal, bal_css = v.balance_table(fp, within=within)
+        if bal.empty or bal.shape[1] <= 2:
+            st.info("Need rides from at least two treatment arms to compare.")
+        else:
+            show(bal, bal_css, legend=True)
+            st.caption("Everything before and around the pitch should look the same in every arm — only the pitch "
+                       "differs. Sit down is the control. Each cell: average or share (rides). **Std. diff** = "
+                       "difference ÷ pooled standard deviation: 🟢 within ±0.25, 🟠 0.25–0.5, 🔴 above 0.5 — coloured "
+                       f"only once each arm has {v.BALANCE_MIN_N}+ rides (grey = too few to judge). Pick one enumerator "
+                       "in the filter above to see whether *they* behave differently by treatment.")
+
+        e23, e23_css = v.e2e3_signups(subs[subs["form_id"].isin(fp["form_id"])], fp, v.GROUP_BY[gb_label])
+        if not e23.empty:
+            st.markdown("#### Sign-ups collected by Enumerators 2 and 3")
+            show(e23, e23_css)
+            st.caption("Normal sign-up cards counted by the E1 for each E2/E3 (c01_normal_e2/e3), split by the same "
+                       "'Group by'. Shaded the same way as the averages: 🟢 above the average, 🟠/🔴 below (0.5–1 / more than 1 SD). To check that the right "
+                       "sign-up cards were used, open the sign-up photos in Tab 2 → Photos and audio audits.")
+
+
+        st.markdown("#### Trends over time")
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            m_lbl = st.selectbox("Measure", [lbl for _, lbl, *_ in v.METRICS], key="tr_m")
+        with tc2:
+            by_lbl = st.selectbox("One line per", ["Enumerator 1", "Route (corridor)", "Direction", "Team",
+                                                   "Treatment", "Marketer"], key="tr_by")
+        with tc3:
+            per = st.radio("Period", ["day", "week"], horizontal=True, key="tr_per")
+        m_col = next(c for c, lbl, *_ in v.METRICS if lbl == m_lbl)
+        tr = v.trend_table(fp, m_col, v.GROUP_BY[by_lbl], per)
+        if tr.empty:
+            st.info("No data for this measure yet.")
+        elif len(tr) < 2:
+            st.caption("Only one " + per + " so far — the chart appears from the second.")
+            st.dataframe(tr.round(1), width="stretch")
+        else:
+            st.line_chart(tr, height=320)
+            st.caption("Average per " + per + ". Gaps = no rides for that line on that " + per + ".")
+
+        st.divider()
+        st.markdown("#### Export")
+        tables = v.patterns_export(fp, subs[subs["form_id"].isin(fp["form_id"])])
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            st.download_button("⬇ Download all as Excel", v.to_excel_bytes(tables),
+                               file_name=f"recruitment_patterns_{lo:%Y%m%d}_{hi:%Y%m%d}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_patterns")
+            st.caption("One sheet per table: averages by every grouping, balance (overall and within route, "
+                       "direction, team), E2/E3 sign-ups, trends by day, and one row per ride.")
+        with ec2:
+            if can_write_reviews():
+                if st.button("💾 Save to Google Drive (Sheet)", key="save_patterns"):
+                    try:
+                        url = write_patterns(tables, dt.datetime.now().strftime("%d %b %Y %H:%M"))
+                        st.success(f"Saved: the 'P · …' tabs in [this Google Sheet]({url}) now hold these tables. "
+                                   "File → Download → Microsoft Excel gives the .xlsx.")
+                    except Exception as e:
+                        st.error(f"Could not save: {e}")
+                st.caption("Writes every table as a 'P · …' tab of a Google Sheet (the HFC Sheet, or the one in "
+                           "patterns_sheet_id in Secrets), overwriting the previous save.")
+            else:
+                st.caption("Saving to Google Drive needs the service-account key in Secrets.")

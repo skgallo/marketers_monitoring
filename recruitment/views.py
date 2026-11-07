@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07k"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07m"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -51,11 +51,11 @@ PERF_TARGET     = 0.80 # performance rates below this are shown in red
 TREAT = {"S": "Sit down", "N": "Normal", "P": "Peddling"}
 
 STATUS_RANK = {
-    "Wrong code selected": 0, "Not-allowed change": 1, "Duplicate E1": 2, "To confirm": 3,
+    "Validity at risk": -1, "Wrong code selected": 0, "Not-allowed change": 1, "Duplicate E1": 2, "To confirm": 3,
     "Supervisor only": 4, "Not submitted": 5, "Done as planned": 6,
 }
 STATUS_STYLE = {
-    "Wrong code selected": RED, "Not-allowed change": RED, "Duplicate E1": RED, "To confirm": BLUE,
+    "Validity at risk": RED, "Wrong code selected": RED, "Not-allowed change": RED, "Duplicate E1": RED, "To confirm": BLUE,
     "Supervisor only": BLUE, "Not submitted": GRAY, "Done as planned": GREEN,
 }
 
@@ -76,6 +76,10 @@ COMPLETION_LABELS = {
 from rollup import MM_REASON_LABELS
 CONF_ITEM_LABELS = {"date": "date", "team": "team", "marketer": "marketer", "route": "route",
                     "ride": "ride number", "pitch": "pitch type"}
+OTHER_WHEN = {"1": "before the announcement", "2": "during announcement/sign-up",
+              "3": "during the pitch/pause", "4": "after the pitch/pause"}
+OTHER_WHO = {"1": "preacher", "2": "seller", "3": "passenger/driver/apprentice", "-55": "other"}
+OTHER_WHEN_TXT = lambda x: ", ".join(OTHER_WHEN.get(c, c) for c in str(x).split()) if x is not None and str(x) not in ("", "nan") else ""
 MATCH_LABELS = {"1": "✓ Match", "2": "✗ Mismatch", "3": "Not verified"}
 YESNO = {"1": "Yes", "0": "No"}
 DISCREPANCY_SOURCE = {
@@ -501,6 +505,10 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                     unreported.append(f"{chg} change not reported to supervisor ({_txt(f['person'])})")
         if unreported:
             parts.add("Unreported change")
+        # Another marketer marketed on the bus (E1 or supervisor form) — the ride may not be valid
+        other_mkt = [f for _, f in d.iterrows() if _code(f.get("other_marketer")) == "1"]
+        if other_mkt:
+            parts.add("Other marketer")
         if len(came_in):
             parts.add("Wrong code")
         if len(e1) > 1:
@@ -525,6 +533,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 
         # Which issue parts produce which status
         tag_parts = {}
+        if "Other marketer" in parts:
+            tag_parts["Validity at risk"] = {"Other marketer"}
         if "Wrong code" in parts:
             tag_parts["Wrong code selected"] = {"Wrong code"}
         if parts & DESIGN_PARTS:
@@ -593,6 +603,12 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 part_text.setdefault(part, []).append(txt_)
         if unreported:
             part_text["Unreported change"] = unreported
+        if other_mkt:
+            part_text["Other marketer"] = [
+                f"Another marketer marketed on the bus ({_role_short(f['role'])} form, {_txt(f['person'])}"
+                + (f": {_txt(f.get('other_marketer_what'))}" if _txt(f.get('other_marketer_what')) else "")
+                + (f"; when: {OTHER_WHEN_TXT(f.get('other_marketer_when'))}" if _txt(f.get('other_marketer_when')) else "")
+                + ")" for f in other_mkt]
         issues = []
         ride_lbl = (f"{fmt_code_date(p['date'])} · team {p['team']} · ride {p['ride_num']}"
                     if p["parse_ok"] else code)
@@ -638,7 +654,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             what = ""
         open_what = "; ".join(dict.fromkeys([c[1] for ch in changes for c in ch
                                              if c[0] != "allowed" and c[2] not in resolved_parts]
-                                            + (unreported if "Unreported change" not in resolved_parts else [])))
+                                            + (unreported if "Unreported change" not in resolved_parts else [])
+                                            + (part_text.get("Other marketer", []) if "Other marketer" not in resolved_parts else [])))
 
         if len(e1):
             names = _names(e1["person"])
@@ -700,6 +717,9 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                                  _parse_time(f.get("b05")) if pd.notna(_parse_time(f.get("b05"))) else _parse_time(f.get("b06")))
             if not np.isnan(gap_) and round(gap_, 1) > DELAY_MAX_MIN:
                 checks.append(f"Pitch/pause started {gap_:.1f} min after sign-up ended")
+            if _code(f.get("other_speaker")) == "1":
+                checks.append("Someone else spoke to the passengers ("
+                              + (", ".join(OTHER_WHO.get(c, c) for c in _txt(f.get("other_speaker_who")).split()) or "?") + ")")
 
         last = d["submitted_at"].max() if not d.empty else pd.NaT
         rows.append({
@@ -962,6 +982,8 @@ def today_board(ledger: pd.DataFrame, day, extra_checks: dict | None = None) -> 
                 else:
                     state = "Waiting"
             else:
+                if "Validity at risk" in tags:
+                    acts.append("Another marketer marketed on the bus — decide if the ride is valid")
                 if "Wrong code selected" in tags:
                     acts += [n for n in r["Code selection"].split("; ") if "filed under" in n][:1]
                 if "Not-allowed change" in tags:
@@ -2084,6 +2106,12 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         if bad(ride, lo=RIDE_MIN_MIN):
             issues.append(f"Ride {ride:.1f} min")
         issues += [f"Order: {o}" for o in order]
+        if _code(r.get("other_marketer")) == "1":
+            issues.insert(0, "ANOTHER MARKETER on the bus" + (f" ({OTHER_WHEN_TXT(r.get('other_marketer_when'))})"
+                                                              if _txt(r.get("other_marketer_when")) else ""))
+        if _code(r.get("other_speaker")) == "1":
+            who_ = ", ".join(OTHER_WHO.get(c, c) for c in _txt(r.get("other_speaker_who")).split())
+            issues.append("Someone else spoke to passengers" + (f" ({who_})" if who_ else ""))
         row = {
             **{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #", "Treatment")},
             "Enumerator 1": _txt(r["person"]),
@@ -2487,6 +2515,8 @@ def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             "ride": du["ride"], "between": between.get(i, np.nan),
             "bus_half": None if _code(r.get("b02a")) not in ("1", "2", "3", "4") else _code(r.get("b02a")) != "1",
             "seat": None if _code(r.get("apprentice_seat")) not in ("0", "1") else _code(r.get("apprentice_seat")) == "1",
+            "other_mkt": None if _code(r.get("other_marketer")) not in ("0", "1") else _code(r.get("other_marketer")) == "1",
+            "other_spk": None if _code(r.get("other_speaker")) not in ("0", "1") else _code(r.get("other_speaker")) == "1",
             # counted indicators (None = not assessed)
             "code_ok": not (sr.get("wrong_code", False) or decisions & {"Fix needed", "Fixed"}),
             "same_day": sr.get("same_day"),
@@ -2543,12 +2573,19 @@ AVG_SD_AMBER, AVG_SD_RED = 0.5, 1.0   # distance from the overall average, in ri
 AVG_MIN_RIDES = 3                     # groups with fewer rides are shown but not coloured
 
 
-def _sd_style(x: float, mean: float, sd: float, n: int) -> tuple[str, str]:
-    """(css, arrow) for a group average x: how many ride-level SDs it is from the overall mean."""
+def _sd_style(x: float, mean: float, sd: float, n: int, higher_is_better: bool = False) -> tuple[str, str]:
+    """(css, arrow) for a group average x: how many ride-level SDs it is from the overall mean.
+    higher_is_better (sign-ups): above the average is shaded green instead of amber/red."""
     if np.isnan(x) or np.isnan(mean) or not sd or np.isnan(sd) or n < AVG_MIN_RIDES:
         return "", ""
     z = (x - mean) / sd
     arrow = " ▲" if z > 0 else " ▼"
+    if higher_is_better and z > 0:
+        if z > AVG_SD_RED:
+            return f"background-color: {GREEN_BG}; font-weight: 600", arrow
+        if z > AVG_SD_AMBER:
+            return f"background-color: {GREEN_BG}", arrow
+        return "", ""
     if abs(z) > AVG_SD_RED:
         return f"background-color: {RED_BG}; font-weight: 600", arrow
     if abs(z) > AVG_SD_AMBER:
@@ -2574,7 +2611,7 @@ def averages_table(f: pd.DataFrame, by: str = "person"):
         row, s = {label: key or "—", "Rides": len(g)}, {label: "", "Rides": ""}
         for m, lbl, nd, _thr in METRICS:
             x = g[m].mean()
-            css_, arrow = _sd_style(x, overall[m], spread[m], int(g[m].notna().sum()))
+            css_, arrow = _sd_style(x, overall[m], spread[m], int(g[m].notna().sum()), higher_is_better=(m == "signups"))
             row[lbl] = "—" if np.isnan(x) else f"{x:.{nd}f}{arrow}"
             s[lbl] = GRAY if np.isnan(x) else css_
         rows.append(row); sty.append(s)
@@ -2622,7 +2659,7 @@ def e2e3_signups(subs: pd.DataFrame, f: pd.DataFrame, by: str = "person"):
     css = pd.DataFrame("", index=g.index, columns=g.columns)
     vals = []
     for k_, (avg, n) in enumerate(zip(g["Avg normal sign-ups"], g["Rides"])):
-        c_, arrow = _sd_style(avg, overall, sd, int(n))
+        c_, arrow = _sd_style(avg, overall, sd, int(n), higher_is_better=True)
         css.iat[k_, list(g.columns).index("Avg normal sign-ups")] = c_
         vals.append(f"{avg:.1f}{arrow}")
     g["Avg normal sign-ups"] = vals
@@ -2647,6 +2684,8 @@ BALANCE_ROWS = [   # (column, label, kind)
     ("start_ok", "Start on time / justified",         "share"),
     ("ann_ok",   f"Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min", "share"),
     ("seat",     "Apprentice gave up seat",           "share"),
+    ("other_mkt", "Another marketer on the bus",      "share"),
+    ("other_spk", "Someone else spoke to passengers", "share"),
 ]
 BALANCE_MIN_N = 5          # rides per arm before a difference is coloured
 BALANCE_SD_AMBER, BALANCE_SD_RED = 0.25, 0.5
@@ -2791,4 +2830,103 @@ COLUMN_HELP = {
     "Bus at start": "How full the bus was when it left the park",
     "Since team's previous ride (min)": "Minutes from the end of the team's previous ride to the start of this one",
     "Apprentice gave seat": "Did the apprentice give up their seat for the recruitment team?",
+    "Another marketer on the bus": "Share of rides where another marketer got on and marketed — this can invalidate the ride",
+    "Someone else spoke to passengers": "Share of rides where a preacher, seller or anyone else spoke to all passengers",
 }
+
+
+
+# ---------------------------------------------------------------------------
+# TAB 4 — Patterns: trends over time and the full export
+# ---------------------------------------------------------------------------
+def trend_table(f: pd.DataFrame, measure: str, by: str = "person", period: str = "day") -> pd.DataFrame:
+    """Average of one measure per day (or week) and group, wide: index = period, columns = groups."""
+    if f is None or f.empty or measure not in f.columns:
+        return pd.DataFrame()
+    x = f[[by, "date", measure]].copy()
+    x = x[x["date"].notna() & x[measure].notna()]
+    if x.empty:
+        return pd.DataFrame()
+    x[measure] = x[measure].astype(float)
+    if period == "week":
+        x["period"] = x["date"] - pd.to_timedelta(x["date"].dt.weekday, unit="D")
+    else:
+        x["period"] = x["date"]
+    t = x.pivot_table(index="period", columns=by, values=measure, aggfunc="mean").sort_index()
+    t.index = pd.to_datetime(t.index)
+    return t
+
+
+def _plain(t: pd.DataFrame) -> pd.DataFrame:
+    """Drop helper columns and arrows for export."""
+    if t is None or t.empty:
+        return pd.DataFrame()
+    t = t[[c for c in t.columns if not str(c).startswith("_")]].copy()
+    return t.apply(lambda col: col.map(lambda x: x.replace(" ▲", "").replace(" ▼", "") if isinstance(x, str) else x))
+
+
+def patterns_export(f: pd.DataFrame, subs: pd.DataFrame) -> dict:
+    """{sheet name: table} with every view of the Patterns tab, for Excel / Google Sheet export."""
+    out = {}
+    for lbl, col in GROUP_BY.items():
+        t, _ = averages_table(f, col)
+        out[f"Averages by {lbl}"[:31]] = _plain(t)
+    for lbl, within in [("Balance - all rides", None), ("Balance - within route", "corridor"),
+                        ("Balance - within direction", "direction"), ("Balance - within team", "team")]:
+        t, _ = balance_table(f, within=within)
+        out[lbl[:31]] = _plain(t)
+    t, _ = e2e3_signups(subs, f, "person")
+    out["E2-E3 sign-ups"] = _plain(t)
+    # trends: long format (day × enumerator × measure)
+    long = []
+    for m, lbl, *_ in METRICS:
+        tt = trend_table(f, m, "person", "day")
+        if not tt.empty:
+            s = tt.stack().reset_index()
+            s.columns = ["Day", "Enumerator 1", "Average"]
+            s["Measure"] = lbl
+            long.append(s)
+    if long:
+        tr = pd.concat(long, ignore_index=True)[["Measure", "Day", "Enumerator 1", "Average"]]
+        tr["Day"] = tr["Day"].dt.strftime("%Y-%m-%d"); tr["Average"] = tr["Average"].round(2)
+        out["Trends by day"] = tr
+    rides = f.drop(columns=[c for c in f.columns if c in ("form_id",)]).copy()
+    rides["date"] = rides["date"].dt.strftime("%Y-%m-%d")
+    out["Rides (one row each)"] = rides
+    return {k: v_ for k, v_ in out.items() if v_ is not None and not v_.empty}
+
+
+def to_excel_bytes(tables: dict) -> bytes:
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for name, t in tables.items():
+            t.to_excel(xw, sheet_name=name[:31], index=False)
+            ws = xw.sheets[name[:31]]
+            for col_cells in ws.columns:
+                width = max(len(str(c.value or "")) for c in col_cells[:200])
+                ws.column_dimensions[col_cells[0].column_letter].width = min(max(10, width + 2), 45)
+            ws.freeze_panes = "B2"
+    return buf.getvalue()
+
+
+
+def media_index(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+                reviews: pd.DataFrame | None = None) -> list:
+    """[{label, form_id, files: [(field label, filename)]}] for E1 forms with photos or audio, in ride order."""
+    d = subs[subs["role"] == E1]
+    present = [(c, lbl) for c, lbl in MEDIA_FIELDS if c in d.columns and d[c].notna().any()]
+    if d.empty or not present:
+        return []
+    ident = ride_identity(d, batch_codes, reviews)
+    d = d.loc[_ride_sort_key(ident, d)]
+    out = []
+    for i, r in d.iterrows():
+        files = [(lbl, _txt(r.get(c)).split("/")[-1]) for c, lbl in present if _txt(r.get(c))]
+        if not files:
+            continue
+        rc = _ride_cols(ident.loc[i])
+        out.append({"label": f"{rc['Ride date']} · team {rc['Team']} · ride {rc['Ride #']} · {_txt(r['person'])}"
+                             f" · {rc['Treatment']}",
+                    "form_id": _txt(r.get("form_id")), "files": files})
+    return out
