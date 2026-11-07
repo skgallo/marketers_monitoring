@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07j"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07k"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -2539,36 +2539,55 @@ def enumerator_indicators(f: pd.DataFrame):
     return pd.DataFrame(rows), pd.DataFrame(sty)
 
 
+AVG_SD_AMBER, AVG_SD_RED = 0.5, 1.0   # distance from the overall average, in ride-level standard deviations
+AVG_MIN_RIDES = 3                     # groups with fewer rides are shown but not coloured
+
+
+def _sd_style(x: float, mean: float, sd: float, n: int) -> tuple[str, str]:
+    """(css, arrow) for a group average x: how many ride-level SDs it is from the overall mean."""
+    if np.isnan(x) or np.isnan(mean) or not sd or np.isnan(sd) or n < AVG_MIN_RIDES:
+        return "", ""
+    z = (x - mean) / sd
+    arrow = " ▲" if z > 0 else " ▼"
+    if abs(z) > AVG_SD_RED:
+        return f"background-color: {RED_BG}; font-weight: 600", arrow
+    if abs(z) > AVG_SD_AMBER:
+        return f"background-color: {AMBER_BG}", arrow
+    return "", ""
+
+
 def averages_table(f: pd.DataFrame, by: str = "person"):
     """
     Averages of each measure by group (enumerator, route, direction, team, treatment, marketer, day),
-    with the overall average in the last row. A cell is coloured when the group's average is far from
-    the overall one (more than the metric's threshold): red = worse direction, blue = other direction.
-    Returns (table, css).
+    with the overall average in the last row. Each cell is shaded by how far the group's average is
+    from the overall average, measured in standard deviations of the individual rides:
+    amber = 0.5–1 SD away, red = more than 1 SD away (▲ above / ▼ below). Groups with fewer than
+    AVG_MIN_RIDES rides are not shaded. Returns (table, css).
     """
     if f is None or f.empty:
         return pd.DataFrame(), pd.DataFrame()
     label = {v_: k for k, v_ in GROUP_BY.items()}.get(by, by)
     overall = {m: f[m].mean() for m, *_ in METRICS}
-    worse_if_lower = {"signups", "ann", "pitch", "pause", "ride"}   # lower than average is the concern
+    spread = {m: f[m].std(ddof=1) for m, *_ in METRICS}
     rows, sty = [], []
     for key, g in f.groupby(by, sort=True):
         row, s = {label: key or "—", "Rides": len(g)}, {label: "", "Rides": ""}
-        for m, lbl, nd, thr in METRICS:
+        for m, lbl, nd, _thr in METRICS:
             x = g[m].mean()
-            row[lbl] = "—" if np.isnan(x) else f"{x:.{nd}f}"
-            s[lbl] = GRAY if np.isnan(x) else ""
-            if not np.isnan(x) and not np.isnan(overall[m]) and abs(x - overall[m]) > thr:
-                bad = (x < overall[m]) if m in worse_if_lower else (x > overall[m])
-                s[lbl] = RED if bad else BLUE
+            css_, arrow = _sd_style(x, overall[m], spread[m], int(g[m].notna().sum()))
+            row[lbl] = "—" if np.isnan(x) else f"{x:.{nd}f}{arrow}"
+            s[lbl] = GRAY if np.isnan(x) else css_
         rows.append(row); sty.append(s)
     tot = {label: "All rides", "Rides": len(f)}
     for m, lbl, nd, _ in METRICS:
         tot[lbl] = "—" if np.isnan(overall[m]) else f"{overall[m]:.{nd}f}"
     rows.append(tot); sty.append({k: "font-weight: 700" for k in tot})
+    sd_row = {label: "1 SD (spread of rides)", "Rides": ""}
+    for m, lbl, nd, _ in METRICS:
+        sd_row[lbl] = "—" if np.isnan(spread[m]) else f"±{spread[m]:.{nd}f}"
+    rows.append(sd_row); sty.append({k: GRAY for k in sd_row})
     t, css = pd.DataFrame(rows), pd.DataFrame(sty).reindex(columns=pd.DataFrame(rows).columns).fillna("")
-    # drop measures that are empty everywhere (e.g. no Sit down rides yet)
-    empty = [lbl for m, lbl, *_ in METRICS if (t[lbl] == "—").all()]
+    empty = [lbl for m, lbl, *_ in METRICS if (t[lbl].iloc[:-1] == "—").all()]
     return t.drop(columns=empty), css.drop(columns=empty)
 
 
@@ -2599,11 +2618,14 @@ def e2e3_signups(subs: pd.DataFrame, f: pd.DataFrame, by: str = "person"):
     keys = ["Enumerator 2/3"] + ([by] if by != "person" else [])
     g = x.groupby(keys).agg(Rides=("n", "size"), avg=("n", "mean")).reset_index()
     g = g.rename(columns={"avg": "Avg normal sign-ups", by: {v_: k for k, v_ in GROUP_BY.items()}.get(by, by)})
-    overall = x["n"].mean()
+    overall, sd = x["n"].mean(), x["n"].std(ddof=1)
     css = pd.DataFrame("", index=g.index, columns=g.columns)
-    css.loc[g["Avg normal sign-ups"] < overall - 3, "Avg normal sign-ups"] = RED
-    css.loc[g["Avg normal sign-ups"] > overall + 3, "Avg normal sign-ups"] = BLUE
-    g["Avg normal sign-ups"] = g["Avg normal sign-ups"].map(lambda v_: f"{v_:.1f}")
+    vals = []
+    for k_, (avg, n) in enumerate(zip(g["Avg normal sign-ups"], g["Rides"])):
+        c_, arrow = _sd_style(avg, overall, sd, int(n))
+        css.iat[k_, list(g.columns).index("Avg normal sign-ups")] = c_
+        vals.append(f"{avg:.1f}{arrow}")
+    g["Avg normal sign-ups"] = vals
     return g, css
 
 

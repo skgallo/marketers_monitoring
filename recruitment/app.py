@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07j"
+EXPECTED_VIEWS_VERSION = "2026-11-07k"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -578,10 +578,11 @@ with tab3:
         gb_label = st.selectbox("Group by", list(v.GROUP_BY), key="avg_by")
         av, av_css = v.averages_table(fsel, v.GROUP_BY[gb_label])
         show(av, av_css, legend=True)
-        st.caption("Average per ride. 🔴 far from the overall average in the worrying direction (fewer sign-ups, "
-                   "shorter announcement/pitch/ride, longer delays or gaps); 🔵 far in the other direction. "
-                   "'Far' = more than 3 sign-ups, 1 min (delay, announcement, lags), 3 min (pitch/pause), "
-                   "5 min (ride) or 10 min (between rides). Few rides → treat with care.")
+        st.caption("Average per ride. Shading = how far a group's average is from the overall average, measured "
+                   "in standard deviations (SD) of the individual rides (the grey bottom row shows 1 SD for each "
+                   f"measure): 🟠 {v.AVG_SD_AMBER}–{v.AVG_SD_RED} SD away, 🔴 more than {v.AVG_SD_RED} SD away; "
+                   "▲ above / ▼ below the average. Groups with fewer than "
+                   f"{v.AVG_MIN_RIDES} rides are not shaded — a couple of rides can be far off by chance.")
 
         st.markdown("#### Balance between treatment arms")
         within_lbl = st.radio("Compare", ["All rides together", "Within each route", "Within each direction",
@@ -604,7 +605,7 @@ with tab3:
             st.markdown("#### Sign-ups collected by Enumerators 2 and 3")
             show(e23, e23_css)
             st.caption("Normal sign-up cards counted by the E1 for each E2/E3 (c01_normal_e2/e3), split by the same "
-                       "'Group by'. 🔴/🔵 = more than 3 below/above the overall average. To check that the right "
+                       "'Group by'. Shaded the same way as the averages (🟠 0.5–1 SD, 🔴 more than 1 SD from the overall average). To check that the right "
                        "sign-up cards were used, open the sign-up photos in Tab 2 → Photos and audio audits.")
 
         st.markdown("#### Ride by ride")
