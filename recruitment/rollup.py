@@ -352,6 +352,8 @@ def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
     start, end = (b06, b10) if t == 'S' else (b05, b09)
     dur = _diff_minutes(start, end)
     to_end = _diff_minutes(end, b11)          # minutes between pitch/pause end and ride end
+    dur = round(dur, 1) if not np.isnan(dur) else dur          # judged on the value shown (1 decimal)
+    to_end = round(to_end, 1) if not np.isnan(to_end) else to_end
     if t == 'S':
         if np.isnan(to_end):
             return None, ''

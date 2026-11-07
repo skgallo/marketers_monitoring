@@ -698,7 +698,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 checks.append(f"Announcement {ann_:.1f} min")
             gap_ = _diff_minutes(_parse_time(f.get("b04")),
                                  _parse_time(f.get("b05")) if pd.notna(_parse_time(f.get("b05"))) else _parse_time(f.get("b06")))
-            if not np.isnan(gap_) and gap_ > DELAY_MAX_MIN:
+            if not np.isnan(gap_) and round(gap_, 1) > DELAY_MAX_MIN:
                 checks.append(f"Pitch/pause started {gap_:.1f} min after sign-up ended")
 
         last = d["submitted_at"].max() if not d.empty else pd.NaT
@@ -1977,6 +1977,7 @@ def _start_check(r) -> tuple[str, str]:
     full = _code(r.get("b02a"))
     if np.isnan(delay):
         return "—", GRAY
+    delay = round(delay, 1)                   # judged on the value shown (1 decimal)
     if delay <= DELAY_MAX_MIN:
         return f"On time ({delay:.1f} min)", GREEN
     if full in ("2", "3", "4"):
@@ -2067,7 +2068,9 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             issues.append(start_txt)
         if sp == "3":
             issues.append("Started after strategic point")
-        bad = lambda x, lo=None, hi=None: not np.isnan(x) and ((lo is not None and x < lo) or (hi is not None and x > hi))
+        # judged on the value shown (1 decimal), so "2.0" never shows as over a 2-min limit
+        bad = lambda x, lo=None, hi=None: not np.isnan(x) and ((lo is not None and round(x, 1) < lo) or
+                                                               (hi is not None and round(x, 1) > hi))
         if bad(round(ann, 1) if not np.isnan(ann) else np.nan, ANN_DUR_MIN, ANN_DUR_MAX):
             issues.append(f"Announcement {ann:.1f} min")
         if bad(du["gap"], hi=DELAY_MAX_MIN):
@@ -2150,6 +2153,7 @@ DUR_LABELS = [("delay", f"Start delay (≤{DELAY_MAX_MIN})"), ("signup", "Ann.+s
 def _dur_flag(key, x) -> bool:
     if np.isnan(x):
         return False
+    x = round(x, 1)                           # judged on the value shown
     if key in ("delay", "gap"):
         return x > DELAY_MAX_MIN
     if key == "pp":
