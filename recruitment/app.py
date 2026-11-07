@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07c"
+EXPECTED_VIEWS_VERSION = "2026-11-07d"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -431,15 +431,24 @@ with tab2:
             if not subs_f.empty and subs_f["ride_date"].notna().any():
                 e4 = e4[e4["ride_date"].isna() | e4["ride_date"].isin(subs_f["ride_date"].unique())]
         st.markdown("#### Timing cross-check — E1 vs E4 (Script Checklist) vs supervisor")
-        st.caption(f"Differences are E4/supervisor minus E1 at each step; listed when more than {v.TIME_GAP_MAX} min. "
-                   "Durations are computed the same way from each source's times, with the same targets "
-                   "(⚑ = outside target). *Missed target only per E4/supervisor* = the E1's own times look fine "
-                   "but an independent record says otherwise.")
+        st.caption(f"Shows only where an independent record disagrees with the E1. **Δ** = E4 or supervisor minus E1, "
+                   f"in minutes, listed when more than {v.TIME_GAP_MAX} min apart (blank = they agree). Targets are not "
+                   "flagged again here (see the timeline above) — only when the second record **flips** the result: "
+                   "🔴 the E4/supervisor's times miss a target but the E1's look fine; 🟠 the reverse.")
         xt, xt_css, e4_unmatched = v.timing_crosscheck(subs_f, e4, batch_codes, reviews)
         if not xt.empty:
-            sel = ((xt["Times differ by > 2 min"].str.contains(":", regex=False))
-                   | (xt["Missed target only per E4/supervisor"] != "—")) if only_issues else pd.Series(True, index=xt.index)
-            show(xt[sel], xt_css[sel])
+            n_cmp = int(xt["_compared"].sum()); n_iss = int(xt["_issue"].sum())
+            c = st.columns(3)
+            c[0].metric("Rides with a second record", f"{n_cmp} / {len(xt)}")
+            c[1].metric("With differences or flips", n_iss)
+            c[2].metric("No E4 or supervisor record", len(xt) - n_cmp)
+            only_diff = st.toggle("Only rides with differences", value=True, key="xt_only")
+            sel = xt["_issue"] if only_diff else xt["_compared"]
+            if sel.any():
+                show(xt[sel], xt_css[sel])
+            else:
+                st.success("No differences between the E1 and the independent records." if n_cmp else
+                           "No E4 or supervisor records to compare yet.")
             download(xt, "timing_crosscheck.csv", "dl_xt")
         try:
             _has_e4 = bool(st.secrets.get("e4_url"))

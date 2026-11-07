@@ -30,7 +30,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07c"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07d"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -2158,9 +2158,14 @@ def _match_e4(e1_planned: dict, e1_times: dict, e4: pd.DataFrame, e4_ident: pd.D
 def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: pd.DataFrame | None = None,
                       reviews: pd.DataFrame | None = None):
     """
-    One row per E1 form: the same ride as recorded by the E4 (Script Checklist) and by the
-    supervisor (recruitment form, role 0). Differences at each step and the durations from each
-    source, with the same targets. Returns (table, css, unmatched E4 forms).
+    One row per E1 form compared with the same ride as recorded by the E4 (Script Checklist)
+    and the supervisor (recruitment form, role 0).
+      · cells show only DIFFERENCES (other − E1, minutes) larger than TIME_GAP_MAX;
+      · target flags are not repeated (Tab 2's timeline has them) — only FLIPS are shown:
+        a target missed according to E4/supervisor while the E1's own times look fine (red),
+        or the reverse (amber).
+    Helper columns: _compared (a second record exists), _issue (any difference or flip).
+    Returns (table, css, unmatched E4 forms).
     """
     d = subs[subs["role"] == E1]
     if d.empty:
@@ -2174,59 +2179,86 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
     m4 = _match_e4({i: ident.at[i, "planned"] for i in d.index}, T, e4, e4_ident) if not e4.empty else {}
     rows, sty = [], []
     for i, r in d.iterrows():
-        srcs = {"E1": (r, T[i])}
+        others = {}
         if i in m4:
-            srcs["E4"] = (e4.loc[m4[i]], _times(e4.loc[m4[i]]))
+            others["E4"] = (e4.loc[m4[i]], _times(e4.loc[m4[i]]))
         if i in pairs:
             s_ = subs.loc[pairs[i][0]]
-            srcs["Sup"] = (s_, _times(s_))
+            others["Sup"] = (s_, _times(s_))
         row = {**{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #")},
                "Enumerator 1": _txt(r["person"]),
-               "E4": _txt(srcs["E4"][0]["observer"]) if "E4" in srcs else "— no checklist —",
-               "Supervisor": _txt(srcs["Sup"][0]["person"]) if "Sup" in srcs else "— not observed —"}
+               "E4": _txt(others["E4"][0]["observer"]) if "E4" in others else "—",
+               "Supervisor": _txt(others["Sup"][0]["person"]) if "Sup" in others else "—"}
         s = {k: "" for k in row}
-        diffs = []
+        if "E4" not in others: s["E4"] = GRAY
+        if "Sup" not in others: s["Supervisor"] = GRAY
+        issue = False
+        # 1. clock times at each step: other − E1
         for lbl, key in CHECK_POINTS:
-            for src in ("E4", "Sup"):
-                if src in srcs:
-                    g = _diff_minutes(T[i][key], srcs[src][1][key])
-                    if not np.isnan(g) and abs(g) > TIME_GAP_MAX:
-                        diffs.append((abs(g), f"{lbl}: {src} {g:+.1f}"))
-        row["Times differ by > 2 min"] = " · ".join(x for _, x in sorted(diffs, reverse=True)) or (
-            "None" if len(srcs) > 1 else "—")
-        s["Times differ by > 2 min"] = RED if diffs else (GREEN if len(srcs) > 1 else GRAY)
-        only_others = []           # targets missed according to E4/supervisor but not according to E1
-        e1_dur = _durations(T[i])
+            bits = []
+            for src, (_, t_) in others.items():
+                g = _diff_minutes(T[i][key], t_[key])
+                if not np.isnan(g) and abs(g) > TIME_GAP_MAX:
+                    bits.append(f"{src} {g:+.1f}")
+            row[f"Δ {lbl}"] = " · ".join(bits)
+            if bits:
+                s[f"Δ {lbl}"] = RED; issue = True
+        # 2. durations: other − E1, and target flips
+        e1_du = _durations(T[i])
+        flips_red, flips_amber = [], []
         for key, lbl in DUR_LABELS:
-            vals, any_flag = [], False
-            for src in ("E1", "E4", "Sup"):
-                if src in srcs:
-                    x = _durations(srcs[src][1])[key]
-                    if not np.isnan(x):
-                        f = _dur_flag(key, x); any_flag |= f
-                        vals.append(f"{src} {x:.1f}" + (" ⚑" if f else ""))
-                        if f and src != "E1" and not _dur_flag(key, e1_dur[key]):
-                            only_others.append(f"{lbl.split(' (')[0]} ({src})")
-            row[lbl] = " · ".join(vals) or "—"
-            s[lbl] = RED if any_flag else ("" if vals else GRAY)
-        row["Missed target only per E4/supervisor"] = " · ".join(only_others) or "—"
-        s["Missed target only per E4/supervisor"] = RED if only_others else GRAY
-        if "E4" not in srcs: s["E4"] = GRAY
-        if "Sup" not in srcs: s["Supervisor"] = GRAY
+            name = lbl.split(" (")[0]
+            bits = []
+            for src, (_, t_) in others.items():
+                x = _durations(t_)[key]
+                if np.isnan(x) or np.isnan(e1_du[key]):
+                    continue
+                if abs(x - e1_du[key]) > TIME_GAP_MAX:
+                    bits.append(f"{src} {x - e1_du[key]:+.1f}")
+                f_other, f_e1 = _dur_flag(key, x), _dur_flag(key, e1_du[key])
+                if f_other and not f_e1:
+                    flips_red.append(f"{name}: {src} {x:.1f} vs E1 {e1_du[key]:.1f}")
+                elif f_e1 and not f_other:
+                    flips_amber.append(f"{name}: E1 {e1_du[key]:.1f} vs {src} {x:.1f}")
+            row[f"Δ {name}"] = " · ".join(bits)
+            if bits:
+                s[f"Δ {name}"] = RED; issue = True
+        row["Target missed per E4/Sup, E1 looks fine"] = " · ".join(flips_red)
+        row["E1 outside target, E4/Sup says fine"] = " · ".join(flips_amber)
+        if flips_red:
+            s["Target missed per E4/Sup, E1 looks fine"] = RED; issue = True
+        if flips_amber:
+            s["E1 outside target, E4/Sup says fine"] = AMBER; issue = True
+        row["_compared"] = bool(others)
+        row["_issue"] = issue
         rows.append(row); sty.append(s)
-    t, css = pd.DataFrame(rows), pd.DataFrame(sty)
-    # E4 checklists that didn't match any E1 form
+    t, css = pd.DataFrame(rows), pd.DataFrame(sty).reindex(columns=pd.DataFrame(rows).columns).fillna("")
+    # drop difference columns that are empty for every ride
+    empty = [c for c in t.columns if c.startswith("Δ ") and (t[c] == "").all()]
+    t, css = t.drop(columns=empty), css.drop(columns=empty)
+    # E4 checklists that didn't match any E1 form, with the likely reason
     if not e4.empty:
         left = e4.loc[[j for j in e4.index if j not in set(m4.values())]]
+        planned_e1 = set(ident["planned"])
+        planned_all = set(planned_codes(batch_codes)) if batch_codes is not None else set()
+        def why(j):
+            pc = e4_ident.at[j, "planned"] if j in e4_ident.index else ""
+            if not _txt(pc):
+                return "No planned code selected"
+            if planned_all and pc not in planned_all:
+                return "Planned code not in batch_codes"
+            if pc not in planned_e1:
+                return "No E1 form for this ride (in the current filters)"
+            return "E1 form already matched to another checklist (duplicate?)"
         unmatched = pd.DataFrame({
             "Ride date": left["ride_date"].map(fmt_day), "Observer": left["observer"],
-            "Role": left["observer_role"], "Planned code selected": left["batch_code"].map(_txt),
+            "Role": left["observer_role"], "Planned code": [e4_ident.at[j, "planned"] if j in e4_ident.index else "" for j in left.index],
             "Actual code": left["actual_batch_code"].map(_txt), "E1 named": left["e1_name"].map(_txt),
+            "Why not matched": [why(j) for j in left.index],
         }).reset_index(drop=True)
     else:
         unmatched = pd.DataFrame()
     return t, css, unmatched
-
 
 def media_url(filename, form_id, server: str | None) -> str | None:
     """Link to a photo/audio file on the SurveyCTO server (opens after logging in to SurveyCTO)."""
