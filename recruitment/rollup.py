@@ -50,8 +50,13 @@ DELAY_MAX_MIN        = 2    # Flag 1: max announcement start delay (minutes)
 ANN_DUR_MIN          = 8    # Flag 2: min announcement duration
 ANN_DUR_MAX          = 12   # Flag 2: max announcement duration
 SIGNUP_DIFF_MAX      = 2    # Flag 3: max |signup - announcement| discrepancy (matches SurveyCTO)
-PITCH_TARGET_MIN     = 25   # Flag 4a/4b: target pitch/pause duration
-PITCH_TOL_MIN        = 2    # Flag 4a/4b: tolerance either side (±2 → 23–27 min)
+PITCH_TARGET_MIN     = 25   # (old rule, kept for reference) target pitch/pause duration
+PITCH_TOL_MIN        = 2    # (old rule) tolerance either side
+# Treatment-specific pitch/pause rules (Nov 2026)
+NORMAL_PITCH_MIN     = 20   # Normal: marketer pitch at least 20 min ...
+PEDDLING_PITCH_MIN   = 12   # Peddling (pitch ~15 min): at least 12 min ...
+#                             ... unless the pitch ran until the end of the ride
+PAUSE_END_TOL_MIN    = 2    # Sit down: pause must last until the ride ends (ends ≤ 2 min before ride end)
 RIDE_MIN_MIN         = 35   # Flag 6: minimum expected ride duration (10 ann/signup + 25 pause/pitch)
 SIGNUP_MIN           = 14   # Flag 7: minimum expected sign-ups
 
@@ -336,6 +341,35 @@ def _diff_minutes(t1, t2) -> float:
 # Timing flags
 # ---------------------------------------------------------------------------
 
+def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
+    """
+    (flag 1/0/None, text) for the pitch / pause of one ride, by treatment.
+      S (sit down): pause should run until the ride ends.
+      N (normal):   pitch ≥ NORMAL_PITCH_MIN, unless it ran until the ride ended.
+      P (peddling): pitch ≥ PEDDLING_PITCH_MIN, unless it ran until the ride ended.
+    """
+    t = str(treatment) if treatment is not None and not (isinstance(treatment, float) and np.isnan(treatment)) else ''
+    start, end = (b06, b10) if t == 'S' else (b05, b09)
+    dur = _diff_minutes(start, end)
+    to_end = _diff_minutes(end, b11)          # minutes between pitch/pause end and ride end
+    if t == 'S':
+        if np.isnan(to_end):
+            return None, ''
+        if to_end > PAUSE_END_TOL_MIN:
+            return 1, f"Pause ended {to_end:.1f} min before the ride ended"
+        return 0, ''
+    if t in ('N', 'P'):
+        if np.isnan(dur):
+            return None, ''
+        floor = NORMAL_PITCH_MIN if t == 'N' else PEDDLING_PITCH_MIN
+        ran_to_end = not np.isnan(to_end) and to_end <= PAUSE_END_TOL_MIN
+        if dur < floor and not ran_to_end:
+            return 1, f"Pitch {dur:.1f} min (< {floor})" + (
+                f", ended {to_end:.1f} min before the ride" if not np.isnan(to_end) else "")
+        return 0, ''
+    return None, ''
+
+
 def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -362,8 +396,13 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     df['announcement_duration'] = ann_dur
 
     # ── Treatment and submission presence ────────────────────────────────────
-    treatment = df.get('p_treatment', pd.Series(dtype=str)).fillna(
-                df.get('a_treatment', pd.Series(dtype=str)))
+    # What actually happened: the script entered on the form (a06_r: 0 sit down, 1 normal,
+    # 2 peddling), else the actual code's treatment letter, else the planned one
+    idx = df.index
+    form_t = df.get('a06_r', pd.Series(None, index=idx)).map(_code).map({'0': 'S', '1': 'N', '2': 'P'})
+    treatment = (form_t.fillna(df.get('a_treatment', pd.Series(None, index=idx)))
+                       .fillna(df.get('p_treatment', pd.Series(None, index=idx))))
+    df['treatment_actual'] = treatment
     is_N    = treatment.isin(['N', 'P'])   # Normal and Peddling both have a marketer pitch (b05→b09)
     is_S    = treatment == 'S'
     has_sub = df['actual_batch_code'].notna()
@@ -398,22 +437,19 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     discrep = (sig_dur - ann_dur).abs()
     df['flag_3_signup_discrep'] = flag_where(discrep > SIGNUP_DIFF_MAX, sig_dur, ann_dur)
 
-    # ── Flag 4a: S-ride pause outside 23–27 min ───────────────────────────────
-    s_pause_dur = pd.to_numeric(df.get('pause_duration', pd.Series(dtype=float)), errors='coerce')
-    s_pause_dur = s_pause_dur.where(s_pause_dur.notna(), df['_pause_dur_min'])
-    df['flag_4a_pause_dur'] = np.where(
-        has_sub & is_S & s_pause_dur.notna(),
-        (abs(s_pause_dur - PITCH_TARGET_MIN) > PITCH_TOL_MIN).astype(int),
-        pd.NA
-    )
-
-    # ── Flag 4b: N-ride pitch outside 23–27 min ───────────────────────────────
-    pitch_raw = pd.Series(df['_pitch_dur_min'], index=df.index)
-    df['flag_4b_pitch_dur'] = np.where(
-        has_sub & is_N & pitch_raw.notna(),
-        (abs(pitch_raw - PITCH_TARGET_MIN) > PITCH_TOL_MIN).astype(int),
-        pd.NA
-    )
+    # ── Flags 4a/4b: treatment-specific pitch / pause rules ──────────────────
+    # Sit down (4a): the pause should last from the end of sign-up until the ride ends,
+    #   so it is flagged when it ends more than PAUSE_END_TOL_MIN before the ride end.
+    # Normal / Peddling (4b): the pitch should last at least NORMAL_PITCH_MIN /
+    #   PEDDLING_PITCH_MIN minutes, unless it ran until the end of the ride.
+    flags_ab = [pitch_pause_check(t, b05, b06, b09, b10, b11)
+                for t, b05, b06, b09, b10, b11 in zip(treatment, df['_b05'], df['_b06'], df['_b09'],
+                                                      df['_b10'], df['_b11'])]
+    f = pd.Series([x[0] for x in flags_ab], index=df.index)
+    df['pitch_pause_check'] = [x[1] for x in flags_ab]
+    df['flag_4a_pause_dur'] = np.where(has_sub & is_S & f.notna(), f.fillna(0).astype(int), pd.NA)
+    df['flag_4b_pitch_dur'] = np.where(has_sub & is_N & f.notna(), f.fillna(0).astype(int), pd.NA)
+    pitch_raw = pd.Series(df['_pitch_dur_min'], index=df.index)   # used by the chronological checks below
 
     # ── Flag 4c: pitch/pause ends AFTER ride end (chronological impossible) ───
     b09_to_b11 = pd.Series(df['_b09_to_b11'], index=df.index)

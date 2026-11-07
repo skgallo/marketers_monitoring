@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 
 from rollup import (
-    parse_batch_code, _parse_time, _diff_minutes, _code,
+    parse_batch_code, _parse_time, _diff_minutes, _code, pitch_pause_check,
+    NORMAL_PITCH_MIN, PEDDLING_PITCH_MIN, PAUSE_END_TOL_MIN,
     DELAY_MAX_MIN, ANN_DUR_MIN, ANN_DUR_MAX, SIGNUP_DIFF_MAX,
     PITCH_TARGET_MIN, PITCH_TOL_MIN, RIDE_MIN_MIN, SIGNUP_MIN,
 )
@@ -30,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07d"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07e"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -141,7 +142,7 @@ COL_DELAY   = f"Start delay (<{DELAY_MAX_MIN} min)"
 COL_REC     = f"Recorded ann./signup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_AUTO    = "Auto form-screen dur."
 COL_DISCREP = f"Timing discrepancy (>{SIGNUP_DIFF_MAX} min)"
-COL_PITCH   = f"Pause/Pitch ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+COL_PITCH   = "Pause/Pitch (min)"
 COL_RIDE    = f"Ride dur. (≥{RIDE_MIN_MIN} min)"
 COL_SIGNUPS = f"Signups (≥{SIGNUP_MIN})"
 COL_GAP     = f"Pitch start gap (≤{DELAY_MAX_MIN} min)"
@@ -1982,7 +1983,7 @@ CLOCK_PREFIX = "🕒 "
 COL_ANN   = f"Announcement ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_LAG   = "Ann. end → sign-up end (min)"
 COL_SGAP  = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
-COL_PP    = f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+COL_PP    = "Pitch/pause (min)"
 COL_RIDE2 = f"Ride ({RIDE_MIN_MIN}+ min)"
 COL_PREV  = "Since team's previous ride (min)"
 
@@ -2059,8 +2060,9 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             issues.append(f"Announcement {ann:.1f} min")
         if bad(du["gap"], hi=DELAY_MAX_MIN):
             issues.append(f"Pitch/pause {du['gap']:.1f} min after sign-up")
-        if bad(pp, PITCH_TARGET_MIN - PITCH_TOL_MIN, PITCH_TARGET_MIN + PITCH_TOL_MIN):
-            issues.append(f"Pitch/pause {pp:.1f} min")
+        pp_txt = _txt(r.get("pitch_pause_check"))      # treatment-specific rule (rollup.pitch_pause_check)
+        if pp_txt:
+            issues.append(pp_txt)
         if bad(ride, lo=RIDE_MIN_MIN):
             issues.append(f"Ride {ride:.1f} min")
         issues += [f"Order: {o}" for o in order]
@@ -2094,7 +2096,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             s[COL_ANN] = RED
         if bad(du["gap"], hi=DELAY_MAX_MIN):
             s[COL_SGAP] = RED
-        if bad(pp, PITCH_TARGET_MIN - PITCH_TOL_MIN, PITCH_TARGET_MIN + PITCH_TOL_MIN):
+        if pp_txt:
             s[COL_PP] = RED
         if bad(ride, lo=RIDE_MIN_MIN):
             s[COL_RIDE2] = RED
@@ -2124,7 +2126,7 @@ CHECK_POINTS = [("Ride start", "b02_r"), ("Ann. start", "b03"), ("Sign-up end", 
                 ("Pitch/pause start", "pp_start"), ("Pitch/pause end", "pp_end"), ("Ride end", "b11")]
 DUR_LABELS = [("delay", f"Start delay (≤{DELAY_MAX_MIN})"), ("signup", "Ann.+sign-up (b03→b04)"),
               ("gap", f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN})"),
-              ("pp", f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN})"),
+              ("pp", "Pitch/pause"),
               ("ride", f"Ride ({RIDE_MIN_MIN}+)")]
 
 
@@ -2215,7 +2217,12 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
                     continue
                 if abs(x - e1_du[key]) > TIME_GAP_MAX:
                     bits.append(f"{src} {x - e1_du[key]:+.1f}")
-                f_other, f_e1 = _dur_flag(key, x), _dur_flag(key, e1_du[key])
+                if key == "pp":
+                    trt = _txt(r.get("treatment_actual"))
+                    ppc = lambda tt: pitch_pause_check(trt, tt["b05"], tt["b06"], tt["b09"], tt["b10"], tt["b11"])[0] == 1
+                    f_other, f_e1 = ppc(t_), ppc(T[i])
+                else:
+                    f_other, f_e1 = _dur_flag(key, x), _dur_flag(key, e1_du[key])
                 if f_other and not f_e1:
                     flips_red.append(f"{name}: {src} {x:.1f} vs E1 {e1_du[key]:.1f}")
                 elif f_e1 and not f_other:
@@ -2260,19 +2267,24 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
         unmatched = pd.DataFrame()
     return t, css, unmatched
 
-def media_url(filename, form_id, server: str | None) -> str | None:
-    """Link to a photo/audio file on the SurveyCTO server (opens after logging in to SurveyCTO)."""
+def media_url(filename, form_id, server: str | None, surveycto_form: str = "rec_form_nov2026") -> str | None:
+    """
+    Link to a photo/audio file of one submission, in the format SurveyCTO uses for
+    attachments in its own exports (API v2). Opens in a browser that is logged in to
+    SurveyCTO with access to the form's data.
+    """
+    from urllib.parse import quote
     f = _txt(filename)
-    if not f:
+    if not f or not server or not _txt(form_id):
         return None
     f = f.split("/")[-1]
-    if not server or not _txt(form_id):
-        return None
-    return f"https://{server}.surveycto.com/view/submission-attachment/{f}?submissionID={_txt(form_id)}"
+    return (f"https://{server}.surveycto.com/api/v2/forms/{surveycto_form}/submissions/"
+            f"{quote(_txt(form_id), safe='')}/attachments/{quote(f)}")
 
 
 def media_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
-                reviews: pd.DataFrame | None = None, server: str | None = None) -> pd.DataFrame:
+                reviews: pd.DataFrame | None = None, server: str | None = None,
+                surveycto_form: str = "rec_form_nov2026") -> pd.DataFrame:
     """One row per E1 form with links to its photos and audio audits (or file names if no server is set)."""
     d = subs[subs["role"] == E1]
     present = [(c, lbl) for c, lbl in MEDIA_FIELDS if c in d.columns and d[c].notna().any()]
@@ -2285,6 +2297,6 @@ def media_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
         row = {k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #")}
         row["Enumerator 1"] = _txt(r["person"])
         for c, lbl in present:
-            row[lbl] = media_url(r.get(c), r.get("form_id"), server) if server else (_txt(r.get(c)).split("/")[-1] or None)
+            row[lbl] = media_url(r.get(c), r.get("form_id"), server, surveycto_form) if server else (_txt(r.get(c)).split("/")[-1] or None)
         rows.append(row)
     return pd.DataFrame(rows)

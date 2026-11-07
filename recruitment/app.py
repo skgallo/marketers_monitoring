@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07d"
+EXPECTED_VIEWS_VERSION = "2026-11-07e"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -465,7 +465,11 @@ with tab2:
             _server = st.secrets.get("surveycto_server")
         except Exception:
             _server = None
-        media = v.media_table(subs_f, batch_codes, reviews, _server)
+        try:
+            _form = st.secrets.get("recruitment_form_id", "rec_form_nov2026")
+        except Exception:
+            _form = "rec_form_nov2026"
+        media = v.media_table(subs_f, batch_codes, reviews, _server, _form)
         if not media.empty:
             with st.expander("📷 🎧 Photos and audio audits per ride"):
                 if _server:
@@ -497,7 +501,7 @@ with tab2:
 | Recorded ann./signup dur. | Outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min (enumerator-recorded) |
 | Auto form-screen dur. | Not flagged — SurveyCTO screen timing, for reference |
 | Timing discrepancy | Recorded and auto differ by > {SIGNUP_DIFF_MAX} min — review; doesn't mean either is wrong |
-| Pause/Pitch | Outside {PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min |
+| Pause/Pitch | **Sit down:** the pause lasts until the ride ends (in the current forms the pause end *is* the ride end, so only older forms can be flagged here). **Normal:** pitch under 20 min, unless it ran until the ride ended. **Peddling:** pitch under 12 min, unless it ran until the ride ended |
 | **Ride timeline** — Start check | Announcement started > {DELAY_MAX_MIN} min after the ride start although the bus was at least half full (🔴), or with no reason; 🟢 if the E1 waited because the bus was less than half full; 🟠 another reason |
 | **Ride timeline** — Strategic point | The announcement started AFTER the route's strategic point (asked only when the start was late) |
 | **Ride timeline** — Announcement | Automatic length of the script screens outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min |
