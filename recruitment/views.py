@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07e"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07f"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -2157,6 +2157,64 @@ def _match_e4(e1_planned: dict, e1_times: dict, e4: pd.DataFrame, e4_ident: pd.D
     return out
 
 
+SRC_NAME = {"E4": "the E4", "Sup": "the supervisor"}
+STEP_WORDS = {"Ride start": "ride start", "Ann. start": "announcement start", "Sign-up end": "sign-up end",
+              "Pitch/pause start": "pitch/pause start", "Pitch/pause end": "pitch/pause end", "Ride end": "ride end"}
+_cap = lambda s: s[:1].upper() + s[1:]
+
+
+def _describe_crosscheck(step_diffs: dict, flips_red: list, flips_amber: list, row: dict) -> str:
+    """
+    Plain-language reading of one ride's comparison. step_diffs = {source: {step: other − E1 minutes}}.
+    Positive = the other person recorded that step LATER than the E1.
+    """
+    if not step_diffs:
+        return "No E4 or supervisor record to compare."
+    out = []
+    big = {src: {k: g for k, g in d.items() if abs(g) > TIME_GAP_MAX} for src, d in step_diffs.items()}
+    for src, d in step_diffs.items():
+        who, b = SRC_NAME[src], big[src]
+        if not d:
+            continue
+        if not b:
+            continue
+        vals = list(d.values())
+        if len(d) >= 3 and len(b) == len(d) and (max(vals) - min(vals)) <= 2:
+            out.append(f"All of {who}'s times are about {np.mean(vals):+.0f} min from the E1's: probably the two "
+                       f"phones' clocks differ, not a recording problem.")
+            continue
+        if len(b) == 1:
+            step, g = next(iter(b.items()))
+            others_ok = len(d) - 1
+            when = "later" if g > 0 else "earlier"
+            txt = (f"{_cap(who)} recorded the {STEP_WORDS.get(step, step.lower())} {abs(g):.1f} min {when} than the E1"
+                   + (f"; the other {others_ok} time{'s' if others_ok > 1 else ''} agree{'' if others_ok > 1 else 's'}" if others_ok else "") + ".")
+            # is the third record on one side?
+            third = [s for s in step_diffs if s != src and step in step_diffs[s]]
+            if third:
+                g3 = step_diffs[third[0]][step]
+                if abs(g3) <= TIME_GAP_MAX:
+                    txt += f" {_cap(SRC_NAME[third[0]])} agrees with the E1, so {who} probably entered this time wrongly."
+                elif abs(g3 - g) <= TIME_GAP_MAX:
+                    txt += f" {_cap(SRC_NAME[third[0]])} agrees with {who}, so the E1 probably entered this time wrongly."
+            else:
+                txt += " Likely one time entered at the wrong moment (by one of the two); the durations using it differ for the same reason."
+            out.append(txt)
+            continue
+        steps = ", ".join(f"{STEP_WORDS.get(k, k.lower())} ({g:+.1f})" for k, g in b.items())
+        out.append(f"{_cap(who)} and the E1 disagree at several steps: {steps}. Check both records with them.")
+    # duration differences without any single step differing by more than the limit
+    dur_cols = [k for k in row if k.startswith("Δ ") and row[k] and k[2:] not in [c for c, _ in CHECK_POINTS]]
+    if not out and dur_cols:
+        out.append("Small differences at several steps add up to a duration difference of more than 2 min "
+                   "(no single time is far off).")
+    for f in flips_red:
+        out.append(f"By the independent record a target is missed ({f} min) but not by the E1's times, so the E1's times may not match what happened.")
+    for f in flips_amber:
+        out.append(f"The E1's times miss a target but the independent record doesn't ({f} min): possibly an E1 recording slip.")
+    return " ".join(out) or "Records agree."
+
+
 def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: pd.DataFrame | None = None,
                       reviews: pd.DataFrame | None = None):
     """
@@ -2187,7 +2245,7 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
         if i in pairs:
             s_ = subs.loc[pairs[i][0]]
             others["Sup"] = (s_, _times(s_))
-        row = {**{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #")},
+        row = {**{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #", "Treatment")},
                "Enumerator 1": _txt(r["person"]),
                "E4": _txt(others["E4"][0]["observer"]) if "E4" in others else "—",
                "Supervisor": _txt(others["Sup"][0]["person"]) if "Sup" in others else "—"}
@@ -2195,11 +2253,14 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
         if "E4" not in others: s["E4"] = GRAY
         if "Sup" not in others: s["Supervisor"] = GRAY
         issue = False
+        step_diffs = {src: {} for src in others}       # every compared step, for the description
         # 1. clock times at each step: other − E1
         for lbl, key in CHECK_POINTS:
             bits = []
             for src, (_, t_) in others.items():
                 g = _diff_minutes(T[i][key], t_[key])
+                if not np.isnan(g):
+                    step_diffs[src][lbl] = g
                 if not np.isnan(g) and abs(g) > TIME_GAP_MAX:
                     bits.append(f"{src} {g:+.1f}")
             row[f"Δ {lbl}"] = " · ".join(bits)
@@ -2236,6 +2297,7 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
             s["Target missed per E4/Sup, E1 looks fine"] = RED; issue = True
         if flips_amber:
             s["E1 outside target, E4/Sup says fine"] = AMBER; issue = True
+        row["What happened"] = _describe_crosscheck(step_diffs, flips_red, flips_amber, row)
         row["_compared"] = bool(others)
         row["_issue"] = issue
         rows.append(row); sty.append(s)

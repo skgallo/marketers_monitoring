@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07e"
+EXPECTED_VIEWS_VERSION = "2026-11-07f"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
