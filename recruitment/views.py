@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07i"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07j"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -2506,7 +2506,7 @@ def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
 INDICATORS = [   # (column, label)
     ("code_ok",    "Correct batch code"),
     ("same_day",   "Sent same day"),
-    ("order_ok",   "Times in possible order"),
+    ("order_ok",   "Times in logical order"),
     ("indep_ok",   "Confirmed by E4/supervisor"),
     ("start_ok",   "Start on time / justified"),
     ("sp_ok",      "At/before strategic point"),
@@ -2705,3 +2705,68 @@ def _balance_one(f: pd.DataFrame, control: str = "Sit down"):
     t = pd.DataFrame(rows)
     css = pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
     return t, css
+
+
+
+# ---------------------------------------------------------------------------
+# Column descriptions (shown when hovering over a column header, and under the tables)
+# ---------------------------------------------------------------------------
+COLUMN_HELP = {
+    # performance indicators
+    "Rides": "Number of rides in the selection",
+    "Correct batch code": "Right planned code selected and ride details (date, team, ride #) entered correctly. "
+                          "Allowed changes (team, marketer), changes you marked OK, and not-allowed changes the E1 "
+                          "reported to the supervisor don't count against them.",
+    "Sent same day": "The form was submitted on the day of the ride",
+    "Times in logical order": "The times follow the order of the ride: ride start → announcement start → sign-up end "
+                              "→ pitch/pause start → pitch/pause end → ride end. Not met if a later step is recorded "
+                              "before an earlier one (e.g. pitch end before pitch start) — a sign of times entered "
+                              "wrongly.",
+    "Confirmed by E4/supervisor": "The E4 (Script Checklist) or supervisor recorded the same times (within 2 min) and "
+                                  "doesn't miss a target the E1's times meet. Only rides with a second record.",
+    "Start on time / justified": "Announcement started within 2 min of the ride start, or later because the E1 "
+                                 "waited for the bus to fill (less than half full at the start)",
+    "At/before strategic point": "When the start was late: the announcement began before or at the route's "
+                                 "strategic point, not after it",
+    f"Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min": "Length of the announcement (time on the script screens) "
+                                                     f"between {ANN_DUR_MIN} and {ANN_DUR_MAX} minutes",
+    "No recording error (sup.)": "The supervisor did not attribute a timing mismatch to the E1. Supervised rides only.",
+    "Counts verified (sup.)": "The supervisor's count of sign-ups (and tickets) matched the E1's. Supervised rides only.",
+    "Checklist (sup.)": "Share of the supervisor's checklist behaviours (s01–s26) the E1 did, pooled over rides",
+    "Grade (sup., 1–10)": "Supervisor's overall grade for the E1 (average; number of rides graded in brackets)",
+    # averages
+    "Sign-ups": "Average normal sign-ups per ride (total on the E1 form)",
+    "Start delay (min)": "Minutes from the bus leaving the park to the start of the announcement",
+    f"Announcement (min, {ANN_DUR_MIN}–{ANN_DUR_MAX})": "Length of the announcement (script screens), minutes",
+    "Ann. end → sign-up end (min)": "Minutes between the end of the announcement and the end of sign-up "
+                                    "(time spent collecting sign-ups after the script)",
+    "Sign-up end → pitch/pause (min)": "Minutes between the end of sign-up and the start of the marketer's pitch "
+                                       "(Normal/Peddling) or of the pause (Sit down); should be 2 or less",
+    "Pitch, Normal/Peddling (min)": "Length of the marketer's pitch (pitch start → pitch end)",
+    "Pause, Sit down (min)": "Length of the pause (pause start → ride end)",
+    "Ride (min)": "Ride length (bus leaves the park → ride end)",
+    "Between rides (min)": "Minutes from the end of the team's previous ride to the start of this one, same day",
+    # balance
+    "Measure": "What is compared across treatment arms",
+    "Sit down (control)": "Average or share in the Sit down (control) arm; rides in brackets",
+    "Normal": "Average or share in the Normal arm; rides in brackets",
+    "Peddling": "Average or share in the Peddling arm; rides in brackets",
+    "Normal − control": "Normal minus Sit down (minutes, sign-ups, or percentage points)",
+    "Peddling − control": "Peddling minus Sit down (minutes, sign-ups, or percentage points)",
+    "Std. diff (Normal)": "Difference ÷ pooled standard deviation: about 0 = balanced; beyond ±0.25 worth a look; "
+                          "beyond ±0.5 a real imbalance",
+    "Std. diff (Peddling)": "Difference ÷ pooled standard deviation: about 0 = balanced; beyond ±0.25 worth a look; "
+                            "beyond ±0.5 a real imbalance",
+    # E2/E3
+    "Enumerator 2/3": "Enumerator 2 or 3 on the ride",
+    "Avg normal sign-ups": "Average normal sign-up cards collected per ride (E1's count of their cards)",
+    # ride timeline
+    "Timeline issues": "Everything on this ride outside its target, in one line",
+    "Independent check": "Comparison with the E4 (Script Checklist) and supervisor records of the same ride",
+    "Start check": "Did the announcement start on time, or was the delay justified by a bus less than half full?",
+    "Strategic point": "When the start was late: did the announcement begin before, at or after the route's "
+                       "strategic point?",
+    "Bus at start": "How full the bus was when it left the park",
+    "Since team's previous ride (min)": "Minutes from the end of the team's previous ride to the start of this one",
+    "Apprentice gave seat": "Did the apprentice give up their seat for the recruitment team?",
+}

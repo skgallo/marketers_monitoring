@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-07i"
+EXPECTED_VIEWS_VERSION = "2026-11-07j"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -77,14 +77,17 @@ with st.spinner("Loading data…"):
         st.stop()
 
 
-def show(t: pd.DataFrame, css: pd.DataFrame | None = None, height: int | None = None):
-    """Render a table with per-cell CSS, hiding helper columns (prefixed '_')."""
+def show(t: pd.DataFrame, css: pd.DataFrame | None = None, height: int | None = None, legend: bool = False):
+    """Render a table with per-cell CSS, hiding helper columns (prefixed '_'). Column descriptions from
+    views.COLUMN_HELP appear when hovering over a header; legend=True also lists them under the table."""
     if t is None or t.empty:
         st.info("Nothing to show.")
         return
     keep = [c for c in t.columns if not str(c).startswith("_")]
     t = t[keep].reset_index(drop=True)
-    kwargs = dict(width="stretch", hide_index=True)
+    helps = {c: v.COLUMN_HELP[c] for c in keep if c in getattr(v, "COLUMN_HELP", {})}
+    kwargs = dict(width="stretch", hide_index=True,
+                  column_config={c: st.column_config.Column(help=h) for c, h in helps.items()})
     if height:
         kwargs["height"] = height
     if css is not None:
@@ -92,6 +95,9 @@ def show(t: pd.DataFrame, css: pd.DataFrame | None = None, height: int | None = 
         st.dataframe(t.style.apply(lambda _: css, axis=None), **kwargs)
     else:
         st.dataframe(t, **kwargs)
+    if legend and helps:
+        with st.expander("What the columns mean", expanded=False):
+            st.markdown("\n".join(f"- **{c}** — {h}" for c, h in helps.items()))
 
 
 def download(t: pd.DataFrame, name: str, key: str, label="⬇ Download CSV"):
@@ -438,7 +444,7 @@ with tab2:
             cols = [c for c in tl.columns if show_clock or not c.startswith(v.CLOCK_PREFIX)]
             sel = ((tl["Timeline issues"] != "None") | ~tl["_check_ok"]) if only_issues \
                 else pd.Series(True, index=tl.index)
-            show(tl.loc[sel, cols], tl_css.loc[sel, [c for c in cols if c in tl_css.columns]])
+            show(tl.loc[sel, cols], tl_css.loc[sel, [c for c in cols if c in tl_css.columns]], legend=True)
             download(tl, "ride_timeline.csv", "dl_tl")
 
         if not xt.empty:
@@ -562,33 +568,16 @@ with tab3:
 
         st.markdown("#### Performance indicators")
         ind, ind_css = v.enumerator_indicators(fsel)
-        show(ind, ind_css)
+        show(ind, ind_css, legend=True)
         st.caption(f"Share of rides meeting each indicator (rides assessed in brackets). Red below "
                    f"{v.PERF_TARGET:.0%}; green = all met; grey = not assessed. Checklist: green 93%+, amber 88–92%, "
-                   "red below 88%.")
-        with st.expander("What each indicator means"):
-            st.markdown(f"""
-| Indicator | Met when |
-|---|---|
-| Correct batch code | Right planned code selected and ride details entered correctly (allowed changes — team, marketer — and differences you marked *OK – planned/allowed* don't count; a not-allowed change the E1 reported to the supervisor doesn't count either) |
-| Sent same day | Form submitted on the ride date |
-| Times in possible order | No step recorded before the previous one |
-| Confirmed by E4/supervisor | The independent record agrees (no flip, no time > {v.TIME_GAP_MAX} min off); only rides with a second record |
-| Start on time / justified | Announcement within {DELAY_MAX_MIN} min of ride start, or waited because the bus was less than half full |
-| At/before strategic point | Not started after the route's strategic point (asked only when the start was late) |
-| Announcement {ANN_DUR_MIN}–{ANN_DUR_MAX} min | Automatic length of the script screens |
-| No recording error (sup.) | The supervisor didn't attribute a timing mismatch to the E1 |
-| Counts verified (sup.) | Sign-up (and ticket) counts matched the supervisor's |
-| Checklist (sup.) | Observed behaviours done (s01–s26), pooled |
-| Grade (sup.) | Supervisor's 1–10 grade, average (number of rides graded) |
-
-Not counted (see Averages): pitch/pause and ride length, sign-up end → pitch/pause, sign-ups, time between rides.
-""")
+                   "red below 88%. Not counted here (see Averages): pitch/pause and ride length, sign-up end → pitch/pause, "
+                   "sign-ups and time between rides — they depend on the marketer, route and passengers.")
 
         st.markdown("#### Averages — patterns by enumerator, route, team, treatment…")
         gb_label = st.selectbox("Group by", list(v.GROUP_BY), key="avg_by")
         av, av_css = v.averages_table(fsel, v.GROUP_BY[gb_label])
-        show(av, av_css)
+        show(av, av_css, legend=True)
         st.caption("Average per ride. 🔴 far from the overall average in the worrying direction (fewer sign-ups, "
                    "shorter announcement/pitch/ride, longer delays or gaps); 🔵 far in the other direction. "
                    "'Far' = more than 3 sign-ups, 1 min (delay, announcement, lags), 3 min (pitch/pause), "
@@ -603,7 +592,7 @@ Not counted (see Averages): pitch/pause and ride length, sign-up end → pitch/p
         if bal.empty or bal.shape[1] <= 2:
             st.info("Need rides from at least two treatment arms to compare.")
         else:
-            show(bal, bal_css)
+            show(bal, bal_css, legend=True)
             st.caption("Everything before and around the pitch should look the same in every arm — only the pitch "
                        "differs. Sit down is the control. Each cell: average or share (rides). **Std. diff** = "
                        "difference ÷ pooled standard deviation: 🟢 within ±0.25, 🟠 0.25–0.5, 🔴 above 0.5 — coloured "
