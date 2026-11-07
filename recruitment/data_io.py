@@ -12,7 +12,8 @@ secrets.toml format
 -------------------
     app_password          = "your-password"
     submissions_url       = "https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv&gid=SUBMISSIONS_GID"
-    batch_codes_url       = "https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv&gid=BATCH_CODES_GID"
+    submissions_url_nov   = "https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv&gid=NOV_FORM_GID"   # optional
+    batch_codes_url      = "https://docs.google.com/spreadsheets/d/SHEET_ID/export?format=csv&gid=BATCH_CODES_GID"
 
 How to find the GID
 -------------------
@@ -86,7 +87,17 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     submissions_url  = _get_url("submissions_url")
     batch_codes_url  = _get_url("batch_codes_url")
 
-    submissions_raw = _read_tab(submissions_url,  "submissions")
+    # One tab per SurveyCTO form: the Oct form (submissions_url) and, once it is
+    # published, the Nov form (submissions_url_nov). Forms are stacked; columns
+    # that exist in only one form are left empty for the other.
+    parts = [_read_tab(submissions_url, "submissions").assign(form_source="Oct 2026")]
+    try:
+        nov_url = st.secrets.get("submissions_url_nov")
+    except Exception:
+        nov_url = None
+    if nov_url:
+        parts.append(_read_tab(nov_url, "submissions (Nov form)").assign(form_source="Nov 2026"))
+    submissions_raw = pd.concat(parts, ignore_index=True, sort=False)
     batch_codes     = _read_tab(batch_codes_url,  "batch_codes")
 
     subs = prepare_submissions(submissions_raw)
@@ -116,9 +127,30 @@ REVIEW_COLUMNS = ["timestamp", "batch_code", "issue", "decision", "note", "revie
                   "form_id", "field", "correct_value"]
 
 
+def _service_account_info():
+    """
+    The service-account key, from either
+      gcp_service_account_json = '''<the whole JSON key file, pasted as-is>'''   (easiest)
+    or the older [gcp_service_account] block. None if neither is set.
+    """
+    import json
+    try:
+        raw = st.secrets.get("gcp_service_account_json")
+    except Exception:
+        raw = None
+    if raw:
+        return json.loads(raw)
+    try:
+        if "gcp_service_account" in st.secrets:
+            return dict(st.secrets["gcp_service_account"])
+    except Exception:
+        pass
+    return None
+
+
 def can_write_reviews() -> bool:
     try:
-        return "gcp_service_account" in st.secrets
+        return _service_account_info() is not None
     except Exception:
         return False
 
@@ -137,7 +169,7 @@ def _sheet_id() -> str:
 @st.cache_resource
 def _sheets_client():
     import gspread
-    return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    return gspread.service_account_from_dict(_service_account_info())
 
 
 def _reviews_worksheet():
@@ -261,6 +293,8 @@ def diagnostics(submissions_raw: pd.DataFrame, batch_codes: pd.DataFrame, subs: 
         "forms_after_cleaning" : len(subs),
         "e1_forms"             : int((role == "Enumerator 1").sum()),
         "supervisor_forms"     : int((role == "Supervisor").sum()),
+        **{f"forms_{k.replace(' ', '_').lower()}": int(n)
+           for k, n in subs.get("form_source", pd.Series(dtype=str)).value_counts().items()},
         "dropped_as_test"      : len(submissions_raw) - len(subs),
     }
 

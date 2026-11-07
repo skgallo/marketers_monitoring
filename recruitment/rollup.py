@@ -57,9 +57,39 @@ SIGNUP_MIN           = 14   # Flag 7: minimum expected sign-ups
 
 TEST_USERNAMES = {'testing', 'test', 'skgallo@uchicago.edu'}   # drop these submissions (lowercase)
 
-# Supervisor names — choice list "supervisor" in the SurveyCTO form.
-# Update here if the roster changes (-55 = Other → supervisor_oth is used).
-SUPERVISOR_LABELS = {'1': 'Fatu', '2': 'Joseph', '3': 'Kadie', '4': 'Sahr'}
+# Supervisor names — choice list "supervisor" in each SurveyCTO form.
+# The codes changed between forms (Daniella was added as 1 in Nov), so the
+# right list is picked per submission (-55 = Other → supervisor_oth is used).
+SUPERVISOR_LABELS_BY_FORM = {
+    'Oct 2026': {'1': 'Fatu', '2': 'Joseph', '3': 'Kadie', '4': 'Sahr'},
+    'Nov 2026': {'1': 'Daniella', '2': 'Fatu', '3': 'Joseph', '4': 'Kadie', '5': 'Sahr'},
+}
+SUPERVISOR_LABELS = SUPERVISOR_LABELS_BY_FORM['Oct 2026']   # kept for older code
+NOV_FORM_FROM_VERSION = 2611000000   # formdef_version of the first Nov form
+
+# Nov form: why the ride differs from the planned code (mm_reason) — only 1 or 4 can be saved
+MM_REASON_LABELS = {'1': 'Plan changed (ride really happened differently)',
+                    '2': 'Entered details wrong', '3': 'Selected wrong planned code',
+                    '4': 'Not sure'}
+
+
+# Nov form (7 Nov version): when the announcement started relative to the route's strategic point
+SP_WHEN_LABELS = {'1': 'Started before the strategic point', '2': 'Started at the strategic point',
+                  '3': 'Started AFTER the strategic point'}
+
+
+def form_source_of(df: pd.DataFrame) -> pd.Series:
+    """'Oct 2026' / 'Nov 2026' per row: from the tab it came from, else formdef_version."""
+    idx = df.index
+    src = df['form_source'] if 'form_source' in df.columns else pd.Series(None, index=idx, dtype=object)
+    ver = pd.to_numeric(df.get('formdef_version', pd.Series(None, index=idx)), errors='coerce')
+    by_ver = pd.Series(np.where(ver >= NOV_FORM_FROM_VERSION, 'Nov 2026', 'Oct 2026'), index=idx)
+    return src.where(src.notna(), by_ver)
+
+
+def supervisor_name(code, form_source='Oct 2026'):
+    labels = SUPERVISOR_LABELS_BY_FORM.get(form_source, SUPERVISOR_LABELS)
+    return labels.get(code, code)
 
 # ---------------------------------------------------------------------------
 # Batch code helpers
@@ -164,6 +194,42 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
     # Drop test rows
     if 'username' in df.columns:
         df = df[~df['username'].str.lower().isin(TEST_USERNAMES)].copy()
+
+    # Which form version (supervisor codes differ between them)
+    df['form_source'] = form_source_of(df)
+    # The Nov form asks the E1 "What is your name?" as e1_name — keep it as e1_self
+    # (e1_name is the dashboard's name for Enumerator 1, from a02_1)
+    if 'e1_name' in df.columns:
+        df = df.rename(columns={'e1_name': 'e1_self', 'e1_name_oth': 'e1_self_oth'})
+
+    # Fields renamed in the 7 Nov form version: fill the names the dashboard uses
+    def _first(*cols):
+        out = pd.Series(None, index=df.index, dtype=object)
+        for c in cols:
+            if c in df.columns:
+                out = out.where(out.notna() & (out.astype(str).str.strip() != ''), df[c])
+        return out
+    df['sup_feedback_additional_strengths'] = _first('sup_feedback_additional_strengths', 'sup_fb_add_strengths')
+    df['sup_feedback_additional_improvements'] = _first('sup_feedback_additional_improvements', 'sup_fb_add_improvements')
+    # Start-delay reason: the free-text question was replaced by the bus-fullness / strategic-point questions
+    gap_reason = df.get('gap_notfull_reason', pd.Series(None, index=df.index)).map(_code)
+    sp = df.get('sp_when', pd.Series(None, index=df.index)).map(_code)
+    built = []
+    for i in df.index:
+        bits = []
+        if gap_reason.get(i) == '1':
+            bits.append('Waited: bus less than half full')
+        elif gap_reason.get(i) == '2':
+            o = df.at[i, 'gap_notfull_other'] if 'gap_notfull_other' in df.columns else None
+            bits.append('Other: ' + str(o).strip() if pd.notna(o) and str(o).strip() else 'Other reason')
+        w = df.at[i, 'gap_fullbus_why'] if 'gap_fullbus_why' in df.columns else None
+        if pd.notna(w) and str(w).strip():
+            bits.append('Bus at least half full: ' + str(w).strip())
+        if sp.get(i) in SP_WHEN_LABELS:
+            bits.append(SP_WHEN_LABELS[sp.get(i)])
+        built.append('; '.join(bits) or None)
+    df['announcement_delay_explanation'] = _first('announcement_delay_explanation').where(
+        _first('announcement_delay_explanation').notna(), pd.Series(built, index=df.index))
 
     # Tag every submission with its role — all submissions are kept.
     # "Enumerator 1" = role_type 1 (or missing/unknown — older forms without the field).
@@ -298,7 +364,7 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     # ── Treatment and submission presence ────────────────────────────────────
     treatment = df.get('p_treatment', pd.Series(dtype=str)).fillna(
                 df.get('a_treatment', pd.Series(dtype=str)))
-    is_N    = treatment == 'N'
+    is_N    = treatment.isin(['N', 'P'])   # Normal and Peddling both have a marketer pitch (b05→b09)
     is_S    = treatment == 'S'
     has_sub = df['actual_batch_code'].notna()
 
@@ -389,6 +455,12 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     total_signups = pd.to_numeric(df.get('total_signups', pd.Series(dtype=float)), errors='coerce')
     df['flag_7_low_signup'] = flag_where(total_signups < SIGNUP_MIN, total_signups)
 
+    # ── Flag 8 (Nov form): marketer pitch started > 2 min after sign-up ended ─
+    # pitch_start_gap = b04 (sign-up end) → b05 (pitch start); Normal/Peddling rides only.
+    gap = pd.to_numeric(df.get('pitch_start_gap', pd.Series(np.nan, index=df.index)), errors='coerce')
+    df['pitch_start_gap'] = gap.round(6)
+    df['flag_8_pitch_start_gap'] = np.where(has_sub & gap.notna(), (gap.round(6) > DELAY_MAX_MIN).astype(int), pd.NA)
+
     # ── Flag 5: any timing/chronological issue ───────────────────────────────
     timing_flags = [
         'flag_1_start_delay', 'flag_2_ann_duration', 'flag_3_signup_discrep',
@@ -437,8 +509,11 @@ def add_people(df: pd.DataFrame) -> pd.DataFrame:
     e1_code = df.get('a02_1', pd.Series(None, index=idx)).map(_code)
     e1_lab  = df.get('a02_1_lab', pd.Series(None, index=idx)).map(
         lambda v: str(v).strip() if pd.notna(v) and str(v).strip() not in ('', 'nan') else None)
+    # The roster codes changed between the Oct and Nov forms (e.g. Daniel 3 → 14),
+    # so enumerators are identified by name (spaces/case/dots ignored) where available.
+    norm = lambda s: re.sub(r'[^a-z]', '', s.lower())
     df['e1_id'] = [
-        (f"oth:{lab.lower()}" if c == '-55' and lab else c) if c else (f"user:{u}" if pd.notna(u) else None)
+        (f"name:{norm(lab)}" if lab and norm(lab) else c) if (c or lab) else (f"user:{u}" if pd.notna(u) else None)
         for c, lab, u in zip(e1_code, e1_lab, username)
     ]
     # Canonical display name per e1_id = most frequent spelling
@@ -449,9 +524,10 @@ def add_people(df: pd.DataFrame) -> pd.DataFrame:
 
     sup_code = df.get('supervisor', pd.Series(None, index=idx)).map(_code)
     sup_oth  = df.get('supervisor_oth', pd.Series(None, index=idx))
+    src      = df['form_source'] if 'form_source' in df.columns else pd.Series('Oct 2026', index=idx)
     df['sup_name'] = [
-        (str(o).strip() if c == '-55' and pd.notna(o) else SUPERVISOR_LABELS.get(c, c)) if c else None
-        for c, o in zip(sup_code, sup_oth)
+        (str(o).strip() if c == '-55' and pd.notna(o) else supervisor_name(c, s)) if c else None
+        for c, o, s in zip(sup_code, sup_oth, src)
     ]
     is_sup = df['role'] == 'Supervisor'
     df['person'] = np.where(is_sup, df['sup_name'], df['e1_name'])

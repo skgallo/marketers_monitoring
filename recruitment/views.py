@@ -30,7 +30,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-10-24"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-07b"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -40,6 +40,7 @@ BLUE = "color: #0055AA; font-weight: 600"
 GRAY = "color: #888888"
 GREEN = "color: #1E7B34; font-weight: 600"
 PURPLE = "color: #7B2CBF; font-weight: 600"
+AMBER = "color: #B26B00; font-weight: 600"
 GREEN_BG = "#D9F2E6"; AMBER_BG = "#FDF1D6"; RED_BG = "#FADBD3"   # cell backgrounds
 
 TIME_GAP_MAX    = 2    # min — E1 vs supervisor checkpoint gap that needs review
@@ -49,11 +50,11 @@ PERF_TARGET     = 0.80 # performance rates below this are shown in red
 TREAT = {"S": "Sit down", "N": "Normal", "P": "Peddling"}
 
 STATUS_RANK = {
-    "Wrong code selected": 0, "Design problem": 1, "Duplicate E1": 2, "To confirm": 3,
+    "Wrong code selected": 0, "Not-allowed change": 1, "Duplicate E1": 2, "To confirm": 3,
     "Supervisor only": 4, "Not submitted": 5, "Done as planned": 6,
 }
 STATUS_STYLE = {
-    "Wrong code selected": RED, "Design problem": RED, "Duplicate E1": RED, "To confirm": BLUE,
+    "Wrong code selected": RED, "Not-allowed change": RED, "Duplicate E1": RED, "To confirm": BLUE,
     "Supervisor only": BLUE, "Not submitted": GRAY, "Done as planned": GREEN,
 }
 
@@ -71,6 +72,9 @@ COMPLETION_LABELS = {
     "1": "Completed — no disruption", "2": "Completed — with disruption",
     "3": "Not fully completed", "4": "Completion not confirmed",
 }
+from rollup import MM_REASON_LABELS
+CONF_ITEM_LABELS = {"date": "date", "team": "team", "marketer": "marketer", "route": "route",
+                    "ride": "ride number", "pitch": "pitch type"}
 MATCH_LABELS = {"1": "✓ Match", "2": "✗ Mismatch", "3": "Not verified"}
 YESNO = {"1": "Yes", "0": "No"}
 DISCREPANCY_SOURCE = {
@@ -104,7 +108,11 @@ ISSUE_DEFS = [
     ("flag_4b_pitch_dur",   "Pitch duration",       "pause_duration_explanation"),
     ("flag_6_short_ride",   "Short ride",           "ride_duration_explanation"),
     ("flag_7_low_signup",   "Low sign-ups",         "final_comment_lowsignup"),
+    # Nov form: marketer started the pitch > 2 min after sign-up ended (reference only,
+    # not counted in the enumerator's timing score)
+    ("flag_8_pitch_start_gap", "Pitch start gap",   "pitch_start_gap_explanation"),
 ]
+NOT_E1_TIMING = {"flag_7_low_signup", "flag_8_pitch_start_gap"}
 # Recording / data-quality problems (not protocol deviations)
 RECORDING_DEFS = [
     ("flag_3_signup_discrep", "Recorded ≠ auto timing"),
@@ -122,6 +130,7 @@ CORE_FIELDS = ["announcement_start_delay", "signup_duration", "pause_duration",
 CHECKPOINTS = [
     ("Ride start",          ["b02_r"]),
     ("Ann. start",          ["b03"]),
+    ("Sign-up end",         ["b04"]),          # Nov form
     ("Ann. end",            ["b05", "b06"]),
     ("Pitch/pause end",     ["b09", "b10"]),
     ("Ride end",            ["b11"]),
@@ -135,6 +144,7 @@ COL_DISCREP = f"Timing discrepancy (>{SIGNUP_DIFF_MAX} min)"
 COL_PITCH   = f"Pause/Pitch ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
 COL_RIDE    = f"Ride dur. (≥{RIDE_MIN_MIN} min)"
 COL_SIGNUPS = f"Signups (≥{SIGNUP_MIN})"
+COL_GAP     = f"Pitch start gap (≤{DELAY_MAX_MIN} min)"
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -231,13 +241,13 @@ def code_changes(row) -> list:
     elif g("p_route") != g("a_route"):
         out.append(("design", f"Direction {g('p_route')}→{g('a_route')}", "Route"))
     if g("p_date") != g("a_date"):
-        out.append(("confirm", f"Date {fmt_code_date(g('p_date'))}→{fmt_code_date(g('a_date'))}", "Date"))
+        out.append(("design", f"Date {fmt_code_date(g('p_date'))}→{fmt_code_date(g('a_date'))}", "Date"))
     if g("p_team") != g("a_team"):
-        out.append(("confirm", f"Team {g('p_team')}→{g('a_team')}", "Team"))
+        out.append(("allowed", f"Team {g('p_team')}→{g('a_team')} (allowed)", "Team"))
     if g("p_mkt_id") != g("a_mkt_id"):
         out.append(("allowed", f"Mkt ID {g('p_mkt_id')}→{g('a_mkt_id')} (allowed)", "Mkt ID"))
     if g("p_ride_num") != g("a_ride_num"):
-        out.append(("confirm", f"Ride # {g('p_ride_num')}→{g('a_ride_num')}", "Ride #"))
+        out.append(("design", f"Ride # {g('p_ride_num')}→{g('a_ride_num')}", "Ride #"))
     return out
 
 
@@ -277,10 +287,12 @@ DECISION_ALIASES = {
     "ok – planned/allowed": "Approved", "ok - planned/allowed": "Approved",
     "correct in cleaning": "Fix needed",
 }
-DESIGN_PARTS  = {"Treatment", "Route", "Batch code"}
-CONFIRM_PARTS = {"Date", "Team", "Ride #"}
+# Batch-code changes that are NOT allowed (the E1 must stop and call the supervisor)
+DESIGN_PARTS  = {"Treatment", "Route", "Batch code", "Date", "Ride #"}
+# Allowed changes the E1 did not report to the supervisor (Nov form: mm_ok_marketer / mm_ok_team = No)
+CONFIRM_PARTS = {"Unreported change"}
 # Changes the field team is allowed to make on the day — shown in "What changed", never flagged
-ALLOWED_PARTS = {"Mkt ID"}
+ALLOWED_PARTS = {"Mkt ID", "Team"}
 
 
 def review_map(reviews: pd.DataFrame | None) -> dict:
@@ -335,6 +347,15 @@ def _ride_lookup(batch_codes: pd.DataFrame) -> dict:
     return {k: v[0] for k, v in keys.items() if len(v) == 1}
 
 
+def _only_team_or_mkt_differs(selected: str, actual: str) -> bool:
+    """True when the selected planned code and the actual code differ only in team and/or marketer."""
+    p, a = parse_batch_code(selected), parse_batch_code(actual)
+    if not (p["parse_ok"] and a["parse_ok"]):
+        return False
+    same_core = all(p[k] == a[k] for k in ("date", "route", "ride_num", "treatment"))
+    return same_core and (p["team"] != a["team"] or p["mkt_id"] != a["mkt_id"])
+
+
 def effective_codes(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFrame:
     """
     Which planned ride each form actually belongs to.
@@ -352,6 +373,11 @@ def effective_codes(subs: pd.DataFrame, batch_codes: pd.DataFrame) -> pd.DataFra
         likely.append(lookup.get((r["ride_date"], team, ride)) if team and ride and pd.notna(r["ride_date"]) else None)
     out = pd.DataFrame({"likely_code": likely}, index=subs.index)
     sel = subs["batch_code"].map(_txt)
+    # Another team doing this ride is allowed: if the code selected and the actual code agree on
+    # everything except team / marketer, the form belongs to the code selected
+    swap = [_only_team_or_mkt_differs(s_, a_) for s_, a_ in
+            zip(sel, subs.get("actual_batch_code", pd.Series(None, index=subs.index)).map(_txt))]
+    out.loc[swap, "likely_code"] = sel[swap]
     out["misfiled"] = out["likely_code"].notna() & (out["likely_code"] != sel)
     out["eff_code"] = out["likely_code"].where(out["likely_code"].notna(), sel)
     return out
@@ -390,6 +416,8 @@ def ride_identity(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
         team = _code(cf.get("a02a_r", r.get("a02a_r")))
         ride = _code(cf.get("a04_r", r.get("a04_r")))
         likely = lookup.get((date, team, ride)) if team and ride and pd.notna(date) else None
+        if _only_team_or_mkt_differs(selected, actual):
+            likely = selected                     # another team doing this ride is allowed
         if cf.get("batch_code_pre"):
             planned, note = cf["batch_code_pre"], f"Selected {selected} → corrected (review)"
         elif likely and likely != selected:
@@ -403,7 +431,7 @@ def ride_identity(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             p_date = pd.to_datetime(p["date"], format="%d%m%Y", errors="coerce")
             if note or not (team and ride and pd.notna(date)):
                 team, ride, date = p["team"], p["ride_num"], p_date
-            elif (team, ride) != (p["team"], p["ride_num"]) or date != p_date:
+            elif ride != p["ride_num"] or date != p_date:   # a team change alone is allowed
                 # Not in the plan list, but the form and the code selected disagree:
                 # show the ride the form describes and say so
                 note = (f"Selected {selected} (team {p['team']}, ride {p['ride_num']}) "
@@ -464,6 +492,14 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 
         # Every issue on this ride, by the name used in the reviews tab
         parts = {c[2] for ch in changes for c in ch if c[0] != "allowed"}
+        # Nov form: an allowed change (team / marketer) the E1 says was NOT reported to the supervisor
+        unreported = []
+        for _, f in basis.iterrows():
+            for flag, ok, chg in [("mm_team", "mm_ok_team", "team"), ("mm_marketer", "mm_ok_marketer", "marketer")]:
+                if _code(f.get(flag)) == "1" and _code(f.get(ok)) == "0":
+                    unreported.append(f"{chg} change not reported to supervisor ({_txt(f['person'])})")
+        if unreported:
+            parts.add("Unreported change")
         if len(came_in):
             parts.add("Wrong code")
         if len(e1) > 1:
@@ -491,7 +527,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         if "Wrong code" in parts:
             tag_parts["Wrong code selected"] = {"Wrong code"}
         if parts & DESIGN_PARTS:
-            tag_parts["Design problem"] = parts & DESIGN_PARTS
+            tag_parts["Not-allowed change"] = parts & DESIGN_PARTS
         if "Duplicate E1" in parts:
             tag_parts["Duplicate E1"] = {"Duplicate E1"}
         if parts & CONFIRM_PARTS and not parts & DESIGN_PARTS:
@@ -554,6 +590,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         for ch in changes:
             for _, txt_, part in ch:
                 part_text.setdefault(part, []).append(txt_)
+        if unreported:
+            part_text["Unreported change"] = unreported
         issues = []
         ride_lbl = (f"{fmt_code_date(p['date'])} · team {p['team']} · ride {p['ride_num']}"
                     if p["parse_ok"] else code)
@@ -597,8 +635,9 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             what = _ann(changes[0])
         else:
             what = ""
-        open_what = "; ".join(dict.fromkeys(c[1] for ch in changes for c in ch
-                                            if c[0] != "allowed" and c[2] not in resolved_parts))
+        open_what = "; ".join(dict.fromkeys([c[1] for ch in changes for c in ch
+                                             if c[0] != "allowed" and c[2] not in resolved_parts]
+                                            + (unreported if "Unreported change" not in resolved_parts else [])))
 
         if len(e1):
             names = _names(e1["person"])
@@ -619,6 +658,48 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             vals = {_txt(x) for x in basis.get(col, pd.Series(dtype=str))} - {""} if len(basis) else set()
             return bool(vals) and vals != {planned_val or ""}
 
+        # Nov form: the E1's own explanation when the ride differs from the planned code
+        e1_says = []
+        for _, f in pd.concat([basis, came_in]).drop_duplicates(subset="form_id").iterrows():
+            bits = []
+            mm = _code(f.get("mm_reason"))          # earlier Nov version
+            if mm:
+                bits.append(MM_REASON_LABELS.get(mm, mm))
+            if _code(f.get("mm_real")) == "1":       # current Nov version
+                bits.append("confirmed this is what really happened")
+            for ok, chg in [("mm_ok_team", "team change"), ("mm_ok_marketer", "marketer change"),
+                            ("mm_ok_date", "date change")]:
+                c_ = _code(f.get(ok))
+                if c_ in ("0", "1"):
+                    bits.append(f"{chg} {'reported to' if c_ == '1' else 'NOT reported to'} supervisor")
+            if _code(f.get("ride_invalid_flag")) == "1":
+                who = {"1": "supervisor", "2": "research team"}.get(_code(f.get("mm_contacted_who")), "")
+                bits.append("NOT-ALLOWED change: " + ({"1": f"contacted {who}".strip(),
+                                                         "2": "tried but could not reach supervisor"}
+                                                        .get(_code(f.get("mm_contacted")), "contact not recorded")))
+            wrong = _txt(f.get("conf_wrong"))
+            if wrong:
+                bits.append("marked wrong at confirmation: " + ", ".join(
+                    CONF_ITEM_LABELS.get(w, w) for w in wrong.split()))
+            if bits:
+                e1_says.append(f"{_txt(f['person'])}: " + "; ".join(bits))
+
+        # Implementation checks for Today (from the E1 form(s)): start conditions and timing targets
+        checks = []
+        for _, f in e1.iterrows():
+            txt_, css_ = _start_check(f)
+            if css_ in (RED, AMBER):
+                checks.append(txt_)
+            if _code(f.get("sp_when")) == "3":
+                checks.append("Announcement started AFTER the strategic point")
+            ann_ = _num(f.get("announcement_duration"))
+            if not np.isnan(ann_) and not (ANN_DUR_MIN <= round(ann_, 1) <= ANN_DUR_MAX):
+                checks.append(f"Announcement {ann_:.1f} min")
+            gap_ = _diff_minutes(_parse_time(f.get("b04")),
+                                 _parse_time(f.get("b05")) if pd.notna(_parse_time(f.get("b05"))) else _parse_time(f.get("b06")))
+            if not np.isnan(gap_) and gap_ > DELAY_MAX_MIN:
+                checks.append(f"Pitch/pause started {gap_:.1f} min after sign-up ended")
+
         last = d["submitted_at"].max() if not d.empty else pd.NaT
         rows.append({
             "Status":         " + ".join(f"{t_} ✓ OK" if tag_state[t_] == "ok"
@@ -638,11 +719,13 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             "Code selection": "; ".join(notes + [f"({m})" for m in moved]) or "—",
             "_code_flag":     bool(notes and any("filed under" in n for n in notes)),
             "What changed":   what,
+            "E1 explanation": " | ".join(e1_says) or "—",
             "Last submitted": last.strftime("%d %b %H:%M") if pd.notna(last) else "",
             "Review notes":   "; ".join(review_txt) or "—",
             "Needs decision on": ", ".join(undecided) or "—",
             "_needs_decision": bool(undecided),
             "_issues":        issues,
+            "_checks":        checks,
             "_fix_needed":    fix_needed,
             "_tags":          tags,
             "_open_tags":     open_tags,
@@ -679,8 +762,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                      for u, o, a in zip(t["_undecided_tags"], t["_open_tags"], t["_tags"])]
     # Actual components: red = wrong ride for the design (treatment, route); blue = confirm;
     # green = the difference was marked OK or corrected
-    for col, style in [("Treatment", RED), ("Route", RED),
-                       ("Date", BLUE), ("Team", BLUE), ("Ride #", BLUE)]:
+    for col, style in [("Treatment", RED), ("Route", RED), ("Date", RED), ("Ride #", RED),
+                       ("Team", BLUE)]:
         diff = t["_diff"].map(lambda dd: dd[col])
         ok = t["_resolved_parts"].map(lambda rp: col in rp)
         css.loc[diff & ~ok, col] = style
@@ -691,10 +774,10 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             "Code selection"] = PURPLE
     css.loc[t["E1 form"].str.startswith("✗") & ~not_sub, "E1 form"] = RED
     css.loc[t["E1 form"].str.contains("×", regex=False), "E1 form"] = RED
-    css.loc[t["_tags"].map(lambda x: "Design problem" in x or "To confirm" in x), "What changed"] = GREEN
-    css.loc[t["_open_tags"].map(lambda x: "To confirm" in x or "Design problem" in x), "What changed"] = PURPLE
+    css.loc[t["_tags"].map(lambda x: "Not-allowed change" in x or "To confirm" in x), "What changed"] = GREEN
+    css.loc[t["_open_tags"].map(lambda x: "To confirm" in x or "Not-allowed change" in x), "What changed"] = PURPLE
     css.loc[t["_undecided_tags"].map(lambda x: "To confirm" in x), "What changed"] = BLUE
-    css.loc[t["_undecided_tags"].map(lambda x: "Design problem" in x), "What changed"] = RED
+    css.loc[t["_undecided_tags"].map(lambda x: "Not-allowed change" in x), "What changed"] = RED
     css.loc[t["Review status"].str.startswith("✓"), "Review status"] = GREEN
     css.loc[t["Review status"].isin(["Not reviewed", "Partly reviewed"]), "Review status"] = RED
     css.loc[t["_fix_needed"], "Review status"] = PURPLE
@@ -763,8 +846,6 @@ def apply_live_corrections(raw: pd.DataFrame, reviews: pd.DataFrame | None):
     corr = corrections_table(reviews)
     if corr.empty or raw is None or raw.empty or "KEY" not in raw.columns:
         return raw, []
-    from rollup import SUPERVISOR_LABELS
-    sup_codes = {n.lower(): c for c, n in SUPERVISOR_LABELS.items()}
     out = raw.copy()
     applied = []
     for _, c in corr.iterrows():
@@ -778,12 +859,13 @@ def apply_live_corrections(raw: pd.DataFrame, reviews: pd.DataFrame | None):
             continue
 
         def set_supervisor(name_or_code):
-            code = name_or_code if name_or_code.lstrip("-").isdigit() else sup_codes.get(name_or_code.lower())
-            if code:
-                out.loc[m, "supervisor"] = code
+            # A name is stored as "Other: <name>" so it reads the same whatever form
+            # version the submission came from (the supervisor codes differ by form).
+            if name_or_code.lstrip("-").isdigit():
+                out.loc[m, "supervisor"] = name_or_code
             else:
                 out.loc[m, "supervisor"] = "-55"
-                out.loc[m, "supervisor_oth"] = name_or_code
+                out.loc[m, "supervisor_oth"] = name_or_code.strip().title()
 
         if field == "drop_form":
             if val == "1":
@@ -869,8 +951,8 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
             else:
                 if "Wrong code selected" in tags:
                     acts += [n for n in r["Code selection"].split("; ") if "filed under" in n][:1]
-                if "Design problem" in tags:
-                    acts.append(f"Design: {r['_open_what']}")
+                if "Not-allowed change" in tags:
+                    acts.append(f"Not allowed — call supervisor: {r['_open_what']}")
                 if "Duplicate E1" in tags:
                     acts.append("Two E1 forms — check which one to keep")
                 if "To confirm" in tags:
@@ -890,6 +972,8 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
                 "Supervisor": r["Supervisor form"].replace("✗ none", "✗"),
                 "State":      state,
                 "Action":     " · ".join(acts) or "—",
+                "E1 explanation": r.get("E1 explanation", "—") if acts or had_issues else "—",
+                "Checks":     " · ".join(r.get("_checks") or []) or "—",
                 "Review":     r["Review status"],
             })
             styles.append(state)
@@ -906,6 +990,7 @@ def today_board(ledger: pd.DataFrame, day) -> dict:
             if st_ == "Waiting":
                 css.loc[i] = GRAY
         css.loc[t["E1"].str.startswith("✗") & (t["State"] != "Waiting"), "E1"] = RED
+        css.loc[t["Checks"] != "—", "Checks"] = AMBER
         out[team] = (t, css)
     return out
 
@@ -1070,6 +1155,8 @@ def fidelity_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             COL_DISCREP:           fmt_val(abs(sig - ann)),
             COL_PITCH:             fmt_val(r.get("pause_duration")),
             "Pause/pitch reason":  _txt(r.get("pause_duration_explanation")) or "—",
+            COL_GAP:               fmt_val(r.get("pitch_start_gap")),
+            "Pitch start reason":  _txt(r.get("pitch_start_gap_explanation")) or "—",
             COL_RIDE:              fmt_val(r.get("ride_duration")),
             "Ride dur. reason":    _txt(r.get("ride_duration_explanation")) or "—",
             "Completion":          COMPLETION_LABELS.get(_code(r.get("ride_completion_outcome")), "—"),
@@ -1087,8 +1174,18 @@ def fidelity_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             COL_DISCREP: r.get("flag_3_signup_discrep"),
             COL_PITCH: 1 if (_num(r.get("flag_4a_pause_dur")) == 1 or _num(r.get("flag_4b_pitch_dur")) == 1) else 0,
             COL_RIDE: r.get("flag_6_short_ride"), COL_SIGNUPS: r.get("flag_7_low_signup"),
+            COL_GAP: r.get("flag_8_pitch_start_gap"),
         })
     t = pd.DataFrame(rows)
+    # Columns for questions that aren't in any form in view (e.g. the ride-completion
+    # module was removed from the Nov form; pitch start gap is new) are hidden
+    hide = []
+    if not d.get("ride_completion_outcome", pd.Series(dtype=str)).notna().any():
+        hide += ["Completion", "Not completed — why"]
+    if not d.get("pitch_start_gap", pd.Series(dtype=float)).notna().any():
+        hide += [COL_GAP, "Pitch start reason"]
+    t = t.drop(columns=[c for c in hide if c in t.columns])
+    flags = [{k: v for k, v in fl.items() if k not in hide} for fl in flags]
     css = _empty_css(t)
     if t.empty:
         return t, css
@@ -1102,7 +1199,8 @@ def fidelity_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
         {"Outside target, no reason": RED, "Outside target, some reasons missing": RED,
          "Outside target, reason given": BLUE, "No issues": GREEN}).fillna("")
     css.loc[t["Recording problems"] != "—", "Recording problems"] = RED
-    css.loc[t["Completion"] == "Not fully completed", "Completion"] = RED
+    if "Completion" in t.columns:
+        css.loc[t["Completion"] == "Not fully completed", "Completion"] = RED
     css.loc[t["Code note"] != "—", "Code note"] = PURPLE
     return t, css
 
@@ -1128,6 +1226,7 @@ def crosscheck_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None
         gaps = time_gaps(r, s)
         row["Supervisor"] = _txt(s["person"])
         row["Paired by"]  = method
+        row["Sup. grade (1–10)"] = fmt_val(s.get("sup_obs_grade"), 1)
         for label, _ in CHECKPOINTS:
             row[f"Gap: {label}"] = f"{gaps[label]:.1f}" if label in gaps else "—"
         if gaps:
@@ -1144,11 +1243,22 @@ def crosscheck_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None
         row["Completion match"]    = {"1": "✓ Match", "0": "✗ Differs"}.get(_code(s.get("sup_completion_matches_e1")), "—")
         rows.append(row)
 
-    cols = (["Ride date", "Team", "Ride #", "Planned code", "Enumerator 1", "Supervisor", "Paired by"]
+    cols = (["Ride date", "Team", "Ride #", "Planned code", "Enumerator 1", "Supervisor", "Paired by",
+             "Sup. grade (1–10)"]
             + [f"Gap: {l}" for l, _ in CHECKPOINTS]
             + ["Max gap (min)", "Largest at", "Sign-ups E1 / Sup", "Sup: times match", "Mismatched times",
                "Discrepancy source", "E1 recording issue", "Count match", "Ticket match", "Completion match"])
-    t = pd.DataFrame(rows).reindex(columns=cols).fillna("—")
+    t = pd.DataFrame(rows).reindex(columns=cols).fillna("—").replace({MISSING: "—"})
+    # Hide columns for questions that aren't in the forms in view (Oct: no grade / sign-up end;
+    # Nov: no ride-completion module)
+    sp_all = subs[subs["role"] == SUP]
+    if not sp_all.get("sup_obs_grade", pd.Series(dtype=str)).notna().any():
+        t = t.drop(columns=["Sup. grade (1–10)"])
+    if not sp_all.get("sup_completion_matches_e1", pd.Series(dtype=str)).notna().any():
+        t = t.drop(columns=["Completion match"])
+    if not subs.get("b04", pd.Series(dtype=str)).notna().any():
+        t = t.drop(columns=["Gap: Sign-up end"])
+    cols = list(t.columns)
     css = _empty_css(t)
     if t.empty:
         return t, css
@@ -1156,7 +1266,7 @@ def crosscheck_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None
         css.loc[t[c].map(_num) > TIME_GAP_MAX, c] = RED
     css.loc[t["Sup: times match"] == "No", "Sup: times match"] = RED
     css.loc[t["E1 recording issue"] == "E1 recording error", "E1 recording issue"] = RED
-    for c in ["Count match", "Ticket match", "Completion match"]:
+    for c in [c for c in ["Count match", "Ticket match", "Completion match"] if c in t.columns]:
         css.loc[t[c].str.startswith("✗"), c] = RED
     so = t["Sign-ups E1 / Sup"].str.split(" / ")
     css.loc[so.map(lambda x: len(x) == 2 and "?" not in x and x[0] != x[1]), "Sign-ups E1 / Sup"] = RED
@@ -1220,7 +1330,7 @@ def performance_records(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             f = _num(r.get("flag_batch_code_different"))
             code_ok = np.nan if np.isnan(f) else 1.0 - f
         a = assess_issues(r)
-        timing_flags = [r.get(f) for f, _, _ in ISSUE_DEFS if f != "flag_7_low_signup"]
+        timing_flags = [r.get(f) for f, _, _ in ISSUE_DEFS if f not in NOT_E1_TIMING]
         assessed = [f for f in timing_flags if not np.isnan(_num(f))]
         core_ok = all(not np.isnan(_num(r.get(c))) for c in CORE_FIELDS)
         # impossible timestamp sequences (the recorded-vs-auto discrepancy is its own metric)
@@ -1630,6 +1740,7 @@ def ride_summary(subs: pd.DataFrame, batch_codes: pd.DataFrame, reviews: pd.Data
             "obs_yes": sum(checks.values()), "obs_n": len(checks),
             "times": {"1": "Yes", "0": "No"}.get(_code(s.get("sup_times_match")) if s is not None else None, "—"),
             "rec_err": s is not None and _code(s.get("sup_recording_issue")) == "1",
+            "grade": _num(s.get("sup_obs_grade")) if s is not None else np.nan,   # Nov form, 1–10
             "mismatch_detail": _txt(s.get("sup_time_mismatch_details")) if s is not None else "",
             "strengths": _txt(s.get("sup_feedback_additional_strengths")) if s is not None else "",
             "improve": _txt(s.get("sup_feedback_additional_improvements")) if s is not None else "",
@@ -1668,6 +1779,8 @@ def day_grid(rs: pd.DataFrame):
                 continue
             n_obs = d["obs_n"].sum()
             score = f"{100 * d['obs_yes'].sum() / n_obs:.0f}%" if n_obs else "no checklist"
+            if d["grade"].notna().any():
+                score += f" · grade {d['grade'].mean():.1f}"
             issues = _day_issue_text(d)
             row[col] = f"{score} · {issues}  ({len(d)} ride{'s' if len(d) > 1 else ''})"
             share_bad = d["recording_problem"].mean()
@@ -1696,7 +1809,10 @@ def ride_numbers_table(rs: pd.DataFrame):
         "Sign-ups": rs["signups"].map(lambda x: fmt_val(x, 0)),
         "Times agree": rs["times"],
         "Protocol": [f"{a}/{b}" if b else "—" for a, b in zip(rs["obs_yes"], rs["obs_n"])],
+        "Sup. grade": rs["grade"].map(lambda x: fmt_val(x, 1)),
     })
+    if not rs["grade"].notna().any():
+        t = t.drop(columns=["Sup. grade"])
     css = _empty_css(t)
     css.loc[rs["wrong_code"].values, "Correct code"] = RED
     css.loc[~rs["same_day"].values, "Sent same day"] = RED
@@ -1723,9 +1839,12 @@ def qualitative_table(rs: pd.DataFrame):
         "Enumerator 1": rs["person"], "Date · ride": rs["date"].map(fmt_day) + " · " + rs["ride"],
         "Supervisor": rs["supervisor"].replace("", "—"),
         "Protocol": [f"{a}/{b}" if b else "—" for a, b in zip(rs["obs_yes"], rs["obs_n"])],
+        "Sup. grade": rs["grade"].map(lambda x: fmt_val(x, 1)),
         "Behaviours not observed (supervisor's reason)": [missed_text(r) for _, r in rs.iterrows()],
         "Strengths": rs["strengths"].replace("", "—"), "To improve": rs["improve"].replace("", "—"),
     })
+    if not rs["grade"].notna().any():
+        t = t.drop(columns=["Sup. grade"])
     css = _empty_css(t)
     css.loc[t["Behaviours not observed (supervisor's reason)"].str.startswith("None").values,
             "Behaviours not observed (supervisor's reason)"] = f"background-color: {GREEN_BG}"
@@ -1816,3 +1935,156 @@ def daily_message(rs: pd.DataFrame, person: str, day, sender: str = "") -> str:
     lines += ["", "To work on:"] + ([f"- {cap(w)}" for w in work] if work else ["- Nothing to fix today. Keep it up!"])
     lines += ["", "Thank you!" + (f" {sender}" if sender else "")]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# TAB 2 — Ride timeline and start checks (Nov form)
+# ---------------------------------------------------------------------------
+BUS_FULLNESS = {"1": "< half full", "2": "≥ half full", "3": "Full (seated)", "4": "Full + standing"}
+YESNO_SHORT = {"1": "Yes", "0": "No"}
+MEDIA_FIELDS = [   # (column in the data, label)
+    ("signup_check",      "Sign-up photo"),
+    ("signup_photo_e2",   "E2 cards photo"),
+    ("signup_photo_e3",   "E3 cards photo"),
+    ("aa_1_ann_start",    "Audio 1: ann. start"),
+    ("aa_2_ann_middle",   "Audio 2: ann. middle"),
+    ("aa_3_pause_start",  "Audio 3: pitch/pause start"),
+    ("aa_4_pause_middle", "Audio 4: pitch/pause middle"),
+    ("aa_5_pause_end",    "Audio 5: after pitch/pause end"),
+]
+
+
+def _clock(t) -> str:
+    return t.strftime("%H:%M") if pd.notna(t) else "—"
+
+
+def _start_check(r) -> tuple[str, str]:
+    """(text, style) for 'did the announcement start when it should?'."""
+    delay = _num(r.get("announcement_start_delay"))
+    full = _code(r.get("b02a"))
+    if np.isnan(delay):
+        return "—", GRAY
+    if delay <= DELAY_MAX_MIN:
+        return f"On time ({delay:.1f} min)", GREEN
+    if full in ("2", "3", "4"):
+        why = _txt(r.get("gap_fullbus_why"))
+        return f"Waited {delay:.1f} min although bus {BUS_FULLNESS[full]}" + (f": {why}" if why else ""), RED
+    reason = _code(r.get("gap_notfull_reason"))
+    if full == "1" and reason == "1":
+        return f"Waited {delay:.1f} min: bus < half full (expected)", GREEN
+    if reason == "2":
+        oth = _txt(r.get("gap_notfull_other"))
+        return f"Waited {delay:.1f} min: other reason" + (f" ({oth})" if oth else ""), AMBER
+    return f"Waited {delay:.1f} min, no reason recorded", RED
+
+
+def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+                        reviews: pd.DataFrame | None = None):
+    """
+    One row per E1 form: clock times of each step of the ride, the start checks
+    (bus fullness, strategic point) and the durations/gaps between steps.
+    Returns (table, css).
+    """
+    d = subs[subs["role"] == E1]
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    ident = ride_identity(d, batch_codes, reviews)
+    d = d.loc[_ride_sort_key(ident, d)]
+    rows, sty = [], []
+    for i, r in d.iterrows():
+        t = {k: _parse_time(r.get(k)) for k in ["b02_r", "b03", "b04", "b05", "b06", "b09", "b10", "b11"]}
+        p_start = t["b05"] if pd.notna(t["b05"]) else t["b06"]
+        p_end = t["b09"] if pd.notna(t["b09"]) else t["b10"]
+        ann = _num(r.get("announcement_duration"))            # automatic: script screens
+        ann_end = t["b03"] + pd.Timedelta(minutes=ann) if pd.notna(t["b03"]) and not np.isnan(ann) else pd.NaT
+        lag = _diff_minutes(ann_end, t["b04"])                 # announcement end → sign-up end
+        gap = _diff_minutes(t["b04"], p_start)                 # sign-up end → pitch/pause start
+        pp = _num(r.get("pause_duration"))
+        if np.isnan(pp):
+            pp = _diff_minutes(p_start, p_end)
+        ride = _num(r.get("ride_duration"))
+        if np.isnan(ride):
+            ride = _diff_minutes(t["b02_r"], t["b11"])
+        start_txt, start_css = _start_check(r)
+        sp = _code(r.get("sp_when"))
+        sp_txt = {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—")
+        row = {
+            **{k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #", "Treatment")},
+            "Enumerator 1": _txt(r["person"]),
+            "Ride start": _clock(t["b02_r"]),
+            "Bus at start": BUS_FULLNESS.get(_code(r.get("b02a")), "—"),
+            "Ann. start": _clock(t["b03"]),
+            "Start check": start_txt,
+            "Strategic point": sp_txt,
+            f"Announcement ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)": fmt_val(ann, 1),
+            "Sign-up end": _clock(t["b04"]),
+            "Ann. end → sign-up end (min)": fmt_val(lag, 1),
+            "Pitch/pause start": _clock(p_start),
+            f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)": fmt_val(gap, 1),
+            "Pitch/pause end": _clock(p_end),
+            f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)": fmt_val(pp, 1),
+            "Ride end": _clock(t["b11"]),
+            f"Ride ({RIDE_MIN_MIN}+ min)": fmt_val(ride, 1),
+            "Apprentice gave seat": YESNO_SHORT.get(_code(r.get("apprentice_seat")), "—"),
+        }
+        s = {k: "" for k in row}
+        s["Start check"] = start_css
+        if sp == "3":
+            s["Strategic point"] = RED
+        k_ann = f"Announcement ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
+        if not np.isnan(ann) and not (ANN_DUR_MIN <= round(ann, 1) <= ANN_DUR_MAX):
+            s[k_ann] = RED
+        k_gap = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
+        if not np.isnan(gap) and gap > DELAY_MAX_MIN:
+            s[k_gap] = RED
+        k_pp = f"Pitch/pause ({PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min)"
+        if not np.isnan(pp) and abs(pp - PITCH_TARGET_MIN) > PITCH_TOL_MIN:
+            s[k_pp] = RED
+        k_ride = f"Ride ({RIDE_MIN_MIN}+ min)"
+        if not np.isnan(ride) and ride < RIDE_MIN_MIN:
+            s[k_ride] = RED
+        if not np.isnan(lag) and lag < -1:
+            s["Ann. end → sign-up end (min)"] = RED     # sign-up "ended" well before the announcement did
+        for k, val in row.items():
+            if val in ("—", MISSING) and not s[k]:
+                s[k] = GRAY
+        rows.append(row); sty.append(s)
+    t = pd.DataFrame(rows).replace({MISSING: "—"})
+    css = pd.DataFrame(sty)
+    # hide columns for questions not in the forms in view
+    for col, src in [("Apprentice gave seat", "apprentice_seat"), ("Strategic point", "sp_when"),
+                     ("Sign-up end", "b04"), ("Ann. end → sign-up end (min)", "b04"),
+                     (f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)", "b04")]:
+        if not d.get(src, pd.Series(dtype=str)).notna().any() and col in t.columns:
+            t = t.drop(columns=[col]); css = css.drop(columns=[col])
+    return t, css
+
+
+def media_url(filename, form_id, server: str | None) -> str | None:
+    """Link to a photo/audio file on the SurveyCTO server (opens after logging in to SurveyCTO)."""
+    f = _txt(filename)
+    if not f:
+        return None
+    f = f.split("/")[-1]
+    if not server or not _txt(form_id):
+        return None
+    return f"https://{server}.surveycto.com/view/submission-attachment/{f}?submissionID={_txt(form_id)}"
+
+
+def media_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
+                reviews: pd.DataFrame | None = None, server: str | None = None) -> pd.DataFrame:
+    """One row per E1 form with links to its photos and audio audits (or file names if no server is set)."""
+    d = subs[subs["role"] == E1]
+    present = [(c, lbl) for c, lbl in MEDIA_FIELDS if c in d.columns and d[c].notna().any()]
+    if d.empty or not present:
+        return pd.DataFrame()
+    ident = ride_identity(d, batch_codes, reviews)
+    d = d.loc[_ride_sort_key(ident, d)]
+    rows = []
+    for i, r in d.iterrows():
+        row = {k: v for k, v in _ride_cols(ident.loc[i]).items() if k in ("Ride date", "Team", "Ride #")}
+        row["Enumerator 1"] = _txt(r["person"])
+        for c, lbl in present:
+            row[lbl] = media_url(r.get(c), r.get("form_id"), server) if server else (_txt(r.get(c)).split("/")[-1] or None)
+        rows.append(row)
+    return pd.DataFrame(rows)

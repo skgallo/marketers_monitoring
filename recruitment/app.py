@@ -34,7 +34,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-10-24"
+EXPECTED_VIEWS_VERSION = "2026-11-07b"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -176,7 +176,9 @@ with tab0:
         states = pd.concat([t["State"] for t, _ in board.values()]) if board else pd.Series(dtype=str)
         c = st.columns(4)
         c[0].metric("Rides planned", n_rides)
-        c[1].metric("Forms in", len(forms_day))
+        n_e1 = int((forms_day["role"] == "Enumerator 1").sum())
+        c[1].metric("E1 forms in", n_e1, help="Enumerator 1 forms received for this day")
+        c[1].caption(f"+ {len(forms_day) - n_e1} supervisor form(s)")
         c[2].metric("Need action", int(states.isin(["Action", "Overdue"]).sum()))
         last = forms_day["submitted_at"].max() if not forms_day.empty else pd.NaT
         c[3].metric("Last form", (last.tz_localize("UTC").tz_convert("Africa/Freetown").strftime("%H:%M")
@@ -214,7 +216,7 @@ with tab1:
                    help="Mistakes you marked 'Correct in cleaning' that aren't marked 'Corrected' yet")
     cols[5].metric("Not submitted", n_not_sub)
     st.caption(" · ".join(f"{k}: {int(counts.get(k, 0))}" for k in
-                          ["Wrong code selected", "Design problem", "Duplicate E1", "To confirm", "Supervisor only"]
+                          ["Wrong code selected", "Not-allowed change", "Duplicate E1", "To confirm", "Supervisor only"]
                           if counts.get(k, 0)) or "No open flags.")
 
     f1, f2 = st.columns([3, 2])
@@ -340,16 +342,16 @@ form** — not only the planned code picked from the list. A ride can carry seve
 | Status | Meaning | What to do |
 |---|---|---|
 | 🔴 **Wrong code selected** | A form describing this ride (by its date, team and ride #) was filed under another planned code. The form is counted here only; the row it was filed under shows a grey note in *Code selection* but is not flagged | Decide: Correct in cleaning, or Corrected |
-| 🔴 **Design problem** | The actual code has a different treatment, corridor or direction, or no readable code | Act now: the ride may not count for the design |
+| 🔴 **Not-allowed change** | The actual code has a different date, route/direction, ride number or treatment, or no readable code | Act now: the E1 should have stopped and called the supervisor; the ride may not count |
 | 🔴 **Duplicate E1** | More than one E1 form describes this ride | Same person → keep one; different people → two E1s on one ride, or a wrong code |
-| 🔵 **To confirm** | Date, team, marketer ID or ride # differ from plan | Confirm with the team |
+| 🔵 **To confirm** | A team or marketer change (allowed) that the E1 says was NOT reported to the supervisor | Check with the supervisor |
 | 🔵 **Supervisor only** | Supervisor form(s) but no E1 form for this ride | Chase the E1 form |
 | ⚪ **Not submitted** | No form describes this ride | Check whether the ride happened |
 | 🟢 **Done as planned** | One E1 form, filed under the right code, actual code = planned code | — |
 
 **Date … Treatment** show what actually happened (from the actual batch code on the E1 form, or the
-supervisor form if there is no E1 form). 🔴 Red = treatment or route differs from plan; 🔵 blue = date, team,
-marketer ID or ride # differs. If forms disagree, both values are shown ("A / B"). "—" = no form yet.
+supervisor form if there is no E1 form). 🔴 Red = date, route/direction, ride # or treatment differs from plan (not allowed);
+🔵 blue = team differs (allowed). Marketer ID changes are allowed and not coloured. If forms disagree, both values are shown ("A / B"). "—" = no form yet.
 
 **E1 form / Supervisor form** show who submitted for the ride (✗ = missing).
 **What changed** lists planned → actual for each part that differs (one entry per form when there are several).
@@ -408,6 +410,33 @@ with tab2:
         if only_issues:
             m |= fid["Recording problems"] != "—"
 
+        st.markdown("#### Ride timeline and start checks")
+        st.caption("Clock times of each step, whether the announcement started when it should (bus fullness, "
+                   "strategic point), and the time between steps. 🔴 = outside target; 🟠 = gap with another reason.")
+        tl, tl_css = v.ride_timeline_table(subs_f, batch_codes, reviews)
+        if only_issues and not tl.empty:
+            show(tl[m.values], tl_css[m.values])
+        else:
+            show(tl, tl_css)
+        download(tl, "ride_timeline.csv", "dl_tl")
+
+        try:
+            _server = st.secrets.get("surveycto_server")
+        except Exception:
+            _server = None
+        media = v.media_table(subs_f, batch_codes, reviews, _server)
+        if not media.empty:
+            with st.expander("📷 🎧 Photos and audio audits per ride"):
+                if _server:
+                    st.caption("Links open on the SurveyCTO server (log in to SurveyCTO first).")
+                    st.dataframe(media, hide_index=True, width="stretch", column_config={
+                        c: st.column_config.LinkColumn(c, display_text="open")
+                        for c in media.columns if c not in ("Ride date", "Team", "Ride #", "Enumerator 1")})
+                else:
+                    st.caption("File names only. Add surveycto_server = \"yourserver\" to Secrets "
+                               "(the part before .surveycto.com) to get clickable links.")
+                    st.dataframe(media, hide_index=True, width="stretch")
+
         st.markdown("#### Implementation — values and the reasons given")
         show(fid[m], fid_css[m])
         download(fid[m], "implementation_fidelity.csv", "dl_fid")
@@ -428,8 +457,18 @@ with tab2:
 | Auto form-screen dur. | Not flagged — SurveyCTO screen timing, for reference |
 | Timing discrepancy | Recorded and auto differ by > {SIGNUP_DIFF_MAX} min — review; doesn't mean either is wrong |
 | Pause/Pitch | Outside {PITCH_TARGET_MIN}±{PITCH_TOL_MIN} min |
+| **Ride timeline** — Start check | Announcement started > {DELAY_MAX_MIN} min after the ride start although the bus was at least half full (🔴), or with no reason; 🟢 if the E1 waited because the bus was less than half full; 🟠 another reason |
+| **Ride timeline** — Strategic point | The announcement started AFTER the route's strategic point (asked only when the start was late) |
+| **Ride timeline** — Announcement | Automatic length of the script screens outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min |
+| **Ride timeline** — Ann. end → sign-up end | Lag between the end of the announcement and the end of sign-up (no target; red if sign-up "ended" > 1 min before the announcement) |
+| **Ride timeline** — Sign-up end → pitch/pause | Pitch/pause started > {DELAY_MAX_MIN} min after sign-up ended |
+| Pitch start gap *(Nov form)* | Marketer started the pitch > {DELAY_MAX_MIN} min after sign-up ended (b04 → b05; Normal/Peddling rides). For reference — not counted against the enumerator |
 | Ride dur. | < {RIDE_MIN_MIN} min |
 | Signups | < {SIGNUP_MIN} |
+
+From the Nov form the recorded sign-up duration runs from announcement start to **sign-up end** (b03 → b04);
+before it ran to the pitch/pause start. The ride-completion questions were removed, so those columns only
+appear for Oct forms. **Sup. grade** in the cross-check is the supervisor's 1–10 grade for the E1.
 
 **Issue status** — whether any value is outside its target, and whether the enumerator wrote a reason
 (*reason given* / *no reason*). A reason is context only: it does not make the value acceptable.
