@@ -104,13 +104,15 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # One tab per SurveyCTO form: the Oct form (submissions_url) and, once it is
     # published, the Nov form (submissions_url_nov). Forms are stacked; columns
     # that exist in only one form are left empty for the other.
-    parts = [_read_tab(submissions_url, "submissions").assign(form_source="Oct 2026")]
+    # The form version (Oct / Nov / Launch 0) is read from each submission's formdef_version in rollup,
+    # so supervisor codes and the interruption list are decoded with the right form.
+    parts = [_read_tab(submissions_url, "submissions")]
     try:
         nov_url = st.secrets.get("submissions_url_nov")
     except Exception:
         nov_url = None
     if nov_url:
-        parts.append(_read_tab(nov_url, "submissions (Nov form)").assign(form_source="Nov 2026"))
+        parts.append(_read_tab(nov_url, "submissions (second form)"))
     submissions_raw = pd.concat(parts, ignore_index=True, sort=False)
     batch_codes     = _read_tab(batch_codes_url,  "batch_codes")
 
