@@ -133,9 +133,9 @@ def load_e4() -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return prepare_e4(_read_tab(url, "Script Checklist (E4)"))
-    except RuntimeError as e:
+    except Exception as e:                    # never let the E4 data stop the dashboard
         out = pd.DataFrame()
-        out.attrs["error"] = str(e)
+        out.attrs["error"] = f"E4 (Script Checklist) data could not be read: {e}"
         return out
 
 

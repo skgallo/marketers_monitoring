@@ -748,8 +748,8 @@ E1_LABELS_NOV = {'11': 'Misheal Sellu', '12': 'Cecil Massaquoi', '13': 'Kadija E
 def prepare_e4(raw: pd.DataFrame) -> pd.DataFrame:
     """One row per Script Checklist form that describes a field ride, with the same
     planned/actual code columns as the recruitment forms (batch_code = planned)."""
-    if raw is None or raw.empty:
-        return pd.DataFrame()
+    if raw is None or raw.empty or not ({'batch_code_pre', 'batch_code', 'KEY'} & set(raw.columns)):
+        return pd.DataFrame()          # nothing published yet (empty Sheet or headers only)
     df = raw.copy()
     if 'KEY' in df.columns:
         df = df[~(df['KEY'].notna() & df.duplicated(subset='KEY', keep='last'))].copy()
@@ -760,7 +760,8 @@ def prepare_e4(raw: pd.DataFrame) -> pd.DataFrame:
         df = df[act.isna() | (act > 2)].copy()
     if df.empty:
         return df
-    years = pd.to_datetime(df.get('SubmissionDate'), format='mixed', errors='coerce').dt.year.fillna(2026).astype(int)
+    blank = pd.Series(None, index=df.index, dtype=object)
+    years = pd.to_datetime(df.get('SubmissionDate', blank), format='mixed', errors='coerce').dt.year.fillna(2026).astype(int)
     for c in ['batch_code', 'batch_code_pre']:
         if c not in df.columns:
             df[c] = None
@@ -786,7 +787,7 @@ def prepare_e4(raw: pd.DataFrame) -> pd.DataFrame:
     form_date = pd.to_datetime(df.get('a01_r', pd.Series(None, index=df.index)), format='mixed', errors='coerce')
     code_date = pd.to_datetime(df.get('a_date', pd.Series(None, index=df.index)), format='%d%m%Y', errors='coerce')
     df['ride_date'] = form_date.fillna(code_date).dt.normalize()
-    df['submitted_at'] = pd.to_datetime(df.get('SubmissionDate'), format='mixed', errors='coerce',
+    df['submitted_at'] = pd.to_datetime(df.get('SubmissionDate', blank), format='mixed', errors='coerce',
                                         utc=True).dt.tz_localize(None)
     df['form_id'] = df.get('KEY', pd.Series(None, index=df.index))
     df['person'] = df['observer']
