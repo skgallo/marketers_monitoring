@@ -758,7 +758,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             if not np.isnan(n_man) and n_man > 0:
                 checks.append(f"{int(n_man)} time(s) entered manually (forgot to tap)")
             if _txt(f.get("c10")) not in ("", "0") and _txt(f.get("c10_labels")):
-                checks.append("Interruption: " + _txt(f.get("c10_labels")))
+                checks.append("Interruption: " + (_txt(f.get("interruption_details")) or _txt(f.get("c10_labels")))
+                              + (f" → {_txt(f.get('ride_outcome'))}" if _txt(f.get("ride_outcome")) else ""))
             if _code(f.get("other_speaker")) == "1":
                 checks.append("Someone else spoke to the passengers ("
                               + (", ".join(OTHER_WHO.get(c, c) for c in _txt(f.get("other_speaker_who")).split()) or "?") + ")")
@@ -1243,7 +1244,8 @@ def fidelity_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             COL_SIGNUPS:           fmt_val(r.get("total_signups"), 0),
             "Signup reason":       _txt(r.get("final_comment_lowsignup")) or "—",
             "Disruptions":         _txt(r.get("c10_labels")) or decode_c10(r.get("c10")),
-            "Disruption notes":    _txt(r.get("c10a")) or "—",
+            "Disruption notes":    _txt(r.get("interruption_details")) or _txt(r.get("c10a")) or "—",
+            "Ride outcome":        _txt(r.get("ride_outcome")) or "—",
             "Pax Q1":              _txt(r.get("q00")) or "—",
             "Pax Q2":              _txt(r.get("q01")) or "—",
         })
@@ -2165,8 +2167,9 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         n_manual = _num(r.get("tap_forgot_total"))
         if not np.isnan(n_manual) and n_manual > 0:
             issues.append(f"{int(n_manual)} time{'s' if n_manual > 1 else ''} entered manually (forgot to tap)")
-        if _txt(r.get("c10_labels")) and _txt(r.get("c10_labels")) != "None":
-            issues.append("Interruption: " + _txt(r.get("c10_labels")))
+        if _txt(r.get("c10")) not in ("", "0") and _txt(r.get("c10_labels")):
+            issues.append("Interruption: " + _txt(r.get("c10_labels"))
+                          + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else ""))
         stop = _code(r.get("ride_stop"))
         if stop in ("1", "2"):
             issues = [x for x in issues if not x.startswith(("Announcement + sign-up", "Pitch", "Ride ", "Pause"))]
@@ -2182,6 +2185,10 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             "Enumerator 1": _txt(r["person"]),
             "Timeline issues": " · ".join(issues) or "None",
             "Independent check": (verdicts or {}).get(_txt(r.get("form_id")), ("No second record", GRAY))[0],
+            "Interruption — what happened": (
+                ((_txt(r.get("interruption_details")) or _txt(r.get("c10a")) or _txt(r.get("c10_labels")))
+                 + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else ""))
+                if _txt(r.get("c10")) not in ("", "0") else "—"),
             COL_DELAY2: fmt_val(_num(r.get("announcement_start_delay")) if not np.isnan(_num(r.get("announcement_start_delay"))) else du["delay"], 1),
             "Start check": start_txt,
             "Strategic point": {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—"),
@@ -2203,6 +2210,8 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         s = {k: "" for k in row}
         s["Timeline issues"] = RED if issues else GREEN
         s["Independent check"] = (verdicts or {}).get(_txt(r.get("form_id")), ("", GRAY))[1]
+        s["Interruption — what happened"] = (RED if "STOPPED" in row["Interruption — what happened"]
+                                              else AMBER if row["Interruption — what happened"] != "—" else GRAY)
         row["_check_ok"] = s["Independent check"] in (GREEN, GRAY)
         s["Start check"] = start_css
         _d = _num(r.get("announcement_start_delay")) if not np.isnan(_num(r.get("announcement_start_delay"))) else du["delay"]
@@ -2232,6 +2241,8 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
     css = pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
     if verdicts is None:
         t, css = t.drop(columns=["Independent check"]), css.drop(columns=["Independent check"])
+    if "Interruption — what happened" in t.columns and (t["Interruption — what happened"] == "—").all():
+        t, css = t.drop(columns=["Interruption — what happened"]), css.drop(columns=["Interruption — what happened"])
     for col, src in [("Apprentice gave seat", "apprentice_seat"), ("Strategic point", "sp_when"),
                      (CLOCK_PREFIX + "Sign-up end", "b04"), (COL_LAG, "b04"), (COL_SGAP, "b04")]:
         if not d.get(src, pd.Series(dtype=str)).notna().any() and col in t.columns:
@@ -2915,6 +2926,9 @@ COLUMN_HELP = {
     "Avg normal sign-ups": "Average normal sign-up cards collected per ride (E1's count of their cards)",
     # ride timeline
     "Timeline issues": "Everything on this ride outside its target, in one line",
+    "Interruption — what happened": "Each interruption: type, when it happened, what it affected, whether the marketer "
+                                    "could continue, whether the supervisor was informed, the E1's description — and "
+                                    "whether the ride was completed or stopped",
     "Independent check": "Comparison with the E4 (Script Checklist) and supervisor records of the same ride",
     f"Ride start → announcement (min, ≤{DELAY_MAX_MIN})": "Minutes from the bus leaving the park (ride start, b02_r) to the "
                                                           "start of the announcement (b03). Target: 2 or less, unless "

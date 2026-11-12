@@ -89,6 +89,10 @@ C10_EXTERNAL_BY_FORM = {'old': {'1', '2', '3', '5'},
                         'Launch 0': {'1', '2', '3', '4', '5', '6', '7', '8', '9'}}
 RIDE_STOP_LABELS = {'0': 'Carried on to the end', '1': 'Stopped before any sign-up card was written on',
                     '2': 'Stopped after sign-up cards were written on'}
+DIS_WHEN = {'1': 'before recruitment', '2': 'during the announcement', '3': 'during sign-up',
+            '4': 'during the pitch', '5': 'after the pitch'}
+DIS_EFFECT = {'1': 'recruitment', '2': "the marketer's pitch", '3': 'the ride duration'}
+DIS_CONT = {'1': 'continued', '2': 'continued after a pause', '3': 'left the bus', '-55': 'other'}
 PITCH_SHORT_LABELS = {'1': 'marketer simply marketed for a short time', '2': 'something cut the pitch short'}
 
 # Nov form: why the ride differs from the planned code (mm_reason) — only 1 or 4 can be saved
@@ -109,6 +113,17 @@ def form_source_of(df: pd.DataFrame) -> pd.Series:
     ver = pd.to_numeric(df.get('formdef_version', pd.Series(None, index=idx)), errors='coerce')
     by_ver = pd.Series(np.where(ver >= LAUNCH_FORM_FROM_VERSION, 'Launch 0',
                                 np.where(ver >= NOV_FORM_FROM_VERSION, 'Nov 2026', 'Oct 2026')), index=idx)
+    # No formdef_version published: recognise the form by questions only it has
+    def has(cols):
+        m = pd.Series(False, index=idx)
+        for c in cols:
+            if c in df.columns:
+                m |= df[c].notna() & (df[c].astype(str).str.strip() != '')
+        return m
+    no_ver = ver.isna()
+    by_ver = by_ver.mask(no_ver & has(['b02_r_tap', 'b03_tap', 'restart_ride', 'tap_forgot_total']), 'Launch 0')
+    by_ver = by_ver.mask(no_ver & ~has(['b02_r_tap', 'b03_tap', 'restart_ride', 'tap_forgot_total'])
+                         & has(['mm_real', 'conf_ok', 'e1_name', 'mm_reason']), 'Nov 2026')
     return src.where(src.notna(), by_ver)
 
 
@@ -269,6 +284,47 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
         if rep:
             df['c10a'] = [' | '.join(str(x).strip() for x in vals if pd.notna(x) and str(x).strip()) or None
                           for vals in df[rep].values.tolist()]
+    # Launch 0 form: one readable line per interruption (repeat group, published as dis_*_1, dis_*_2, …)
+    def _rep(col, k):
+        for name in (f'{col}_{k}', f'{col}{k}'):
+            if name in df.columns:
+                return df[name]
+        return pd.Series(None, index=df.index, dtype=object)
+    n_rep = max([int(m.group(1)) for c in df.columns for m in [re.match(r'^dis_(?:what|code|when|eff|cont|sup)_(\d+)$', c)] if m]
+                or [0])
+    if n_rep:
+        c10_codes = df.get('c10', pd.Series(None, index=df.index)).map(
+            lambda x: [c for c in str(x).split() if c not in ('0', 'nan', 'None')] if pd.notna(x) else [])
+        texts = [[] for _ in range(len(df))]
+        for k in range(1, n_rep + 1):
+            code, when, eff = _rep('dis_code', k), _rep('dis_when', k), _rep('dis_eff', k)
+            cont, what, sup, sup_t = _rep('dis_cont', k), _rep('dis_what', k), _rep('dis_sup', k), _rep('dis_sup_time', k)
+            for j, i in enumerate(df.index):
+                cd = _code(code[i]) or (c10_codes[i][k - 1] if len(c10_codes[i]) >= k else None)
+                if not (cd or pd.notna(what[i])):
+                    continue
+                lab = C10_LABELS_BY_FORM['Launch 0'].get(cd, cd or 'Interruption')
+                bits = []
+                if pd.notna(when[i]) and str(when[i]).strip():
+                    bits.append(', '.join(DIS_WHEN.get(c, c) for c in str(when[i]).split()))
+                if pd.notna(eff[i]) and str(eff[i]).strip() and str(eff[i]).strip() != '0':
+                    bits.append('affected ' + ', '.join(DIS_EFFECT.get(c, c) for c in str(eff[i]).split() if c != '0'))
+                if _code(cont[i]):
+                    bits.append('marketer: ' + DIS_CONT.get(_code(cont[i]), str(cont[i])))
+                if _code(sup[i]) == '1':
+                    bits.append('supervisor informed' + (f' at {str(sup_t[i])[:5]}' if pd.notna(sup_t[i]) else ''))
+                elif _code(sup[i]) == '0':
+                    bits.append('supervisor NOT informed')
+                t = lab + (f" ({'; '.join(bits)})" if bits else '')
+                if pd.notna(what[i]) and str(what[i]).strip():
+                    t += f' — "{str(what[i]).strip()}"'
+                texts[j].append(t)
+        df['interruption_details'] = [' | '.join(t) or None for t in texts]
+    # What happened to the ride after the interruption(s)
+    stop = df.get('ride_stop', pd.Series(None, index=df.index)).map(_code)
+    df['ride_outcome'] = stop.map({'0': 'ride completed', '1': 'ride STOPPED before sign-ups (restart)',
+                                   '2': 'ride STOPPED after sign-ups (cancelled)'})
+
     # Interruption labels and "outside the E1's control", by form version
     def _c10(row_codes, src):
         key = 'Launch 0' if src == 'Launch 0' else 'old'
