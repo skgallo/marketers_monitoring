@@ -323,12 +323,20 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
 # Batch code comparison flags
 # ---------------------------------------------------------------------------
 
+def _parsed_frame(codes: pd.Series, prefix: str) -> pd.DataFrame:
+    """parse_batch_code() for every code, as columns with a prefix. Works for 0 rows too (when every form
+    is a test form, Series.apply(pd.Series) would return a Series and duplicate the code column)."""
+    keys = list(parse_batch_code(None).keys())
+    rows = [parse_batch_code(c) for c in codes]
+    return pd.DataFrame(rows, index=codes.index, columns=keys).add_prefix(prefix)
+
+
 def add_batch_code_flags(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # Parse planned and actual batch codes
-    p = df['batch_code'].apply(parse_batch_code).apply(pd.Series).add_prefix('p_')
-    a = df['actual_batch_code'].apply(parse_batch_code).apply(pd.Series).add_prefix('a_')
+    p = _parsed_frame(df['batch_code'], 'p_')
+    a = _parsed_frame(df['actual_batch_code'], 'a_')
     df = pd.concat([df, p, a], axis=1)
 
     has_actual = df['actual_batch_code'].notna()
@@ -758,8 +766,8 @@ def prepare_e4(raw: pd.DataFrame) -> pd.DataFrame:
             df[c] = None
         df[c] = [fix_batch_code(x, y) for x, y in zip(df[c], years)]
     df = df.rename(columns={'batch_code': 'actual_batch_code', 'batch_code_pre': 'batch_code'})
-    p = df['batch_code'].apply(parse_batch_code).apply(pd.Series).add_prefix('p_')
-    a = df['actual_batch_code'].apply(parse_batch_code).apply(pd.Series).add_prefix('a_')
+    p = _parsed_frame(df['batch_code'], 'p_')
+    a = _parsed_frame(df['actual_batch_code'], 'a_')
     df = pd.concat([df, p, a], axis=1)
 
     rt = df.get('role_type', pd.Series(None, index=df.index)).map(_code)
