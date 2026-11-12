@@ -211,6 +211,15 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
       - Rename: batch_code_pre → batch_code (planned); batch_code → actual_batch_code
     """
     df = df.copy()
+    # Same column name twice (e.g. stacked tabs, or a field published twice): keep one, first non-empty value
+    if df.columns.duplicated().any():
+        merged = {}
+        for c in dict.fromkeys(df.columns):
+            block = df.loc[:, df.columns == c]
+            merged[c] = block.iloc[:, 0] if block.shape[1] == 1 else block.astype(object).bfill(axis=1).iloc[:, 0]
+        df = pd.DataFrame(merged, index=df.index)
+    # The rename below must not create a duplicate 'actual_batch_code' / 'batch_code'
+    df = df.drop(columns=[c for c in ('actual_batch_code',) if c in df.columns and 'batch_code' in df.columns])
 
     # Each SurveyCTO form once: if publishing re-sent forms, keep the latest copy of each KEY
     if 'KEY' in df.columns:
@@ -434,8 +443,8 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     # signup_duration      = enumerator-RECORDED announcement/signup activity duration
     # announcement_duration = AUTOMATIC form-screen timing (b03→b05/b06 area)
     # Round to 6 dp for comparison; display layer rounds to 2 dp.
-    sig_dur = pd.to_numeric(df.get('signup_duration',       pd.Series(dtype=float)), errors='coerce').round(6)
-    ann_dur = pd.to_numeric(df.get('announcement_duration', pd.Series(dtype=float)), errors='coerce').round(6)
+    sig_dur = pd.to_numeric(df.get('signup_duration',       pd.Series(np.nan, index=df.index)), errors='coerce').round(6)
+    ann_dur = pd.to_numeric(df.get('announcement_duration', pd.Series(np.nan, index=df.index)), errors='coerce').round(6)
 
     # Overwrite with rounded versions so display layer gets consistent values
     df['signup_duration']       = sig_dur
@@ -466,7 +475,7 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
         return np.where(valid, condition.fillna(False).astype(int), pd.NA)
 
     # ── Flag 1: announcement start delay > 2 min ─────────────────────────────
-    delay = pd.to_numeric(df.get('announcement_start_delay', pd.Series(dtype=float)), errors='coerce')
+    delay = pd.to_numeric(df.get('announcement_start_delay', pd.Series(np.nan, index=df.index)), errors='coerce')
     df['flag_1_start_delay'] = flag_where(delay > DELAY_MAX_MIN, delay)
 
     # ── Flag 2: RECORDED ann./signup duration outside 8–12 min ───────────────
@@ -530,11 +539,11 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # ── Flag 6: short ride ────────────────────────────────────────────────────
-    ride_dur = pd.to_numeric(df.get('ride_duration', pd.Series(dtype=float)), errors='coerce')
+    ride_dur = pd.to_numeric(df.get('ride_duration', pd.Series(np.nan, index=df.index)), errors='coerce')
     df['flag_6_short_ride'] = flag_where(ride_dur < RIDE_MIN_MIN, ride_dur)
 
     # ── Flag 7: low signups ───────────────────────────────────────────────────
-    total_signups = pd.to_numeric(df.get('total_signups', pd.Series(dtype=float)), errors='coerce')
+    total_signups = pd.to_numeric(df.get('total_signups', pd.Series(np.nan, index=df.index)), errors='coerce')
     df['flag_7_low_signup'] = flag_where(total_signups < SIGNUP_MIN, total_signups)
 
     # ── Flag 8 (Nov form): marketer pitch started > 2 min after sign-up ended ─
