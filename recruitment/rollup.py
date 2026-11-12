@@ -277,6 +277,21 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
         if sp.get(i) in SP_WHEN_LABELS:
             bits.append(SP_WHEN_LABELS[sp.get(i)])
         built.append('; '.join(bits) or None)
+    # Column names published with their group path (e.g. "recruitment_form/enter_bus/ride_stop" or
+    # ".../dis_rep[2]/dis_what") are shortened to the field name (ride_stop, dis_what_2)
+    ren = {}
+    for c in df.columns:
+        s = str(c)
+        if '/' not in s and '[' not in s:
+            continue
+        last = re.split(r'[/]', s)[-1]
+        k = re.findall(r'dis_rep\[(\d+)\]', s)
+        base = re.sub(r'\[\d+\]$', '', last)
+        new_name = f"{base}_{k[-1]}" if k and base.startswith('dis_') else base
+        if new_name and new_name not in df.columns and new_name not in ren.values():
+            ren[c] = new_name
+    if ren:
+        df = df.rename(columns=ren)
     # Launch 0 form: interruption details are a repeat group, published as dis_*_1, dis_*_2, …
     if 'c10a' not in df.columns or not df['c10a'].notna().any():
         rep = sorted([c for c in df.columns if re.match(r'^dis_what(_\d+)?$', c)],

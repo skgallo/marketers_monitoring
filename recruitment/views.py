@@ -759,7 +759,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 checks.append(f"{int(n_man)} time(s) entered manually (forgot to tap)")
             if _txt(f.get("c10")) not in ("", "0") and _txt(f.get("c10_labels")):
                 checks.append("Interruption: " + (_txt(f.get("interruption_details")) or _txt(f.get("c10_labels")))
-                              + (f" → {_txt(f.get('ride_outcome'))}" if _txt(f.get("ride_outcome")) else ""))
+                              + (f" → {_txt(f.get('ride_outcome'))}" if _txt(f.get("ride_outcome")) else " → ride outcome not in the data"))
             if _code(f.get("other_speaker")) == "1":
                 checks.append("Someone else spoke to the passengers ("
                               + (", ".join(OTHER_WHO.get(c, c) for c in _txt(f.get("other_speaker_who")).split()) or "?") + ")")
@@ -2169,7 +2169,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             issues.append(f"{int(n_manual)} time{'s' if n_manual > 1 else ''} entered manually (forgot to tap)")
         if _txt(r.get("c10")) not in ("", "0") and _txt(r.get("c10_labels")):
             issues.append("Interruption: " + _txt(r.get("c10_labels"))
-                          + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else ""))
+                          + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else " → ride outcome not in the data (check the ride_stop column)"))
         stop = _code(r.get("ride_stop"))
         if stop in ("1", "2"):
             issues = [x for x in issues if not x.startswith(("Announcement + sign-up", "Pitch", "Ride ", "Pause"))]
@@ -2187,7 +2187,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             "Independent check": (verdicts or {}).get(_txt(r.get("form_id")), ("No second record", GRAY))[0],
             "Interruption — what happened": (
                 ((_txt(r.get("interruption_details")) or _txt(r.get("c10a")) or _txt(r.get("c10_labels")))
-                 + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else ""))
+                 + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else " → ride outcome not in the data (check the ride_stop column)"))
                 if _txt(r.get("c10")) not in ("", "0") else "—"),
             COL_DELAY2: fmt_val(_num(r.get("announcement_start_delay")) if not np.isnan(_num(r.get("announcement_start_delay"))) else du["delay"], 1),
             "Start check": start_txt,
