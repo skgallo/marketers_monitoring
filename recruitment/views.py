@@ -492,8 +492,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         sp = d[d["role"] == SUP].sort_values("submitted_at")
         # Launch 0 form: a ride stopped before any sign-up card was used is restarted on another bus with the
         # same batch code. The stopped attempt is kept for the record but doesn't count as a second E1 form.
-        stop_code = e1.get("ride_stop", pd.Series(dtype=str)).map(_code) if len(e1) else pd.Series(dtype=str)
-        stopped_before = e1[stop_code == "1"] if len(e1) else e1
+        stop_code = e1.get("ride_stop", pd.Series(None, index=e1.index, dtype=object)).map(_code)
+        stopped_before = e1[stop_code == "1"]
         cancelled = d[d.get("ride_stop", pd.Series(None, index=d.index)).map(_code) == "2"] if len(d) else d
         restart_note = []
         if len(stopped_before) and len(e1) > len(stopped_before):
@@ -946,7 +946,7 @@ def apply_live_corrections(raw: pd.DataFrame, reviews: pd.DataFrame | None):
             if val.lstrip("-").isdigit():
                 out.loc[m, "a02_1"] = val
             else:
-                same = raw.loc[raw.get("a02_1_lab", pd.Series(dtype=str)).map(_txt).str.lower() == val.lower(), "a02_1"]
+                same = raw.loc[raw.get("a02_1_lab", pd.Series(None, index=raw.index, dtype=object)).map(_txt).str.lower() == val.lower(), "a02_1"]
                 out.loc[m, "a02_1"] = _txt(same.iloc[0]) if len(same) else "-55"
                 out.loc[m, "a02_1_lab"] = val
         applied.append(f"form {_txt(c['form_id'])[-8:]}: {field} → {val}")
