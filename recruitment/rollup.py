@@ -68,9 +68,28 @@ TEST_USERNAMES = {'testing', 'test', 'skgallo@uchicago.edu'}   # drop these subm
 SUPERVISOR_LABELS_BY_FORM = {
     'Oct 2026': {'1': 'Fatu', '2': 'Joseph', '3': 'Kadie', '4': 'Sahr'},
     'Nov 2026': {'1': 'Daniella', '2': 'Fatu', '3': 'Joseph', '4': 'Kadie', '5': 'Sahr'},
+    'Launch 0': {'1': 'Daniella', '2': 'Fatu', '3': 'Joseph', '4': 'Kadie', '5': 'Sahr'},
 }
 SUPERVISOR_LABELS = SUPERVISOR_LABELS_BY_FORM['Oct 2026']   # kept for older code
-NOV_FORM_FROM_VERSION = 2611000000   # formdef_version of the first Nov form
+NOV_FORM_FROM_VERSION = 2611000000     # formdef_version of the first Nov form
+LAUNCH_FORM_FROM_VERSION = 2611120000  # formdef_version of the first Launch 0 form (rec_form_launch0)
+
+# Interruption list (c10) — the codes changed in the Launch 0 form
+C10_LABELS_BY_FORM = {
+    'old': {'0': 'None', '1': 'Bus/route interruption', '2': 'Passenger disruption/confrontation',
+            '3': 'Marketer/pitch interruption', '4': 'Team, equipment or materials',
+            '5': 'Recruitment paused/stopped', '-55': 'Other'},
+    'Launch 0': {'0': 'None', '1': 'Traffic or route diversion', '2': 'Bus breakdown', '3': 'Police stop',
+                 '4': 'Pharmacy Board intervention', '5': 'Marketer emergency', '6': 'Preacher or other speaker',
+                 '7': 'Passenger confrontation/repeated interruptions', '8': 'Passenger emergency',
+                 '9': 'Enumerator ill or emergency', '-55': 'Other'},
+}
+# Interruptions outside the enumerator's control (they explain a flagged value)
+C10_EXTERNAL_BY_FORM = {'old': {'1', '2', '3', '5'},
+                        'Launch 0': {'1', '2', '3', '4', '5', '6', '7', '8', '9'}}
+RIDE_STOP_LABELS = {'0': 'Carried on to the end', '1': 'Stopped before any sign-up card was written on',
+                    '2': 'Stopped after sign-up cards were written on'}
+PITCH_SHORT_LABELS = {'1': 'marketer simply marketed for a short time', '2': 'something cut the pitch short'}
 
 # Nov form: why the ride differs from the planned code (mm_reason) — only 1 or 4 can be saved
 MM_REASON_LABELS = {'1': 'Plan changed (ride really happened differently)',
@@ -88,7 +107,8 @@ def form_source_of(df: pd.DataFrame) -> pd.Series:
     idx = df.index
     src = df['form_source'] if 'form_source' in df.columns else pd.Series(None, index=idx, dtype=object)
     ver = pd.to_numeric(df.get('formdef_version', pd.Series(None, index=idx)), errors='coerce')
-    by_ver = pd.Series(np.where(ver >= NOV_FORM_FROM_VERSION, 'Nov 2026', 'Oct 2026'), index=idx)
+    by_ver = pd.Series(np.where(ver >= LAUNCH_FORM_FROM_VERSION, 'Launch 0',
+                                np.where(ver >= NOV_FORM_FROM_VERSION, 'Nov 2026', 'Oct 2026')), index=idx)
     return src.where(src.notna(), by_ver)
 
 
@@ -233,6 +253,30 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
         if sp.get(i) in SP_WHEN_LABELS:
             bits.append(SP_WHEN_LABELS[sp.get(i)])
         built.append('; '.join(bits) or None)
+    # Launch 0 form: interruption details are a repeat group, published as dis_*_1, dis_*_2, …
+    if 'c10a' not in df.columns or not df['c10a'].notna().any():
+        rep = sorted([c for c in df.columns if re.match(r'^dis_what(_\d+)?$', c)],
+                     key=lambda c: int(c.rsplit('_', 1)[-1]) if c.rsplit('_', 1)[-1].isdigit() else 0)
+        if rep:
+            df['c10a'] = [' | '.join(str(x).strip() for x in vals if pd.notna(x) and str(x).strip()) or None
+                          for vals in df[rep].values.tolist()]
+    # Interruption labels and "outside the E1's control", by form version
+    def _c10(row_codes, src):
+        key = 'Launch 0' if src == 'Launch 0' else 'old'
+        codes = [c for c in str(row_codes).split() if c and str(row_codes) not in ('nan', 'None')]
+        return ("; ".join(C10_LABELS_BY_FORM[key].get(c, c) for c in codes) or None,
+                bool(set(codes) & C10_EXTERNAL_BY_FORM[key]))
+    c10 = df.get('c10', pd.Series(None, index=df.index))
+    pairs = [_c10(c, s) if pd.notna(c) else (None, False) for c, s in zip(c10, df['form_source'])]
+    df['c10_labels'] = [p[0] for p in pairs]
+    df['c10_external'] = [p[1] for p in pairs]
+    # Launch 0 form: why a pitch was short (replaces part of the free-text explanation)
+    if 'pause_short_reason' in df.columns:
+        why = df['pause_short_reason'].map(_code).map(PITCH_SHORT_LABELS)
+        base = _first('pause_duration_explanation')
+        df['pause_duration_explanation'] = [
+            '; '.join(x for x in [w if isinstance(w, str) else None, (str(b).strip() if pd.notna(b) else None)] if x) or None
+            for w, b in zip(why, base)]
     df['announcement_delay_explanation'] = _first('announcement_delay_explanation').where(
         _first('announcement_delay_explanation').notna(), pd.Series(built, index=df.index))
 

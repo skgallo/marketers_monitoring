@@ -308,18 +308,35 @@ def load_reviews() -> pd.DataFrame:
 # the tables are written as tabs ("P · …") of a Google Sheet the service account can edit:
 # patterns_sheet_id in Secrets, or the HFC Sheet itself. File → Download → Excel gives the .xlsx.
 
+def _clean_sheet_id(x: str) -> str:
+    """Accept a bare ID or a full Google Sheets link (…/d/<ID>/edit…); strip spaces and quotes."""
+    x = str(x or "").strip().strip('"').strip("'")
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", x)
+    return m.group(1) if m else x
+
+
 def patterns_sheet_id() -> str:
     try:
-        return st.secrets.get("patterns_sheet_id") or _sheet_id()
+        sid = st.secrets.get("patterns_sheet_id")
     except Exception:
-        return _sheet_id()
+        sid = None
+    return _clean_sheet_id(sid) if sid else _clean_sheet_id(_sheet_id())
 
 
 def write_patterns(tables: dict, stamp: str) -> str:
     """Overwrite one tab per table (prefixed 'P · ') plus a 'P · README' with the time. Returns the Sheet URL."""
     import gspread
     sid = patterns_sheet_id()
-    sh = _sheets_client().open_by_key(sid)
+    try:
+        sh = _sheets_client().open_by_key(sid)
+    except Exception as e:
+        txt = str(e)
+        hint = (f"Google could not find a Sheet with ID '{sid[:6]}…{sid[-4:]}' that the dashboard can open. Check that "
+                "patterns_sheet_id (or submissions_url) is the Sheet's ID — the long part between /d/ and /edit — and "
+                "that the Sheet is shared with hfc-dashboard@recruitment-hfc-dashboard.iam.gserviceaccount.com as Editor.")
+        if "Page Not Found" in txt or "404" in txt or "not found" in txt.lower() or "PERMISSION" in txt.upper():
+            raise RuntimeError(hint) from None
+        raise
     existing = {ws.title: ws for ws in sh.worksheets()}
     items = [("README", pd.DataFrame({"Patterns snapshot": [f"Saved from the HFC dashboard on {stamp}",
                                                             "Each 'P · ' tab is overwritten on every save."]}))]

@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-07n"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-12"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -76,6 +76,8 @@ COMPLETION_LABELS = {
 from rollup import MM_REASON_LABELS
 CONF_ITEM_LABELS = {"date": "date", "team": "team", "marketer": "marketer", "route": "route",
                     "ride": "ride number", "pitch": "pitch type"}
+RIDE_STOP_TXT = {"1": "stopped before any sign-up card was used (restart needed)",
+                 "2": "STOPPED after sign-up cards were used — ride cancelled"}
 OTHER_WHEN = {"1": "before the announcement", "2": "during announcement/sign-up",
               "3": "during the pitch/pause", "4": "after the pitch/pause"}
 OTHER_WHO = {"1": "preacher", "2": "seller", "3": "passenger/driver/apprentice", "-55": "other"}
@@ -488,6 +490,15 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         d = by_eff.get(code, empty)                       # forms that describe this ride
         e1 = d[d["role"] == E1].sort_values("submitted_at")
         sp = d[d["role"] == SUP].sort_values("submitted_at")
+        # Launch 0 form: a ride stopped before any sign-up card was used is restarted on another bus with the
+        # same batch code. The stopped attempt is kept for the record but doesn't count as a second E1 form.
+        stop_code = e1.get("ride_stop", pd.Series(dtype=str)).map(_code) if len(e1) else pd.Series(dtype=str)
+        stopped_before = e1[stop_code == "1"] if len(e1) else e1
+        cancelled = d[d.get("ride_stop", pd.Series(None, index=d.index)).map(_code) == "2"] if len(d) else d
+        restart_note = []
+        if len(stopped_before) and len(e1) > len(stopped_before):
+            e1 = e1[~e1.index.isin(stopped_before.index)]
+            restart_note.append(f"{len(stopped_before)} earlier attempt(s) stopped before sign-ups; ride restarted")
         came_in = d[d["_misfiled"]]                       # belong here, filed under another code
         sel = by_sel.get(code, empty)
         went_out = sel[sel["_misfiled"]]                  # filed here, belong to another ride
@@ -513,6 +524,11 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
         mkt_spoke = [f for _, f in d.iterrows() if _code(f.get("s27")) == "0"]
         if mkt_spoke:
             parts.add("Marketer spoke in pause")
+        # Ride stopped: after sign-up cards were used (cancelled), or before them and not restarted yet
+        if len(cancelled):
+            parts.add("Ride stopped")
+        elif len(stopped_before) and not restart_note:      # stopped before cards and not restarted (yet)
+            parts.add("Ride stopped")
         if len(came_in):
             parts.add("Wrong code")
         if len(e1) > 1:
@@ -537,8 +553,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
 
         # Which issue parts produce which status
         tag_parts = {}
-        if parts & {"Other marketer", "Marketer spoke in pause"}:
-            tag_parts["Validity at risk"] = parts & {"Other marketer", "Marketer spoke in pause"}
+        if parts & {"Other marketer", "Marketer spoke in pause", "Ride stopped"}:
+            tag_parts["Validity at risk"] = parts & {"Other marketer", "Marketer spoke in pause", "Ride stopped"}
         if "Wrong code" in parts:
             tag_parts["Wrong code selected"] = {"Wrong code"}
         if parts & DESIGN_PARTS:
@@ -585,7 +601,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             review_status = "✓ Reviewed (" + " / ".join(kinds) + ")"
 
         # Code selection notes
-        notes = []
+        notes = list(restart_note)
         for _, f in came_in.iterrows():
             notes.append(f"{_role_short(f['role'])} form ({_txt(f['person'])}, team {_code(f.get('a02a_r'))} "
                          f"ride {_code(f.get('a04_r'))}) was filed under {_txt(f['batch_code'])}")
@@ -607,6 +623,17 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 part_text.setdefault(part, []).append(txt_)
         if unreported:
             part_text["Unreported change"] = unreported
+        if "Ride stopped" in parts:
+            txts = []
+            for _, f in (cancelled if len(cancelled) else stopped_before).iterrows():
+                t_ = f"{_role_short(f['role'])} form ({_txt(f['person'])}): " + RIDE_STOP_TXT.get(_code(f.get("ride_stop")), "ride stopped")
+                if _code(f.get("card_collect")) == "0":
+                    n_ = _txt(f.get("card_missing"))
+                    t_ += " — sign-up cards NOT all collected" + (f" (~{n_} missing)" if n_ else "")
+                if _txt(f.get("c10_labels")):
+                    t_ += f" ({_txt(f.get('c10_labels'))})"
+                txts.append(t_)
+            part_text["Ride stopped"] = txts
         if mkt_spoke:
             part_text["Marketer spoke in pause"] = [
                 "Supervisor: the marketer spoke or sold during the Sit down pause"
@@ -664,7 +691,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                                              if c[0] != "allowed" and c[2] not in resolved_parts]
                                             + (unreported if "Unreported change" not in resolved_parts else [])
                                             + (part_text.get("Other marketer", []) if "Other marketer" not in resolved_parts else [])
-                                            + (part_text.get("Marketer spoke in pause", []) if "Marketer spoke in pause" not in resolved_parts else [])))
+                                            + (part_text.get("Marketer spoke in pause", []) if "Marketer spoke in pause" not in resolved_parts else [])
+                                            + (part_text.get("Ride stopped", []) if "Ride stopped" not in resolved_parts else [])))
 
         if len(e1):
             names = _names(e1["person"])
@@ -726,6 +754,11 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                                  _parse_time(f.get("b05")) if pd.notna(_parse_time(f.get("b05"))) else _parse_time(f.get("b06")))
             if not np.isnan(gap_) and round(gap_, 1) > DELAY_MAX_MIN:
                 checks.append(f"Pitch/pause started {gap_:.1f} min after sign-up ended")
+            n_man = _num(f.get("tap_forgot_total"))
+            if not np.isnan(n_man) and n_man > 0:
+                checks.append(f"{int(n_man)} time(s) entered manually (forgot to tap)")
+            if _txt(f.get("c10")) not in ("", "0") and _txt(f.get("c10_labels")):
+                checks.append("Interruption: " + _txt(f.get("c10_labels")))
             if _code(f.get("other_speaker")) == "1":
                 checks.append("Someone else spoke to the passengers ("
                               + (", ".join(OTHER_WHO.get(c, c) for c in _txt(f.get("other_speaker_who")).split()) or "?") + ")")
@@ -1132,8 +1165,9 @@ def time_gaps(e1_row, sup_row) -> dict:
 
 def assess_issues(row) -> dict:
     """Which implementation values are flagged and whether each was explained."""
-    disruptions = set(_txt(row.get("c10")).split())
-    external = bool(disruptions & EXTERNAL_DISRUPTIONS)
+    ext = row.get("c10_external")
+    external = bool(ext) if ext is not None and not (isinstance(ext, float) and np.isnan(ext)) else \
+        bool(set(_txt(row.get("c10")).split()) & EXTERNAL_DISRUPTIONS)
     items, n_flag, n_expl = [], 0, 0
     for flag, label, reason_col in ISSUE_DEFS:
         if _num(row.get(flag)) == 1:
@@ -1208,7 +1242,7 @@ def fidelity_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
                                                            _txt(r.get("pitchpause_completed_why"))] if x) or "—",
             COL_SIGNUPS:           fmt_val(r.get("total_signups"), 0),
             "Signup reason":       _txt(r.get("final_comment_lowsignup")) or "—",
-            "Disruptions":         decode_c10(r.get("c10")),
+            "Disruptions":         _txt(r.get("c10_labels")) or decode_c10(r.get("c10")),
             "Disruption notes":    _txt(r.get("c10a")) or "—",
             "Pax Q1":              _txt(r.get("q00")) or "—",
             "Pax Q2":              _txt(r.get("q01")) or "—",
@@ -2037,6 +2071,7 @@ def _start_check(r) -> tuple[str, str]:
 
 
 CLOCK_PREFIX = "🕒 "
+COL_DELAY2 = f"Ride start → announcement (min, ≤{DELAY_MAX_MIN})"
 COL_ANN   = f"Announcement + sign-up ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_LAG   = "Ann. end → sign-up end (min)"
 COL_SGAP  = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
@@ -2126,6 +2161,16 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         if bad(ride, lo=RIDE_MIN_MIN):
             issues.append(f"Ride {ride:.1f} min")
         issues += [f"Order: {o}" for o in order]
+        # Launch 0 form: manual times, interruptions, stopped rides
+        n_manual = _num(r.get("tap_forgot_total"))
+        if not np.isnan(n_manual) and n_manual > 0:
+            issues.append(f"{int(n_manual)} time{'s' if n_manual > 1 else ''} entered manually (forgot to tap)")
+        if _txt(r.get("c10_labels")) and _txt(r.get("c10_labels")) != "None":
+            issues.append("Interruption: " + _txt(r.get("c10_labels")))
+        stop = _code(r.get("ride_stop"))
+        if stop in ("1", "2"):
+            issues = [x for x in issues if not x.startswith(("Announcement + sign-up", "Pitch", "Ride ", "Pause"))]
+            issues.insert(0, "RIDE STOPPED: " + RIDE_STOP_TXT[stop])
         if _code(r.get("other_marketer")) == "1":
             issues.insert(0, "ANOTHER MARKETER on the bus" + (f" ({OTHER_WHEN_TXT(r.get('other_marketer_when'))})"
                                                               if _txt(r.get("other_marketer_when")) else ""))
@@ -2137,6 +2182,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             "Enumerator 1": _txt(r["person"]),
             "Timeline issues": " · ".join(issues) or "None",
             "Independent check": (verdicts or {}).get(_txt(r.get("form_id")), ("No second record", GRAY))[0],
+            COL_DELAY2: fmt_val(_num(r.get("announcement_start_delay")) if not np.isnan(_num(r.get("announcement_start_delay"))) else du["delay"], 1),
             "Start check": start_txt,
             "Strategic point": {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—"),
             "Bus at start": BUS_FULLNESS.get(_code(r.get("b02a")), "—"),
@@ -2159,6 +2205,9 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         s["Independent check"] = (verdicts or {}).get(_txt(r.get("form_id")), ("", GRAY))[1]
         row["_check_ok"] = s["Independent check"] in (GREEN, GRAY)
         s["Start check"] = start_css
+        _d = _num(r.get("announcement_start_delay")) if not np.isnan(_num(r.get("announcement_start_delay"))) else du["delay"]
+        if not np.isnan(_d) and round(_d, 1) > DELAY_MAX_MIN:
+            s[COL_DELAY2] = start_css if start_css in (RED, AMBER) else ""   # justified delays aren't coloured
         if sp == "3":
             s["Strategic point"] = RED
         if bad(round(ann, 1) if not np.isnan(ann) else np.nan, ANN_DUR_MIN, ANN_DUR_MAX):
@@ -2432,7 +2481,7 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
         unmatched = pd.DataFrame()
     return t, css, unmatched
 
-def media_url(filename, form_id, server: str | None, surveycto_form: str = "rec_form_nov2026") -> str | None:
+def media_url(filename, form_id, server: str | None, surveycto_form: str = "rec_form_launch0") -> str | None:
     """
     Link to a photo/audio file of one submission, in the format SurveyCTO uses for
     attachments in its own exports (API v2). Opens in a browser that is logged in to
@@ -2449,7 +2498,7 @@ def media_url(filename, form_id, server: str | None, surveycto_form: str = "rec_
 
 def media_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
                 reviews: pd.DataFrame | None = None, server: str | None = None,
-                surveycto_form: str = "rec_form_nov2026") -> pd.DataFrame:
+                surveycto_form: str = "rec_form_launch0") -> pd.DataFrame:
     """One row per E1 form with links to its photos and audio audits (or file names if no server is set)."""
     d = subs[subs["role"] == E1]
     present = [(c, lbl) for c, lbl in MEDIA_FIELDS if c in d.columns and d[c].notna().any()]
@@ -2537,6 +2586,9 @@ def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             "bus_half": None if _code(r.get("b02a")) not in ("1", "2", "3", "4") else _code(r.get("b02a")) != "1",
             "seat": None if _code(r.get("apprentice_seat")) not in ("0", "1") else _code(r.get("apprentice_seat")) == "1",
             "other_mkt": None if _code(r.get("other_marketer")) not in ("0", "1") else _code(r.get("other_marketer")) == "1",
+            "tap_ok": None if np.isnan(_num(r.get("tap_forgot_total"))) else _num(r.get("tap_forgot_total")) == 0,
+            "stopped": _code(r.get("ride_stop")) in ("1", "2"),
+            "interrupted": None if not _txt(r.get("c10")) else _txt(r.get("c10")) != "0",
             "other_spk": None if _code(r.get("other_speaker")) not in ("0", "1") else _code(r.get("other_speaker")) == "1",
             # counted indicators (None = not assessed)
             "code_ok": not (sr.get("wrong_code", False) or decisions & {"Fix needed", "Fixed"}),
@@ -2551,13 +2603,23 @@ def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             "no_rec_err": None if not sr.get("supervised") else not sr.get("rec_err", False),
             "counts_ok": sr.get("counts_verified"),
         })
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        # a stopped ride isn't a complete ride: its durations don't go into the averages
+        for m in ["signups", "delay", "ann", "script", "lag", "gap", "pitch", "pause", "ride", "between"]:
+            if m in out.columns:
+                out.loc[out["stopped"], m] = np.nan
+        for m in ["ann_ok", "start_ok"]:
+            out[m] = out[m].astype(object)
+            out.loc[out["stopped"], m] = None
+    return out
 
 
 INDICATORS = [   # (column, label)
     ("code_ok",    "Correct batch code"),
     ("same_day",   "Sent same day"),
     ("order_ok",   "Times in logical order"),
+    ("tap_ok",     "Times tapped live"),
     ("indep_ok",   "Confirmed by E4/supervisor"),
     ("start_ok",   "Start on time / justified"),
     ("sp_ok",      "At/before strategic point"),
@@ -2706,6 +2768,8 @@ BALANCE_ROWS = [   # (column, label, kind)
     ("ann_ok",   f"Announcement + sign-up {ANN_DUR_MIN}–{ANN_DUR_MAX} min", "share"),
     ("seat",     "Apprentice gave up seat",           "share"),
     ("other_mkt", "Another marketer on the bus",      "share"),
+    ("interrupted", "Ride had an interruption",       "share"),
+    ("stopped",   "Ride stopped",                     "share"),
     ("other_spk", "Someone else spoke to passengers", "share"),
 ]
 BALANCE_MIN_N = 5          # rides per arm before a difference is coloured
@@ -2800,6 +2864,8 @@ COLUMN_HELP = {
                           "Allowed changes (team, marketer), changes you marked OK, and not-allowed changes the E1 "
                           "reported to the supervisor don't count against them.",
     "Sent same day": "The form was submitted on the day of the ride",
+    "Times tapped live": "All the times were recorded by tapping YES at the moment it happened — none entered "
+                         "manually afterwards ('I forgot to tap'). Launch form onwards.",
     "Times in logical order": "The times follow the order of the ride: ride start → announcement start → sign-up end "
                               "→ pitch/pause start → pitch/pause end → ride end. Not met if a later step is recorded "
                               "before an earlier one (e.g. pitch end before pitch start) — a sign of times entered "
@@ -2850,6 +2916,9 @@ COLUMN_HELP = {
     # ride timeline
     "Timeline issues": "Everything on this ride outside its target, in one line",
     "Independent check": "Comparison with the E4 (Script Checklist) and supervisor records of the same ride",
+    f"Ride start → announcement (min, ≤{DELAY_MAX_MIN})": "Minutes from the bus leaving the park (ride start, b02_r) to the "
+                                                          "start of the announcement (b03). Target: 2 or less, unless "
+                                                          "the E1 waited for a bus less than half full",
     "Start check": "Did the announcement start on time, or was the delay justified by a bus less than half full?",
     "Strategic point": "When the start was late: did the announcement begin before, at or after the route's "
                        "strategic point?",
