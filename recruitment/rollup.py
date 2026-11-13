@@ -292,6 +292,22 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
             ren[c] = new_name
     if ren:
         df = df.rename(columns=ren)
+    # Google Sheets turns a two-choice answer like "1 3" into a date (3 Jan 2026). Undo that for the
+    # multiple-choice columns (month = first code, day = second code).
+    SM_COLS = ('c10', 'conf_wrong', 's13', 'sup_time_mismatch_points', 'other_marketer_when', 'other_speaker_who',
+               'other_speaker_when')
+    def _undate(x):
+        s = str(x).strip()
+        m = re.match(r'^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T]00:00:00)?$', s)
+        if m:
+            return f"{int(m.group(2))} {int(m.group(3))}"
+        m = re.match(r'^(\d{1,2})/(\d{1,2})/\d{2,4}$', s)
+        if m:
+            return f"{int(m.group(1))} {int(m.group(2))}"
+        return x
+    for c in df.columns:
+        if c in SM_COLS or re.match(r'^dis_(?:when|eff)_\d+$', c):
+            df[c] = df[c].map(lambda x: _undate(x) if pd.notna(x) else x)
     # Launch 0 form: interruption details are a repeat group, published as dis_*_1, dis_*_2, …
     if 'c10a' not in df.columns or not df['c10a'].notna().any():
         rep = sorted([c for c in df.columns if re.match(r'^dis_what(_\d+)?$', c)],

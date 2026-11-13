@@ -759,7 +759,7 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                 checks.append(f"{int(n_man)} time(s) entered manually (forgot to tap)")
             if _txt(f.get("c10")) not in ("", "0") and _txt(f.get("c10_labels")):
                 checks.append("Interruption: " + (_txt(f.get("interruption_details")) or _txt(f.get("c10_labels")))
-                              + (f" → {_txt(f.get('ride_outcome'))}" if _txt(f.get("ride_outcome")) else " → ride outcome not in the data"))
+                              + (f" → {_txt(f.get('ride_outcome'))}" if _txt(f.get("ride_outcome")) else " → whether the ride stopped isn't in the Sheet"))
             if _code(f.get("other_speaker")) == "1":
                 checks.append("Someone else spoke to the passengers ("
                               + (", ".join(OTHER_WHO.get(c, c) for c in _txt(f.get("other_speaker_who")).split()) or "?") + ")")
@@ -2025,7 +2025,7 @@ def daily_message(rs: pd.DataFrame, person: str, day, sender: str = "") -> str:
 # ---------------------------------------------------------------------------
 # TAB 2 — Ride timeline and start checks (Nov form)
 # ---------------------------------------------------------------------------
-BUS_FULLNESS = {"1": "< half full", "2": "≥ half full", "3": "Full (seated)", "4": "Full + standing"}
+BUS_FULLNESS = {"1": "< half full", "2": "about half full", "3": "Full (seated)", "4": "Full + standing"}
 YESNO_SHORT = {"1": "Yes", "0": "No"}
 MEDIA_FIELDS = [   # (column in the data, label)
     ("signup_check",      "Sign-up photos"),
@@ -2052,7 +2052,9 @@ def _ann_signup(r) -> float:
 
 
 def _start_check(r) -> tuple[str, str]:
-    """(text, style) for 'did the announcement start when it should?'."""
+    """(text, style) for 'did the announcement start when it should?'.
+    Rule: start within 2 min of the ride start. If the bus was less than half full, the E1 may wait for it to fill,
+    but must start before (or at) the route's strategic point."""
     delay = _num(r.get("announcement_start_delay"))
     full = _code(r.get("b02a"))
     if np.isnan(delay):
@@ -2060,17 +2062,19 @@ def _start_check(r) -> tuple[str, str]:
     delay = round(delay, 1)                   # judged on the value shown (1 decimal)
     if delay <= DELAY_MAX_MIN:
         return f"On time ({delay:.1f} min)", GREEN
-    if full in ("2", "3", "4"):
+    sp = _code(r.get("sp_when"))
+    sp_txt = {"1": "started before the strategic point", "2": "started at the strategic point",
+              "3": "started AFTER the strategic point"}.get(sp, "")
+    if full in ("3", "4"):                    # bus full: the announcement should have started straight away
         why = _txt(r.get("gap_fullbus_why"))
-        return f"Waited {delay:.1f} min although bus {BUS_FULLNESS[full]}" + (f": {why}" if why else ""), RED
-    reason = _code(r.get("gap_notfull_reason"))
-    if full == "1" and reason == "1":
-        return f"Waited {delay:.1f} min: bus < half full (expected)", GREEN
-    if reason == "2":
-        oth = _txt(r.get("gap_notfull_other"))
-        return f"Waited {delay:.1f} min: other reason" + (f" ({oth})" if oth else ""), AMBER
+        return (f"Waited {delay:.1f} min although bus {BUS_FULLNESS[full]}" + (f" ({sp_txt})" if sp_txt else "")
+                + (f": {why}" if why else ""), RED)
+    if full in ("1", "2"):                    # half full or less: waiting for passengers is fine
+        return (f"Waited {delay:.1f} min for the bus to fill ({BUS_FULLNESS[full]}) — OK"
+                + (f"; {sp_txt}" if sp_txt else ""), GREEN)
+    if not full:
+        return f"Waited {delay:.1f} min; bus fullness not in the data", AMBER
     return f"Waited {delay:.1f} min, no reason recorded", RED
-
 
 CLOCK_PREFIX = "🕒 "
 COL_DELAY2 = f"Ride start → announcement (min, ≤{DELAY_MAX_MIN})"
@@ -2078,7 +2082,7 @@ COL_ANN   = f"Announcement + sign-up ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_LAG   = "Ann. end → sign-up end (min)"
 COL_SGAP  = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
 COL_PP    = "Pitch/pause (min)"
-COL_RIDE2 = f"Ride ({RIDE_MIN_MIN}+ min)"
+COL_RIDE2 = "Ride (min)"
 COL_PREV  = "Since team's previous ride (min)"
 
 
@@ -2160,8 +2164,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         pp_txt = _txt(r.get("pitch_pause_check"))      # treatment-specific rule (rollup.pitch_pause_check)
         if pp_txt:
             issues.append(pp_txt)
-        if bad(ride, lo=RIDE_MIN_MIN):
-            issues.append(f"Ride {ride:.1f} min")
+        # ride length depends on the route: shown in its column, not flagged as an issue
         issues += [f"Order: {o}" for o in order]
         # Launch 0 form: manual times, interruptions, stopped rides
         n_manual = _num(r.get("tap_forgot_total"))
@@ -2169,7 +2172,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             issues.append(f"{int(n_manual)} time{'s' if n_manual > 1 else ''} entered manually (forgot to tap)")
         if _txt(r.get("c10")) not in ("", "0") and _txt(r.get("c10_labels")):
             issues.append("Interruption: " + _txt(r.get("c10_labels"))
-                          + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else " → ride outcome not in the data (check the ride_stop column)"))
+                          + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else " → whether the ride stopped isn't in the Sheet (ride_stop not published)"))
         stop = _code(r.get("ride_stop"))
         if stop in ("1", "2"):
             issues = [x for x in issues if not x.startswith(("Announcement + sign-up", "Pitch", "Ride ", "Pause"))]
@@ -2187,7 +2190,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             "Independent check": (verdicts or {}).get(_txt(r.get("form_id")), ("No second record", GRAY))[0],
             "Interruption — what happened": (
                 ((_txt(r.get("interruption_details")) or _txt(r.get("c10a")) or _txt(r.get("c10_labels")))
-                 + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else " → ride outcome not in the data (check the ride_stop column)"))
+                 + (f" → {_txt(r.get('ride_outcome'))}" if _txt(r.get("ride_outcome")) else " → whether the ride stopped isn't in the Sheet (ride_stop not published)"))
                 if _txt(r.get("c10")) not in ("", "0") else "—"),
             COL_DELAY2: fmt_val(_num(r.get("announcement_start_delay")) if not np.isnan(_num(r.get("announcement_start_delay"))) else du["delay"], 1),
             "Start check": start_txt,
@@ -2226,7 +2229,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         if pp_txt:
             s[COL_PP] = RED
         if bad(ride, lo=RIDE_MIN_MIN):
-            s[COL_RIDE2] = RED
+            s[COL_RIDE2] = GRAY                 # reference only
         if not np.isnan(lag) and lag < -1:
             s[COL_LAG] = RED
         if order:
@@ -2258,7 +2261,7 @@ CHECK_POINTS = [("Ride start", "b02_r"), ("Ann. start", "b03"), ("Sign-up end", 
 DUR_LABELS = [("delay", f"Start delay (≤{DELAY_MAX_MIN})"), ("signup", "Ann.+sign-up (b03→b04)"),
               ("gap", f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN})"),
               ("pp", "Pitch/pause"),
-              ("ride", f"Ride ({RIDE_MIN_MIN}+)")]
+              ("ride", "Ride")]
 
 
 def _dur_flag(key, x) -> bool:
@@ -2270,7 +2273,7 @@ def _dur_flag(key, x) -> bool:
     if key == "pp":
         return abs(x - PITCH_TARGET_MIN) > PITCH_TOL_MIN
     if key == "ride":
-        return x < RIDE_MIN_MIN
+        return False                          # ride length depends on the route: never a target
     return False
 
 
