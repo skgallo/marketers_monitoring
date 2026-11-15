@@ -57,26 +57,32 @@ FORM_DEFAULTS = {
                              "44": "Fatorma Sheriff", "14": "Daniel T G Sesay"}},
     },
     "bnb_druginfo": {
+        # bnb_druginfo_form_launch0 — filled by the E4, twice per marketer per day (submission_no 1 and 2)
         "label": "BnB Drug Info",
-        "date_cols": ["date", "a01_r", "SubmissionDate"],
-        "batch_cols": ["batch_code_pre", "batch_code"],
-        "role_col": None,
-        "role_map": {},
-        "person_cols": {"E4": ["a02_4_lab", "e4_name", "enum_name", "enumerator"]},
-        "team_cols": ["a02a_r", "team"],
-        "marketer_cols": ["mkt_id", "a03_r", "marketer"],
+        "date_cols": ["date_key", "bc_date_key", "SubmissionDate"],
+        "batch_cols": ["batch_codes_today", "bc_first"],      # the day's planned codes; the first one gives the team
+        "role_col": "enumrole",
+        "role_map": {"4": "E4"},
+        "person_cols": {"E4": ["enumerator"]},
+        "other_cols": ["enum_oth"],
+        "team_cols": [],
+        "marketer_cols": ["bc_mkt_id", "a03_r"],
         "exclude": {},
+        "code_maps": {"E4": {"41": "Aminata Kamara", "42": "Davida A L Yambasu", "43": "Mamusu Bangura", "44": "Fatorma Sheriff", "14": "Daniel T G Sesay"}},
     },
     "bnb_dataentry": {
+        # bnb_dataentry_launch0 — one per ride from the E2 and one from the E3 (enumrole 2 / 3), entered after the ride
         "label": "BnB Data Entry",
-        "date_cols": ["a01_r", "date", "SubmissionDate"],
-        "batch_cols": ["batch_code_pre", "batch_code"],
-        "role_col": "enum_role",            # which enumerator entered it: 2 = E2, 3 = E3
-        "role_map": {"2": "E2", "3": "E3", "E2": "E2", "E3": "E3"},
-        "person_cols": {"E2": ["a02_2_lab", "enum_name"], "E3": ["a02_3_lab", "enum_name"]},
-        "team_cols": ["a02a_r", "team"],
-        "marketer_cols": [],
+        "date_cols": ["di_date_key"],                          # the RIDE date (entry can be the next day)
+        "batch_cols": ["batch_code", "ride_code"],
+        "role_col": "enumrole",
+        "role_map": {"2": "E2", "3": "E3"},
+        "person_cols": {"E2": ["enumerator"], "E3": ["enumerator"]},
+        "other_cols": ["enum_oth"],
+        "team_cols": ["team"],
+        "marketer_cols": ["mkt_id"],
         "exclude": {},
+        "code_maps": {"E2": {"21": "Celia A R King", "22": "Johnrietta R Sesay", "23": "Lahai Mustapha", "24": "Abdul Aziz Conteh", "25": "Ronald Deen", "26": "Folarin Joah", "27": "Wilfred EA Conteh", "1": "Daniella Mansaray"}, "E3": {"21": "Celia A R King", "22": "Johnrietta R Sesay", "23": "Lahai Mustapha", "24": "Abdul Aziz Conteh", "25": "Ronald Deen", "26": "Folarin Joah", "27": "Wilfred EA Conteh", "1": "Daniella Mansaray"}},
     },
 }
 FORM_ORDER = ["recruitment", "script", "bnb_druginfo", "bnb_dataentry"]
@@ -178,7 +184,7 @@ def submissions(raw: pd.DataFrame, form: str, cfg: dict, roster: pd.DataFrame) -
             df = df[~df[col].map(_code).isin(vals)]
     if df.empty:
         return pd.DataFrame(columns=out_cols)
-    code = _first_col(df, cfg["batch_cols"]).map(lambda x: str(x).strip() if pd.notna(x) else None)
+    code = _first_col(df, cfg["batch_cols"]).map(lambda x: str(x).split()[0].strip() if pd.notna(x) and str(x).split() else None)
     p = code.map(parse_code)
     date = _naive_dt(_first_col(df, cfg["date_cols"]))
     date = date.fillna(p.map(lambda d: d.get("date") if d else pd.NaT)).dt.normalize()
@@ -207,6 +213,10 @@ def submissions(raw: pd.DataFrame, form: str, cfg: dict, roster: pd.DataFrame) -
             val = cmap[_code(val)]
         elif val is not None and _code(val) in code_to_name:
             val = code_to_name[_code(val)]
+        if val is not None and _code(val) == "-55":
+            oth = next((str(df.at[i, c]).strip() for c in cfg.get("other_cols", []) if c in df.columns
+                        and pd.notna(df.at[i, c]) and str(df.at[i, c]).strip()), None)
+            val = oth or val
         if val is None and "username" in df.columns:
             val = str(df.at[i, "username"])
         person.append(val)
