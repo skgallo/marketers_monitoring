@@ -12,6 +12,7 @@ Uses the Recruitment app's Secrets (submissions_url, batch_codes_url, e4_url) pl
     script_url        = "…"      # Script Checklist data tab
     bnb_druginfo_url  = "…"      # BnB Drug Information Form data tab
     bnb_dataentry_url = "…"      # BnB Data Entry data tab
+    dataentry_url     = "…"      # Data Entry (sign-up cards) data tab — 27 per ride
     monitor_from      = "2026-11-12"   # optional
   Optional column overrides if a form uses different field names, e.g.
     [forms.bnb_dataentry]
@@ -92,10 +93,27 @@ def _save_fixes(rows: list) -> str | None:
         return str(e)
 
 
+def _rewrite_fixes(df: pd.DataFrame) -> str | None:
+    """Replace the whole fixes tab with `df` (used to edit or undo saved fixes)."""
+    ws = _fixes_ws(create=True)
+    if ws is None:
+        return st.session_state.get("fixes_error") or "No service account or roster_url in Secrets."
+    try:
+        cols = list(dict.fromkeys(FIX_COLS + [c for c in df.columns if c in FIX_COLS]))
+        body = df.reindex(columns=cols).fillna("").astype(str).values.tolist()
+        ws.clear()
+        ws.update(values=[cols] + body, range_name="A1")
+        return None
+    except Exception as e:
+        return str(e)
+
+
 # --------------------------------------------------------------------------- data
 def _read(url: str, name: str) -> pd.DataFrame:
     try:
         df = pd.read_csv(url, dtype=str)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()          # empty tab (e.g. no name fixes yet): nothing to read, not an error
     except Exception as e:
         st.warning(f"Could not read **{name}**: {e}. Check the link in Secrets and that the Sheet is shared "
                    "as 'Anyone with the link → Viewer'.")
@@ -146,6 +164,8 @@ if c2.button("🔄 Refresh"):
     st.rerun()
 
 roster, plan, subs, status = load_all()
+if status.get("dataentry") != "not connected":
+    F.TRACKED_ROLES.add("Data entry")      # data-entry people now have a form: ✓ / ✗ like everyone else
 try:
     start = pd.Timestamp(st.secrets.get("monitor_from", "2026-11-12"))
 except Exception:
@@ -228,14 +248,58 @@ with tab_day:
                     load_all.clear()
                     st.rerun()
 
+    with st.expander("✏️ Saved name fixes — change or undo"):
+        saved = _load_fixes()
+        if saved.empty or "KEY" not in saved.columns:
+            st.caption("No fixes saved yet.")
+        else:
+            saved = saved.reindex(columns=FIX_COLS).fillna("")
+            all_names = sorted(set(roster["name"]) | set(saved["name"]) - {""})
+            sv = saved.copy()
+            sv.insert(0, "Undo?", False)
+            new_sv = st.data_editor(
+                sv, hide_index=True, width="stretch", key="saved_fixes",
+                disabled=[c for c in sv.columns if c not in ("Undo?", "name")],
+                column_config={"Undo?": st.column_config.CheckboxColumn(help="Tick to delete this fix"),
+                               "name": st.column_config.SelectboxColumn("Correct name", options=all_names)})
+            st.caption("Change **Correct name**, or tick **Undo?** to remove a fix (the form goes back to the name "
+                       "picked on the phone). Then save.")
+            if st.button("💾 Save changes to fixes"):
+                keep = new_sv[~new_sv["Undo?"]].drop(columns="Undo?")
+                err = _rewrite_fixes(keep)
+                if err:
+                    st.error(f"Could not save: {err}")
+                else:
+                    st.success(f"Saved — {len(new_sv) - len(keep)} removed, {len(keep)} kept.")
+                    load_all.clear()
+                    st.rerun()
+
     st.markdown("#### Rides")
     st.caption("Which per-ride forms came in for each planned ride (matched by batch code).")
     tr, trc = F.day_rides(day, roster, plan, subs)
     show(tr, trc)
 
+    st.markdown("#### Sign-up card data entry")
+    if status.get("dataentry") == "not connected":
+        st.info("Data Entry (cards) form not connected yet — add `dataentry_url` to Secrets once it is published.")
+    else:
+        st.caption(f"Each planned ride should have {F.CARDS_PER_RIDE} Data Entry submissions (one per sign-up card), "
+                   "matched by batch code — whatever day they were entered. **Entry date check**: cards entered by someone "
+                   "who wasn't on the roster for data entry that day.")
+        tc, tcc = F.card_entry(plan, subs, day=day, roster=roster)
+        show(tc, tcc)
+        back, backc = F.card_entry(plan, subs, upto=today, roster=roster)
+        if not back.empty:
+            open_ = back["Status"] != "✓ complete"
+            with st.expander(f"All rides so far: {int(open_.sum())} of {len(back)} not complete"):
+                show(back[open_.values].reset_index(drop=True), backc[open_.values].reset_index(drop=True))
+
 with tab_att:
     st.caption("✓ = submitted at least one form that day · ✗ absent = on the roster but no form · "
-               "purple = worked but not on the roster.")
+               "purple = worked but not on the roster. **Field days** = days on the roster as E1–E4 / supervisor "
+               "with at least one form. **Data entry days** = days they entered sign-up cards (until the Data Entry "
+               "form is connected, past days on the roster for data entry). **Total** = days worked, either kind, "
+               "each day counted once.")
     sel = st.slider("Days", 1, len(days), min(14, len(days)), help="How many of the most recent days to show")
     tg, tgc = F.attendance_grid(roster, subs, days[-sel:], today)
     show(tg, tgc)

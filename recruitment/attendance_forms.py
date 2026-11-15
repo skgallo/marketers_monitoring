@@ -85,8 +85,25 @@ FORM_DEFAULTS = {
         "exclude": {},
         "code_maps": {"E2": {"21": "Celia A R King", "22": "Johnrietta R Sesay", "23": "Lahai Mustapha", "24": "Abdul Aziz Conteh", "25": "Ronald Deen", "26": "Folarin Joah", "27": "Wilfred EA Conteh", "1": "Daniella Mansaray"}, "E3": {"21": "Celia A R King", "22": "Johnrietta R Sesay", "23": "Lahai Mustapha", "24": "Abdul Aziz Conteh", "25": "Ronald Deen", "26": "Folarin Joah", "27": "Wilfred EA Conteh", "1": "Daniella Mansaray"}},
     },
+    "dataentry": {
+        # data_entry_launch0 — the sign-up card data entry: ONE submission per card, 27 cards per ride.
+        # Encrypted: publish only enumerator, other, starttime, batch_code, team (+ optional endtime, signup).
+        "label": "Data Entry (cards)",
+        "date_cols": ["starttime", "SubmissionDate"],          # the day the entry was DONE (attendance day)
+        "batch_cols": ["batch_code"],
+        "role_col": None,
+        "person_cols": {"Data entry": ["enumerator"]},
+        "other_cols": ["other"],
+        "team_cols": ["team"],
+        "marketer_cols": [],
+        "exclude": {},
+        "code_maps": {"Data entry": {"1": "John", "4": "Kadie", "5": "Sahr", "7": "Joseph", "8": "Emmanuel Bangura",
+                                     "9": "Davida A L Yambasu", "10": "Daniel T G Sesay", "11": "Kadija Esther Kamara",
+                                     "12": "Abdul Aziz Conteh"}},
+    },
 }
-FORM_ORDER = ["recruitment", "script", "bnb_druginfo", "bnb_dataentry"]
+FORM_ORDER = ["recruitment", "script", "bnb_druginfo", "bnb_dataentry", "dataentry"]
+CARDS_PER_RIDE = 27
 # who is expected to submit what (per ride unless noted)
 EXPECTED = {
     "E1": [("recruitment", "ride", 1)],
@@ -100,9 +117,13 @@ _CODE_RE = re.compile(r"^(\d{8})(\d)(\d+)([A-Z]{4})(\d+)([A-Z])$")
 
 
 # --------------------------------------------------------------------------- helpers
+NAME_ALIASES = {"kadie": "kadiatunabay", "kadienabay": "kadiatunabay"}   # nicknames used in the roster
+
+
 def norm_name(x) -> str:
-    """Name key: letters only, lower case ('Daniel T G Sesay' == 'daniel t.g. sesay')."""
-    return re.sub(r"[^a-z]", "", str(x).lower()) if x is not None and str(x) not in ("", "nan", "None") else ""
+    """Name key: letters only, lower case ('Daniel T G Sesay' == 'daniel t.g. sesay'); nicknames mapped."""
+    k = re.sub(r"[^a-z]", "", str(x).lower()) if x is not None and str(x) not in ("", "nan", "None") else ""
+    return NAME_ALIASES.get(k, k)
 
 
 def _code(v):
@@ -197,7 +218,7 @@ def submissions(raw: pd.DataFrame, form: str, cfg: dict, roster: pd.DataFrame) -
     date = date.fillna(sub.dt.normalize())
     team = _first_col(df, cfg["team_cols"]).map(_code)
     team = team.where(team.notna(), p.map(lambda d: d.get("team") if d else None))
-    if cfg.get("role_col") and cfg["role_col"] in df.columns:
+    if cfg.get("role_col") and cfg["role_col"] in df.columns:  # no role_col → the form's only role
         role = df[cfg["role_col"]].map(_code).map(cfg["role_map"])
     else:
         role = pd.Series(next(iter(cfg["person_cols"])), index=df.index)
@@ -372,7 +393,7 @@ def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=
     rows, sty = [], []
     for _, p in people.iterrows():
         row, s = {"Name": p["name"]}, {"Name": ""}
-        n_present = n_rostered = 0
+        n_present = n_rostered = n_entry = n_total = 0
         for d in days:
             col = pd.Timestamp(d).strftime("%a %d %b")
             r_pd = roster[(roster["key"] == p["key"]) & (roster["date"] == d)]
@@ -380,7 +401,16 @@ def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=
             tracked = r_pd["role"].isin(TRACKED_ROLES).any()
             worked = ((subs["key"] == p["key"]) & (subs["date"] == d)).any()
             future = today is not None and pd.Timestamp(d) > pd.Timestamp(today)
-            n_rostered += rostered and tracked and not future; n_present += worked and rostered
+            field_r = rostered and r_pd["role"].map(lambda x: x in TRACKED_ROLES and x != "Data entry").any()
+            field_w = ((subs["key"] == p["key"]) & (subs["date"] == d) & (subs["form"] != "dataentry")).any()
+            n_rostered += field_r and not future; n_present += field_w and field_r
+            as_entry = rostered and (r_pd["role"] == "Data entry").any()
+            if "Data entry" in TRACKED_ROLES:    # card form connected: count days they actually entered cards
+                entry_day = as_entry and ((subs["key"] == p["key"]) & (subs["date"] == d) & (subs["form"] == "dataentry")).any()
+            else:                                # not connected yet: the roster is taken as attendance
+                entry_day = as_entry and not future
+            n_entry += entry_day
+            n_total += bool(worked or entry_day)
             if worked:
                 row[col] = "✓" if rostered else "✓ (not rostered)"
                 s[col] = "background-color:#D9F2E6" if rostered else "background-color:#EEEDFE"
@@ -392,8 +422,12 @@ def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=
                 row[col], s[col] = "✗ absent", "background-color:#FADBD3"
             else:
                 row[col], s[col] = "", ""
-        row["Days worked / rostered"] = f"{n_present}/{n_rostered}" if n_rostered else "—"
-        s["Days worked / rostered"] = ""
+        row["Field days (worked / rostered)"] = f"{n_present}/{n_rostered}" if n_rostered else "—"
+        row["Data entry days"] = str(n_entry) if n_entry else "—"
+        row["Total days worked"] = str(n_total)
+        for c in ("Field days (worked / rostered)", "Data entry days"):
+            s[c] = ""
+        s["Total days worked"] = "font-weight:600"
         rows.append(row); sty.append(s)
     t = pd.DataFrame(rows)
     return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
@@ -448,3 +482,50 @@ def name_checks(day, roster: pd.DataFrame, subs: pd.DataFrame) -> pd.DataFrame:
                      "Filed under": x["person"], "Problem": why,
                      "Probably": ", ".join(cand["name"]) or "—", "KEY": x.get("form_key") or "—"})
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- sign-up card data entry
+def card_entry(plan: pd.DataFrame, subs: pd.DataFrame, upto=None, day=None, roster=None) -> tuple:
+    """One row per planned ride (on `day`, or every ride up to `upto`): sign-up cards entered / 27,
+    who entered them and when. Matched by batch code, whatever day the entry was done. Returns (table, css)."""
+    p = plan.copy()
+    if day is not None:
+        p = p[p["date"] == pd.Timestamp(day).normalize()]
+    elif upto is not None:
+        p = p[p["date"] <= pd.Timestamp(upto)]
+    if p.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    de = subs[subs["form"] == "dataentry"]
+    p["_r"] = pd.to_numeric(p["ride"], errors="coerce")
+    rows, sty = [], []
+    for _, pr in p.sort_values(["date", "team", "_r"]).iterrows():
+        m = de[de["code"] == pr["code"]]
+        n = len(m)
+        row = {"Ride date": pr["date"].strftime("%a %d %b"), "Team": pr["team"], "Ride": pr["ride"],
+               "Batch code": pr["code"], "Cards entered": f"{n}/{CARDS_PER_RIDE}",
+               "Entered by": ", ".join(dict.fromkeys(str(x) for x in m["person"] if x)) or "—",
+               "Entered on": ", ".join(dict.fromkeys(d.strftime("%d %b") for d in m["date"].dropna())) or "—"}
+        # date check: was each card entered on a day the person was on the roster for data entry?
+        off = []
+        if roster is not None and not roster.empty and n:
+            de_r = roster[roster["role"] == "Data entry"]
+            sched = set(zip(de_r["key"], de_r["date"]))
+            for (k, d), g in m.groupby(["key", "date"]):
+                if (k, d) not in sched:
+                    off.append(f"{g['person'].iloc[0]} {d.strftime('%d %b')} ({len(g)})")
+        row["Entry date check"] = ("✓ on scheduled days" if not off else "Not scheduled: " + "; ".join(off)) if n else "—"
+        if n == CARDS_PER_RIDE:
+            status, css = "✓ complete", "color:#1E7B34;font-weight:600"
+        elif n > CARDS_PER_RIDE:
+            status, css = f"{n - CARDS_PER_RIDE} too many — duplicates?", "color:#B26B00;font-weight:600"
+        elif n == 0:
+            status, css = "not started", "color:#CC0000;font-weight:600"
+        else:
+            status, css = f"{CARDS_PER_RIDE - n} missing", "color:#B26B00;font-weight:600"
+        row["Status"] = status
+        s = {k: "" for k in row}
+        s["Cards entered"] = s["Status"] = css
+        s["Entry date check"] = ("color:#B26B00;font-weight:600" if off else "color:#1E7B34") if n else "color:#888888"
+        rows.append(row); sty.append(s)
+    t = pd.DataFrame(rows)
+    return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
