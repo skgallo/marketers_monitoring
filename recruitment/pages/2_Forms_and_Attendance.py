@@ -92,6 +92,12 @@ try:
     start = pd.Timestamp(st.secrets.get("monitor_from", "2026-11-12"))
 except Exception:
     start = pd.Timestamp("2026-11-12")
+subs = subs.copy()
+subs["date"] = pd.to_datetime(subs["date"], errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
+roster = roster.copy()
+roster["date"] = pd.to_datetime(roster["date"], errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
+plan = plan.copy()
+plan["date"] = pd.to_datetime(plan["date"], errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
 subs = subs[subs["date"].isna() | (subs["date"] >= start)]
 
 st.caption("Data sources: " + " · ".join(f"{F.FORM_DEFAULTS[f]['label']}: {status.get(f, '—')}" for f in F.FORM_ORDER)

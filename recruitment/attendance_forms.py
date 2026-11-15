@@ -115,6 +115,14 @@ def parse_code(code) -> dict:
             "route": route, "ride": ride, "treatment": trt}
 
 
+def _naive_dt(s) -> pd.Series:
+    """Parse dates/times from any source into plain (time-zone-free) timestamps, so they compare cleanly.
+    Text with a time zone is converted to UTC (Sierra Leone time) first."""
+    s = pd.Series(s)
+    out = pd.to_datetime(s, format="mixed", errors="coerce", utc=True)
+    return out.dt.tz_localize(None)
+
+
 def _first_col(df: pd.DataFrame, cols: list):
     for c in cols:
         if c in df.columns and df[c].notna().any():
@@ -140,7 +148,7 @@ def clean_roster(roster: pd.DataFrame) -> pd.DataFrame:
     for c in ["date", "team", "role", "name", "code"]:
         if c not in r.columns:
             r[c] = None
-    r["date"] = pd.to_datetime(r["date"], format="mixed", dayfirst=True, errors="coerce").dt.normalize()
+    r["date"] = pd.to_datetime(r["date"], format="mixed", dayfirst=True, errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
     r["team"] = r["team"].map(lambda x: re.sub(r"\D", "", str(x)) if pd.notna(x) else "")
     def _role(x):
         s = str(x).strip()
@@ -172,9 +180,9 @@ def submissions(raw: pd.DataFrame, form: str, cfg: dict, roster: pd.DataFrame) -
         return pd.DataFrame(columns=out_cols)
     code = _first_col(df, cfg["batch_cols"]).map(lambda x: str(x).strip() if pd.notna(x) else None)
     p = code.map(parse_code)
-    date = pd.to_datetime(_first_col(df, cfg["date_cols"]), format="mixed", errors="coerce")
+    date = _naive_dt(_first_col(df, cfg["date_cols"]))
     date = date.fillna(p.map(lambda d: d.get("date") if d else pd.NaT)).dt.normalize()
-    sub = pd.to_datetime(df.get("SubmissionDate", pd.Series(None, index=df.index)), format="mixed", errors="coerce")
+    sub = _naive_dt(df.get("SubmissionDate", pd.Series(None, index=df.index)))
     date = date.fillna(sub.dt.normalize())
     team = _first_col(df, cfg["team_cols"]).map(_code)
     team = team.where(team.notna(), p.map(lambda d: d.get("team") if d else None))
