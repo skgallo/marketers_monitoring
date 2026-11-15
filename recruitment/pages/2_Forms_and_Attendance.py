@@ -98,6 +98,7 @@ roster = roster.copy()
 roster["date"] = pd.to_datetime(roster["date"], errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
 plan = plan.copy()
 plan["date"] = pd.to_datetime(plan["date"], errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
+roster = F.fix_roster_dates(roster, plan)
 subs = subs[subs["date"].isna() | (subs["date"] >= start)]
 
 st.caption("Data sources: " + " · ".join(f"{F.FORM_DEFAULTS[f]['label']}: {status.get(f, '—')}" for f in F.FORM_ORDER)
@@ -117,13 +118,13 @@ tab_day, tab_att = st.tabs(["Day", "Attendance"])
 with tab_day:
     day = st.selectbox("Day", days, index=default, format_func=lambda d: pd.Timestamp(d).strftime("%a %d %b %Y")
                        + (" (today)" if pd.Timestamp(d) == today else ""))
-    t, css = F.day_people(day, roster, plan, subs)
+    t, css = F.day_people(day, roster, plan, subs, today)
     if not t.empty:
         rostered = t[t["Attendance"] != "Not on roster"]
         k = st.columns(4)
         k[0].metric("Rostered", len(rostered))
         k[1].metric("Present", int((rostered["Attendance"] == "Present").sum()))
-        k[2].metric("Absent / no forms", int((rostered["Attendance"] != "Present").sum()))
+        k[2].metric("Absent / no forms", int((rostered["Attendance"] == "Absent / no forms").sum()))
         k[3].metric("Still missing forms", int(rostered["All forms in"].str.contains("missing").sum()))
     st.markdown("#### People")
     st.caption("Each form: submitted / expected. Expected per day — Recruitment: 1 per ride (E1) · Script Checklist: "
@@ -140,7 +141,7 @@ with tab_att:
     st.caption("✓ = submitted at least one form that day · ✗ absent = on the roster but no form · "
                "purple = worked but not on the roster.")
     sel = st.slider("Days", 1, len(days), min(14, len(days)), help="How many of the most recent days to show")
-    tg, tgc = F.attendance_grid(roster, subs, days[-sel:])
+    tg, tgc = F.attendance_grid(roster, subs, days[-sel:], today)
     show(tg, tgc)
     st.download_button("⬇ Download attendance (CSV)", tg.to_csv(index=False).encode("utf-8"),
                        file_name="attendance.csv", mime="text/csv")

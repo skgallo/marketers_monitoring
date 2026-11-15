@@ -37,7 +37,8 @@ FORM_DEFAULTS = {
         "team_cols": ["a02a_r"],
         "marketer_cols": [],
         "exclude": {},
-        "code_maps": {"Supervisor": {"1": "Daniella", "2": "Fatu", "3": "Joseph", "4": "Kadie", "5": "Sahr"},
+        "code_maps": {"Supervisor": {"1": "Daniella Mansaray", "2": "Fatu Conteh", "3": "Joseph Samuels",
+                                     "4": "Kadiatu Nabay", "5": "Sahr Fasuluku"},
                       "E1": {"11": "Misheal Sellu", "12": "Cecil Massaquoi", "13": "Kadija Esther Kamara",
                              "14": "Daniel T G Sesay", "44": "Fatorma Sheriff"}},
     },
@@ -93,6 +94,7 @@ EXPECTED = {
     "E3": [("bnb_dataentry", "ride", 1)],
     "E4": [("script", "ride", 1), ("bnb_druginfo", "marketer", 2)],
 }
+TRACKED_ROLES = set(EXPECTED) | {"Supervisor"}   # roles that submit a form we read
 TEST_USERNAMES = {"testing", "test", "skgallo@uchicago.edu"}
 _CODE_RE = re.compile(r"^(\d{8})(\d)(\d+)([A-Z]{4})(\d+)([A-Z])$")
 
@@ -250,7 +252,7 @@ def expected_for(person_row, plan_day: pd.DataFrame) -> dict:
     return exp
 
 
-def day_people(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame):
+def day_people(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame, today=None):
     """One row per person on `day`: attendance and submitted / expected for each form. Returns (table, css)."""
     day = pd.Timestamp(day).normalize()
     r_day = roster[roster["date"] == day]
@@ -277,8 +279,12 @@ def day_people(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame
                 row[lbl] = str(got) if got else "—"
                 s[lbl] = "" if got else "color:#888888"
         worked = len(mine) > 0
-        row["Attendance"] = "Present" if worked else "Absent / no forms"
-        s["Attendance"] = "color:#1E7B34;font-weight:600" if worked else "color:#CC0000;font-weight:600"
+        future = today is not None and day > pd.Timestamp(today)
+        tracked = pr["role"] in TRACKED_ROLES
+        row["Attendance"] = ("Present" if worked else "Scheduled" if future
+                             else "Absent / no forms" if tracked else "Not tracked (no form)")
+        s["Attendance"] = ("color:#1E7B34;font-weight:600" if worked else
+                           "color:#CC0000;font-weight:600" if (tracked and not future) else "color:#888888")
         last = mine["submitted_at"].max()
         row["Last form"] = last.strftime("%H:%M") if pd.notna(last) else "—"
         row["All forms in"] = ("✓" if total_got >= total_exp else f"{total_exp - total_got} missing") if total_exp else "—"
@@ -334,7 +340,26 @@ def day_rides(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame)
     return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
 
 
-def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list):
+def fix_roster_dates(roster: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
+    """Google Sheets can read 12/11/2026 as 11 Dec. If a roster date isn't a planned day but the same date with
+    day and month swapped is, use the swapped one."""
+    if roster is None or roster.empty or plan is None or plan.empty:
+        return roster
+    planned = set(plan["date"].dropna())
+    r = roster.copy()
+    def fix(d):
+        if pd.isna(d) or d in planned or d.day > 12:
+            return d
+        try:
+            sw = pd.Timestamp(year=d.year, month=d.day, day=d.month)
+        except ValueError:
+            return d
+        return sw if sw in planned else d
+    r["date"] = r["date"].map(fix)
+    return r
+
+
+def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=None):
     """Person × day: Present (submitted something) / Absent (rostered, nothing) / — (not rostered).
     Returns (table, css)."""
     people = roster.drop_duplicates("key")[["key", "name"]]
@@ -346,12 +371,19 @@ def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list):
         n_present = n_rostered = 0
         for d in days:
             col = pd.Timestamp(d).strftime("%a %d %b")
-            rostered = ((roster["key"] == p["key"]) & (roster["date"] == d)).any()
+            r_pd = roster[(roster["key"] == p["key"]) & (roster["date"] == d)]
+            rostered = not r_pd.empty
+            tracked = r_pd["role"].isin(TRACKED_ROLES).any()
             worked = ((subs["key"] == p["key"]) & (subs["date"] == d)).any()
-            n_rostered += rostered; n_present += worked and rostered
+            future = today is not None and pd.Timestamp(d) > pd.Timestamp(today)
+            n_rostered += rostered and tracked and not future; n_present += worked and rostered
             if worked:
                 row[col] = "✓" if rostered else "✓ (not rostered)"
                 s[col] = "background-color:#D9F2E6" if rostered else "background-color:#EEEDFE"
+            elif rostered and today is not None and pd.Timestamp(d) > pd.Timestamp(today):
+                row[col], s[col] = "scheduled", "color:#888888"
+            elif rostered and not tracked:
+                row[col], s[col] = "scheduled (" + ", ".join(r_pd["role"].unique()) + ", no form)", "color:#888888"
             elif rostered:
                 row[col], s[col] = "✗ absent", "background-color:#FADBD3"
             else:
