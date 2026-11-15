@@ -69,7 +69,10 @@ def load_all():
         status[f] = f"{len(s)} forms"
         parts.append(s)
     subs = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
-        columns=["form", "date", "code", "team", "role", "person", "key", "submitted_at", "marketer"])
+        columns=["form", "date", "code", "team", "role", "person", "key", "submitted_at", "marketer", "form_key"])
+    fixes = _read(get("fixes_url"), "fixes") if get("fixes_url") else pd.DataFrame()
+    subs = F.apply_fixes(subs, fixes, roster)
+    status["fixes"] = f"{int(subs['fixed_from'].notna().sum())} forms" if get("fixes_url") else "not connected"
     return roster, plan, subs, status
 
 
@@ -102,7 +105,7 @@ roster = F.fix_roster_dates(roster, plan)
 subs = subs[subs["date"].isna() | (subs["date"] >= start)]
 
 st.caption("Data sources: " + " · ".join(f"{F.FORM_DEFAULTS[f]['label']}: {status.get(f, '—')}" for f in F.FORM_ORDER)
-           + f" · Roster: {len(roster)} rows · Planned rides: {len(plan)}")
+           + f" · Name fixes: {status.get('fixes', '—')} · Roster: {len(roster)} rows · Planned rides: {len(plan)}")
 
 days = sorted(set(roster["date"].dropna()) | set(plan["date"].dropna()) | set(subs["date"].dropna()))
 days = [d for d in days if d >= start]
@@ -131,6 +134,17 @@ with tab_day:
                "1 per ride (E4) · BnB Drug Info: 2 per marketer (E4) · BnB Data Entry: 1 per ride each (E2, E3). "
                "🟢 complete · 🟠 some missing · 🔴 none yet · purple = submitted but not on the roster.")
     show(t, css)
+
+    nc = F.name_checks(day, roster, subs)
+    st.markdown("#### Check names")
+    if nc.empty:
+        st.caption("✓ Every form is filed under someone rostered on that team today.")
+    else:
+        st.warning(f"{len(nc)} form(s) filed under a name that doesn't match today's roster — usually the wrong "
+                   "name was picked on the phone. 'Probably' = who is rostered with that role on that team.")
+        st.dataframe(nc, hide_index=True, width="stretch")
+        st.caption("To correct: in the roster Sheet's **fixes** tab add a row with the form's `KEY` and the right "
+                   "`name`, then press 🔄 Refresh. (Fix the SurveyCTO data in cleaning too.)")
 
     st.markdown("#### Rides")
     st.caption("Which per-ride forms came in for each planned ride (matched by batch code).")

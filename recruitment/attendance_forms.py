@@ -156,7 +156,10 @@ def clean_roster(roster: pd.DataFrame) -> pd.DataFrame:
     for c in ["date", "team", "role", "name", "code"]:
         if c not in r.columns:
             r[c] = None
-    r["date"] = pd.to_datetime(r["date"], format="mixed", dayfirst=True, errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
+    # ISO dates (2026-11-12) first: with dayfirst=True they would be misread as 11 Dec
+    iso = pd.to_datetime(r["date"], format="ISO8601", errors="coerce", utc=True)
+    other = pd.to_datetime(r["date"], format="mixed", dayfirst=True, errors="coerce", utc=True)
+    r["date"] = iso.fillna(other).dt.tz_localize(None).dt.normalize()
     r["team"] = r["team"].map(lambda x: re.sub(r"\D", "", str(x)) if pd.notna(x) else "")
     def _role(x):
         s = str(x).strip()
@@ -226,6 +229,7 @@ def submissions(raw: pd.DataFrame, form: str, cfg: dict, roster: pd.DataFrame) -
     mkt = mkt.where(mkt.notna(), p.map(lambda d: d.get("mkt_id") if d else None))
     out = pd.DataFrame({"form": form, "date": date, "code": code, "team": team, "role": role,
                         "person": person, "submitted_at": sub, "marketer": mkt}, index=df.index)
+    out["form_key"] = df["KEY"].values if "KEY" in df.columns else None
     out["key"] = out["person"].map(norm_name)
     # match short names to the roster ('Fatu' → 'Fatu Conteh') when the match is unique
     if roster is not None and not roster.empty:
@@ -393,3 +397,54 @@ def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=
         rows.append(row); sty.append(s)
     t = pd.DataFrame(rows)
     return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
+
+
+# --------------------------------------------------------------------------- name fixes
+def apply_fixes(subs: pd.DataFrame, fixes: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    """Fixes tab (KEY, name): the form with that SurveyCTO KEY was filled by `name`, whatever code was chosen."""
+    s = subs.copy()
+    s["fixed_from"] = None
+    if fixes is None or fixes.empty or "form_key" not in s.columns:
+        return s
+    fx = fixes.copy()
+    fx.columns = [str(c).strip().lower() for c in fx.columns]
+    if "key" not in fx.columns or "name" not in fx.columns:
+        return s
+    fx = fx.dropna(subset=["key", "name"])
+    m = dict(zip(fx["key"].astype(str).str.strip(), fx["name"].astype(str).str.strip()))
+    rkeys = set(roster["key"]) if roster is not None and not roster.empty else set()
+    def rk(name):
+        k = norm_name(name)
+        if k in rkeys:
+            return k
+        hits = [x for x in rkeys if x.startswith(k) or k.startswith(x)]
+        return hits[0] if len(hits) == 1 else k
+    hit = s["form_key"].astype(str).str.strip().isin(m)
+    for i in s.index[hit]:
+        new = m[str(s.at[i, "form_key"]).strip()]
+        s.at[i, "fixed_from"] = s.at[i, "person"]
+        s.at[i, "person"] = new
+        s.at[i, "key"] = rk(new)
+    return s
+
+
+def name_checks(day, roster: pd.DataFrame, subs: pd.DataFrame) -> pd.DataFrame:
+    """Forms on `day` filed under someone who is not rostered that day, or rostered on a different team.
+    'Probably' = the person rostered that day with the same role on the form's team."""
+    day = pd.Timestamp(day).normalize()
+    r_day = roster[roster["date"] == day]
+    s_day = subs[(subs["date"] == day) & (subs["key"] != "")]
+    rows = []
+    for _, x in s_day.iterrows():
+        mine = r_day[r_day["key"] == x["key"]]
+        teams = set(mine["team"]) - {""}
+        if not mine.empty and (not x["team"] or not teams or x["team"] in teams):
+            continue
+        why = "Not on today's roster" if mine.empty else f"Rostered on team {', '.join(sorted(teams))}"
+        cand = r_day[(r_day["team"] == x["team"]) & (r_day["role"] == x["role"])] if x["team"] else r_day.iloc[0:0]
+        rows.append({"Form": FORM_DEFAULTS[x["form"]]["label"], "Team on form": x["team"] or "—",
+                     "Marketer": x.get("marketer") or "—",
+                     "Submitted": x["submitted_at"].strftime("%H:%M") if pd.notna(x["submitted_at"]) else "—",
+                     "Filed under": x["person"], "Problem": why,
+                     "Probably": ", ".join(cand["name"]) or "—", "KEY": x.get("form_key") or "—"})
+    return pd.DataFrame(rows)
