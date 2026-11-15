@@ -36,6 +36,62 @@ st.set_page_config(page_title="Forms and Attendance", page_icon="🗂️", layou
 require_password()          # same password as the Recruitment HFC page (shared session)
 
 
+# --------------------------------------------------------------------------- name fixes (fixes tab in the roster Sheet)
+FIX_COLS = ["KEY", "name", "filed_under", "form", "date", "saved_at"]
+
+
+def _roster_sheet_id():
+    import re
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", str(st.secrets.get("roster_url", "")))
+    return m.group(1) if m else None
+
+
+def _fixes_ws(create=False):
+    """The 'fixes' worksheet in the roster Sheet via the service account, or None if not possible."""
+    try:
+        import gspread
+        from data_io import _service_account_info
+        info = _service_account_info()
+        sid = _roster_sheet_id()
+        if not info or not sid:
+            return None
+        sh = gspread.service_account_from_dict(info).open_by_key(sid)
+        try:
+            ws = sh.worksheet("fixes")
+        except gspread.WorksheetNotFound:
+            if not create:
+                return None
+            ws = sh.add_worksheet("fixes", rows=500, cols=len(FIX_COLS))
+        if not ws.row_values(1):
+            ws.update(values=[FIX_COLS], range_name="A1")
+        return ws
+    except Exception as e:
+        st.session_state["fixes_error"] = str(e)
+        return None
+
+
+def _load_fixes() -> pd.DataFrame:
+    ws = _fixes_ws()
+    if ws is not None:
+        try:
+            return pd.DataFrame(ws.get_all_records(), dtype=str)
+        except Exception as e:
+            st.session_state["fixes_error"] = str(e)
+    url = st.secrets.get("fixes_url")
+    return _read(url, "fixes") if url else pd.DataFrame()
+
+
+def _save_fixes(rows: list) -> str | None:
+    ws = _fixes_ws(create=True)
+    if ws is None:
+        return st.session_state.get("fixes_error") or "No service account or roster_url in Secrets."
+    try:
+        ws.append_rows(rows, value_input_option="RAW")
+        return None
+    except Exception as e:
+        return str(e)
+
+
 # --------------------------------------------------------------------------- data
 def _read(url: str, name: str) -> pd.DataFrame:
     try:
@@ -70,9 +126,8 @@ def load_all():
         parts.append(s)
     subs = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
         columns=["form", "date", "code", "team", "role", "person", "key", "submitted_at", "marketer", "form_key"])
-    fixes = _read(get("fixes_url"), "fixes") if get("fixes_url") else pd.DataFrame()
-    subs = F.apply_fixes(subs, fixes, roster)
-    status["fixes"] = f"{int(subs['fixed_from'].notna().sum())} forms" if get("fixes_url") else "not connected"
+    subs = F.apply_fixes(subs, _load_fixes(), roster)
+    status["fixes"] = f"{int(subs['fixed_from'].notna().sum())} forms"
     return roster, plan, subs, status
 
 
@@ -123,7 +178,7 @@ with tab_day:
                        + (" (today)" if pd.Timestamp(d) == today else ""))
     t, css = F.day_people(day, roster, plan, subs, today)
     if not t.empty:
-        rostered = t[t["Attendance"] != "Not on roster"]
+        rostered = t[~t["Attendance"].isin(["Not on roster", "Not tracked (no form)"])]
         k = st.columns(4)
         k[0].metric("Rostered", len(rostered))
         k[1].metric("Present", int((rostered["Attendance"] == "Present").sum()))
@@ -142,9 +197,36 @@ with tab_day:
     else:
         st.warning(f"{len(nc)} form(s) filed under a name that doesn't match today's roster — usually the wrong "
                    "name was picked on the phone. 'Probably' = who is rostered with that role on that team.")
-        st.dataframe(nc, hide_index=True, width="stretch")
-        st.caption("To correct: in the roster Sheet's **fixes** tab add a row with the form's `KEY` and the right "
-                   "`name`, then press 🔄 Refresh. (Fix the SurveyCTO data in cleaning too.)")
+        names = sorted(set(roster.loc[roster["date"] == pd.Timestamp(day), "name"])) or sorted(set(roster["name"]))
+        ed = nc.copy()
+        ed.insert(0, "Fix?", False)
+        ed.insert(1, "Correct name", ed["Probably"].where(ed["Probably"].isin(names), None))
+        out = st.data_editor(
+            ed, hide_index=True, width="stretch", key=f"fix_{pd.Timestamp(day).date()}",
+            disabled=[c for c in ed.columns if c not in ("Fix?", "Correct name")],
+            column_config={
+                "Fix?": st.column_config.CheckboxColumn(help="Tick to save this correction"),
+                "Correct name": st.column_config.SelectboxColumn(options=names, help="Who really filled in this form"),
+                "KEY": st.column_config.TextColumn(width="small")})
+        st.caption("Tick **Fix?**, check **Correct name** (pre-filled with 'Probably'), then **Save**. "
+                   "Saved to the *fixes* tab of the roster Sheet — only this dashboard uses it; "
+                   "the SurveyCTO data is not changed.")
+        if st.button("💾 Save name fixes", type="primary"):
+            pick = out[out["Fix?"] & out["Correct name"].notna()]
+            if pick.empty:
+                st.info("Tick at least one row and choose a name.")
+            else:
+                now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+                rows = [[r["KEY"], r["Correct name"], r["Filed under"], r["Form"],
+                         str(pd.Timestamp(day).date()), now] for _, r in pick.iterrows()]
+                err = _save_fixes(rows)
+                if err:
+                    st.error(f"Could not save: {err}. Share the roster Sheet with the service account "
+                             "(hfc-dashboard@recruitment-hfc-dashboard.iam.gserviceaccount.com) as **Editor**.")
+                else:
+                    st.success(f"Saved {len(rows)} fix(es).")
+                    load_all.clear()
+                    st.rerun()
 
     st.markdown("#### Rides")
     st.caption("Which per-ride forms came in for each planned ride (matched by batch code).")
