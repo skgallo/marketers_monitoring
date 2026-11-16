@@ -127,8 +127,14 @@ ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, reviews)
 e4_all = load_e4()
 if not e4_all.empty:
     e4_all = e4_all[e4_all["ride_date"].isna() | (e4_all["ride_date"] >= MONITOR_FROM)]
-_xt_all, _, _ = v.timing_crosscheck(subs, e4_all, batch_codes, reviews)
-verdicts_all, flips_by_code = v.crosscheck_verdicts(_xt_all)
+try:
+    _xt_all, _, _ = v.timing_crosscheck(subs, e4_all, batch_codes, reviews)
+    verdicts_all, flips_by_code = v.crosscheck_verdicts(_xt_all)
+except Exception as _e:                      # never let the E4 comparison stop the whole dashboard
+    st.warning(f"The E4 / supervisor timing comparison could not be built ({type(_e).__name__}: {_e}). "
+               "Everything else is shown; send this message to fix it.")
+    _xt_all = pd.DataFrame()
+    verdicts_all, flips_by_code = v.crosscheck_verdicts(_xt_all) if hasattr(v, "crosscheck_verdicts") else ({}, {})
 
 st.sidebar.caption(f"Showing rides from {MONITOR_FROM.strftime('%d %b %Y')} onward.")
 st.sidebar.header("Filters (tabs 1 & 2)")
@@ -431,7 +437,11 @@ with tab2:
         e4 = e4_all
         if not e4.empty and not subs_f.empty and subs_f["ride_date"].notna().any():
             e4 = e4[e4["ride_date"].isna() | e4["ride_date"].isin(subs_f["ride_date"].unique())]
-        xt, xt_css, e4_unmatched = v.timing_crosscheck(subs_f, e4, batch_codes, reviews)
+        try:
+            xt, xt_css, e4_unmatched = v.timing_crosscheck(subs_f, e4, batch_codes, reviews)
+        except Exception as _e:
+            st.warning(f"E4 / supervisor comparison not available ({type(_e).__name__}: {_e}).")
+            xt, xt_css, e4_unmatched = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         verdicts, _ = v.crosscheck_verdicts(xt)
 
         st.markdown("#### Ride timeline and start checks")

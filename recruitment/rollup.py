@@ -838,6 +838,19 @@ def prepare_e4(raw: pd.DataFrame) -> pd.DataFrame:
     if raw is None or raw.empty or not ({'batch_code_pre', 'batch_code', 'KEY'} & set(raw.columns)):
         return pd.DataFrame()          # nothing published yet (empty Sheet or headers only)
     df = raw.copy()
+    # group-path column names ("script/section_b/b02_r") → field name (b02_r); duplicate names merged
+    ren = {}
+    for c in df.columns:
+        s = str(c)
+        if '/' in s:
+            last = re.sub(r'\[\d+\]$', '', s.split('/')[-1])
+            if last and last not in df.columns and last not in ren.values():
+                ren[c] = last
+    if ren:
+        df = df.rename(columns=ren)
+    if df.columns.duplicated().any():
+        df = df.T.groupby(level=0, sort=False).first().T
+    df = df.reset_index(drop=True)
     if 'KEY' in df.columns:
         df = df[~(df['KEY'].notna() & df.duplicated(subset='KEY', keep='last'))].copy()
     if 'username' in df.columns:

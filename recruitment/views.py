@@ -2281,11 +2281,13 @@ def _match_e4(e1_planned: dict, e1_times: dict, e4: pd.DataFrame, e4_ident: pd.D
     """{E1 row index: E4 row index} — same planned ride; if several, closest ride start."""
     out, used = {}, set()
     for i, code in e1_planned.items():
-        cand = [j for j in e4_ident.index if e4_ident.at[j, "planned"] == code and j not in used]
+        cand = [j for j in e4_ident.index if j in e4.index and e4_ident.at[j, "planned"] == code and j not in used]
         if not cand:
             continue
         def gap(j):
-            g = _diff_minutes(e1_times[i]["b02_r"], _parse_time(e4.at[j, "b02_r"]))
+            v_ = e4.loc[j].get("b02_r") if j in e4.index else None
+            v_ = v_.iloc[0] if isinstance(v_, pd.Series) else v_
+            g = _diff_minutes(e1_times[i]["b02_r"], _parse_time(v_))
             return abs(g) if not np.isnan(g) else 999
         best = min(cand, key=gap)
         out[i] = best; used.add(best)
