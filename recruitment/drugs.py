@@ -360,10 +360,11 @@ def summary_table(rides: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     g = r.groupby(["Team", "Marketer"])
     return pd.DataFrame({
-        "Rides checked": g.size(),
-        "All 4 core drugs": g["4 core drugs pitched"].apply(lambda s: f"{(s == '✓').sum()}/{len(s)}"),
-        "Order changed": g["Order"].apply(lambda s: int(s.str.contains("order changed").sum())),
-        "Drugs dropped/added": g["Order"].apply(lambda s: int(s.str.contains("dropped|added").sum())),
+        "Rides checked (Normal / Peddling)": g.size(),
+        "Rides with all 4 core drugs (pain, deworming, cold, infection)":
+            g["4 core drugs pitched"].apply(lambda s: f"{(s == '✓').sum()} of {len(s)}"),
+        "Rides where the order changed": g["Order"].apply(lambda s: int(s.str.contains("order changed").sum())),
+        "Rides with a drug dropped or added": g["Order"].apply(lambda s: int(s.str.contains("dropped|added").sum())),
     }).reset_index()
 
 

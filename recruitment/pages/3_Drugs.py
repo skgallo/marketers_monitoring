@@ -151,7 +151,7 @@ if not mt.empty:
     k = st.columns(3)
     k[0].metric("Marketers", len(mt))
     k[1].metric("Morning form in", int((~mt["Morning form"].str.startswith("✗")).sum()))
-    k[2].metric("All 4 core drugs", int((mt["4 core drugs"] == "✓").sum()))
+    k[2].metric("Bags with all 4 core drugs", help="At least one pain, deworming, cold and infection drug in the morning list", value= int((mt["4 core drugs"] == "✓").sum()))
 show(mt, mtc)
 
 # ---- 3
@@ -165,7 +165,7 @@ if not rt.empty:
     checked = rt[~rt["Pitch"].eq("Sit down") & ~rt["Drugs pitched (in order)"].eq("no Script Checklist yet")]
     k = st.columns(3)
     k[0].metric("Rides with a checklist", len(checked))
-    k[1].metric("All 4 core drugs pitched", int((checked["4 core drugs pitched"] == "✓").sum()))
+    k[1].metric("Rides with all 4 core drugs pitched", help="At least one pain, deworming, cold and infection drug pitched on the ride", value= int((checked["4 core drugs pitched"] == "✓").sum()))
     k[2].metric("Order changed", int(checked["Order"].str.contains("order changed").sum()))
 show(rt, rtc)
 
@@ -210,6 +210,10 @@ with st.expander("✏️ Drug names that don't match the morning list — mark a
                 load_aliases.clear(); st.rerun()
 
 st.markdown("#### By marketer")
+st.caption("One line per marketer for this day (Sit down rides and rides without a Script Checklist are left out). "
+           "**Rides with all 4 core drugs**: rides where the marketer pitched at least one drug of EACH core type — "
+           "a pain drug, a deworming drug, a cold drug and an infection drug. "
+           "**Order changed / drug dropped or added**: compared with the marketer's first ride of the day.")
 sm = DR.summary_table(rt)
 if sm.empty:
     st.info("Nothing to show.")
