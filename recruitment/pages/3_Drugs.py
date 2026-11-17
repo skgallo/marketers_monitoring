@@ -49,6 +49,63 @@ def load():
     return F, D, R, plan, status
 
 
+ALIAS_COLS = ["written", "same_as", "saved_at"]
+
+
+def _alias_ws(create=False):
+    """'drug_aliases' tab in the roster Sheet (service account), or None."""
+    import re
+    try:
+        import gspread
+        from data_io import _service_account_info
+        info = _service_account_info()
+        m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", str(st.secrets.get("roster_url", "")))
+        if not info or not m:
+            return None
+        sh = gspread.service_account_from_dict(info).open_by_key(m.group(1))
+        try:
+            ws = sh.worksheet("drug_aliases")
+        except gspread.WorksheetNotFound:
+            if not create:
+                return None
+            ws = sh.add_worksheet("drug_aliases", rows=500, cols=len(ALIAS_COLS))
+        if not ws.row_values(1):
+            ws.update(values=[ALIAS_COLS], range_name="A1")
+        return ws
+    except Exception as e:
+        st.session_state["alias_error"] = str(e)
+        return None
+
+
+@st.cache_data(ttl=300)
+def load_aliases() -> pd.DataFrame:
+    ws = _alias_ws()
+    if ws is not None:
+        try:
+            return pd.DataFrame(ws.get_all_records(), dtype=str)
+        except Exception:
+            pass
+    url = st.secrets.get("drug_aliases_url")
+    return _read(url, "drug aliases") if url else pd.DataFrame()
+
+
+def _write_aliases(df: pd.DataFrame | None = None, append: list | None = None):
+    ws = _alias_ws(create=True)
+    if ws is None:
+        return (st.session_state.get("alias_error") or "No service account or roster_url in Secrets.") + \
+            " Share the roster Sheet with hfc-dashboard@recruitment-hfc-dashboard.iam.gserviceaccount.com as Editor."
+    try:
+        if append:
+            ws.append_rows(append, value_input_option="RAW")
+        else:
+            ws.clear()
+            ws.update(values=[ALIAS_COLS] + df.reindex(columns=ALIAS_COLS).fillna("").astype(str).values.tolist(),
+                      range_name="A1")
+        return None
+    except Exception as e:
+        return str(e)
+
+
 def show(t, css):
     if t is None or t.empty:
         st.info("Nothing to show.")
@@ -63,6 +120,8 @@ if c2.button("🔄 Refresh"):
     st.rerun()
 
 F, D, R, plan, status = load()
+aliases = load_aliases()
+DR.set_aliases(aliases)            # 'Ronamox' = 'Ronamox 500' etc., saved below
 for df in (F, D, R, plan):
     if not df.empty and "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
@@ -109,6 +168,46 @@ if not rt.empty:
     k[1].metric("All 4 core drugs pitched", int((checked["4 core drugs pitched"] == "✓").sum()))
     k[2].metric("Order changed", int(checked["Order"].str.contains("order changed").sum()))
 show(rt, rtc)
+
+with st.expander("✏️ Drug names that don't match the morning list — mark as the same drug"):
+    st.caption("Names written differently on the Script Checklist ('Ronamox' vs 'Ronamox 500'). Names that clearly "
+               "match one drug in the marketer's bag are matched automatically; pick the rest here. Saved to the "
+               "*drug_aliases* tab of the roster Sheet and used on every day.")
+    um = DR.unmatched_names(R, F, D, day)
+    if um.empty:
+        st.caption("✓ Every drug pitched matches the morning list.")
+    else:
+        opts = sorted({o for lst in um["options"] for o in lst})
+        ed = um.drop(columns="options").copy()
+        ed.insert(0, "Same as", None)
+        out = st.data_editor(ed, hide_index=True, width="stretch", key=f"alias_{pd.Timestamp(day).date()}",
+                             disabled=[c for c in ed.columns if c != "Same as"],
+                             column_config={"Same as": st.column_config.SelectboxColumn(
+                                 options=opts, help="The drug from the morning list this really is (leave empty if it "
+                                                    "really wasn't in the bag)")})
+        if st.button("💾 Save drug names", type="primary"):
+            pick = out[out["Same as"].notna()]
+            if pick.empty:
+                st.info("Choose 'Same as' for at least one row.")
+            else:
+                now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+                err = _write_aliases(append=[[w, s, now] for w, s in zip(pick["Written on the checklist"], pick["Same as"])])
+                if err:
+                    st.error(f"Could not save: {err}")
+                else:
+                    load_aliases.clear(); st.rerun()
+    if not aliases.empty and {"written", "same_as"} <= set(aliases.columns):
+        st.markdown("**Saved — tick Undo? to remove**")
+        sv = aliases.reindex(columns=ALIAS_COLS).fillna("")
+        sv.insert(0, "Undo?", False)
+        new_sv = st.data_editor(sv, hide_index=True, width="stretch", key="alias_saved",
+                                disabled=ALIAS_COLS)
+        if st.button("💾 Save (remove ticked)", key="alias_undo"):
+            err = _write_aliases(df=aliases.reindex(columns=ALIAS_COLS)[~new_sv["Undo?"].values])
+            if err:
+                st.error(f"Could not save: {err}")
+            else:
+                load_aliases.clear(); st.rerun()
 
 st.markdown("#### By marketer")
 sm = DR.summary_table(rt)

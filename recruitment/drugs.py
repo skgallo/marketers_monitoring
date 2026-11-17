@@ -27,9 +27,36 @@ GREEN, RED, AMBER, GREY = ("color:#1E7B34;font-weight:600", "color:#CC0000;font-
                            "color:#B26B00;font-weight:600", "color:#888888")
 
 
+ALIASES = {}   # {norm(written name): norm(real name)} — set from the drug_aliases tab by the page
+
+
 def norm(x) -> str:
-    """Drug-name key for matching: lower case, letters and digits only ('Metromax ' == 'metromax')."""
-    return re.sub(r"[^a-z0-9]", "", str(x).lower()) if x is not None and str(x) not in ("nan", "None") else ""
+    """Drug-name key for matching: lower case, letters and digits only ('Metromax ' == 'metromax');
+    names saved as the same drug (drug_aliases) map to one key."""
+    k = re.sub(r"[^a-z0-9]", "", str(x).lower()) if x is not None and str(x) not in ("nan", "None") else ""
+    return ALIASES.get(k, k)
+
+
+def set_aliases(df: pd.DataFrame):
+    """drug_aliases tab: columns 'written' and 'same_as'."""
+    ALIASES.clear()
+    if df is None or df.empty or not {"written", "same_as"} <= set(df.columns):
+        return
+    for w, s in zip(df["written"], df["same_as"]):
+        kw = re.sub(r"[^a-z0-9]", "", str(w).lower())
+        ks = re.sub(r"[^a-z0-9]", "", str(s).lower())
+        if kw and ks and kw != ks:
+            ALIASES[kw] = ks
+
+
+def resolve(name, bag_keys) -> str:
+    """Key of `name`, matched to the marketer's bag when one bag drug clearly is the same
+    ('Ronamox' → 'Ronamox 500', 'HTC para' → 'HTC-PARA 500')."""
+    k = norm(name)
+    if not k or k in bag_keys:
+        return k
+    hits = [b for b in bag_keys if b.startswith(k) or k.startswith(b)]
+    return hits[0] if len(hits) == 1 else k
 
 
 def _clean(raw: pd.DataFrame) -> pd.DataFrame:
@@ -282,9 +309,11 @@ def ride_table(R: pd.DataFrame, F: pd.DataFrame, D: pd.DataFrame, day, plan: pd.
         items = _items(x["pitched"])
         cats = cat_of(D, day, x["mkt"])
         bag = {norm(b) for b in bag_for(F, D, day, x["mkt"])}
+        bag_keys = bag | set(cats)
+        keys = [resolve(d, bag_keys) for d in items]
         row["Drugs pitched (in order)"] = " → ".join(f"{i + 1}. {p}" for i, p in enumerate(x["pitched"])) or "none recorded"
         row["N"] = str(len(items))
-        have = {c: any(CAT_CORE.get(cats.get(norm(d))) == c for d in items) for c in CORE}
+        have = {c: any(CAT_CORE.get(cats.get(k)) == c for k in keys) for c in CORE}
         for c in CORE:
             row[CORE_LABEL[c]], s[CORE_LABEL[c]] = ("✓", GREEN) if have[c] else ("✗", RED)
         miss = [CORE_LABEL[c] for c in CORE if not have[c]]
@@ -292,7 +321,7 @@ def ride_table(R: pd.DataFrame, F: pd.DataFrame, D: pd.DataFrame, day, plan: pd.
         if not items:
             s["Drugs pitched (in order)"] = RED
         # order vs the marketer's first ride of the day
-        seq = [norm(d) for d in items]
+        seq = keys
         key = (x["mkt"], day)
         if key not in first_order and seq:
             first_order[key] = (x["ride"], seq, items)
@@ -314,7 +343,7 @@ def ride_table(R: pd.DataFrame, F: pd.DataFrame, D: pd.DataFrame, day, plan: pd.
             s["Order"] = GREEN if not notes else (RED if common_ref != common_now else AMBER)
         else:
             row["Order"], s["Order"] = "—", GREY
-        not_bag = [d for d in items if bag and norm(d) not in bag]
+        not_bag = [d for d, k in zip(items, keys) if bag and k not in bag]
         row["Not in the morning list"] = ", ".join(not_bag) if not_bag else ("✓" if bag else "no Drug Info")
         s["Not in the morning list"] = AMBER if not_bag else (GREEN if bag else GREY)
         rows.append(row); sty.append(s)
@@ -336,3 +365,25 @@ def summary_table(rides: pd.DataFrame) -> pd.DataFrame:
         "Order changed": g["Order"].apply(lambda s: int(s.str.contains("order changed").sum())),
         "Drugs dropped/added": g["Order"].apply(lambda s: int(s.str.contains("dropped|added").sum())),
     }).reset_index()
+
+
+def unmatched_names(R: pd.DataFrame, F: pd.DataFrame, D: pd.DataFrame, day) -> pd.DataFrame:
+    """Drug names pitched on `day` that don't match the marketer's morning list: (marketer, written, bag options)."""
+    day = pd.Timestamp(day).normalize()
+    rows = []
+    if R.empty:
+        return pd.DataFrame()
+    for _, x in R[(R["date"] == day) & (R["treatment"] != "S")].iterrows():
+        bag_names = bag_for(F, D, day, x["mkt"])
+        bag = {norm(b) for b in bag_names} | set(cat_of(D, day, x["mkt"]))
+        for d in _items(x["pitched"] or []):
+            if bag and resolve(d, bag) not in bag:
+                rows.append({"Marketer": x["mkt"], "Written on the checklist": d,
+                             "options": bag_names, "Rides": x["ride"]})
+    if not rows:
+        return pd.DataFrame()
+    t = pd.DataFrame(rows)
+    t["_k"] = t["Written on the checklist"].map(norm)
+    t = (t.groupby(["Marketer", "_k"], as_index=False)
+          .agg({"Written on the checklist": "first", "options": "first", "Rides": lambda s: ", ".join(sorted(set(s)))}))
+    return t.drop(columns="_k")
