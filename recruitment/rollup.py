@@ -489,7 +489,7 @@ def _diff_minutes(t1, t2) -> float:
 # Timing flags
 # ---------------------------------------------------------------------------
 
-def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
+def pitch_pause_check(treatment, b05, b06, b09, b10, b11, form_source=None):
     """
     (flag 1/0/None, text) for the pitch / pause of one ride, by treatment.
       S (sit down): pause should run until the ride ends.
@@ -497,11 +497,12 @@ def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
       P (peddling): pitch ≥ PEDDLING_PITCH_MIN, unless it ran until the ride ended.
     """
     t = str(treatment) if treatment is not None and not (isinstance(treatment, float) and np.isnan(treatment)) else ''
-    start, end = (b06, b10) if t == 'S' else (b05, b09)
+    launch0 = form_source == "Launch 0"
+    start, end = (b06, b11 if launch0 else b10) if t == 'S' else (b05, b09)
     dur = _diff_minutes(start, end)
     to_end = _diff_minutes(end, b11)          # minutes between pitch/pause end and ride end
-    dur = round(dur, 1) if not np.isnan(dur) else dur          # judged on the value shown (1 decimal)
-    to_end = round(to_end, 1) if not np.isnan(to_end) else to_end
+    dur = round(dur, 6 if launch0 else 1) if not np.isnan(dur) else dur          # judged on the value shown (1 decimal)
+    to_end = round(to_end, 6 if launch0 else 1) if not np.isnan(to_end) else to_end
     if t == 'S':
         if np.isnan(to_end):
             return None, ''
@@ -511,7 +512,7 @@ def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
     if t in ('N', 'P'):
         if np.isnan(dur):
             return None, ''
-        floor = NORMAL_PITCH_MIN if t == 'N' else PEDDLING_PITCH_MIN
+        floor = (15 if launch0 else NORMAL_PITCH_MIN) if t == 'N' else PEDDLING_PITCH_MIN
         ran_to_end = not np.isnan(to_end) and to_end <= PAUSE_END_TOL_MIN
         if dur < floor and not ran_to_end:
             return 1, f"Pitch {dur:.1f} min (< {floor})" + (
@@ -522,10 +523,16 @@ def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
 
 def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    unrounded_signup = pd.to_numeric(df.get("signup_duration"), errors="coerce")
+    unrounded_announcement = pd.to_numeric(df.get("announcement_duration"), errors="coerce")
 
     # ── Parse raw SurveyCTO time columns ────────────────────────────────────
     for col in ['b02_r', 'b03', 'b05', 'b06', 'b09', 'b10', 'b11']:
         df[f'_{col}'] = df[col].apply(_parse_time) if col in df.columns else pd.NaT
+
+    launch0 = df["form_source"].eq("Launch 0")
+    # Launch 0 records the sit-down pause through arrival, with no b10 checkpoint.
+    df.loc[launch0, "_b10"] = df.loc[launch0, "_b11"]
 
     # Derive raw durations from timestamps (for chronological checks)
     df['_delay_min']     = df.apply(lambda r: _diff_minutes(r['_b02_r'], r['_b03']), axis=1)
@@ -646,6 +653,29 @@ def add_timing_flags(df: pd.DataFrame) -> pd.DataFrame:
     gap = pd.to_numeric(df.get('pitch_start_gap', pd.Series(np.nan, index=df.index)), errors='coerce')
     df['pitch_start_gap'] = gap.round(6)
     df['flag_8_pitch_start_gap'] = np.where(has_sub & gap.notna(), (gap.round(6) > DELAY_MAX_MIN).astype(int), pd.NA)
+
+    # Current Launch 0 form rules, verified against version 2611171856.
+    # Keep the established Training Launch rules on their own submissions.
+    for i in df.index[launch0]:
+        row = df.loc[i]
+        kind = row["treatment_actual"]
+        pause = pd.to_numeric(pd.Series([row.get("pause_duration")]), errors="coerce").iloc[0]
+        end_gap = row["_b09_to_b11"]
+        if kind == "S":
+            df.at[i, "flag_4a_pause_dur"] = 0 if pd.notna(pause) else pd.NA
+            df.at[i, "pitch_pause_check"] = ""
+        elif kind in ("N", "P"):
+            floor = 15 if kind == "N" else 12
+            value = int(round(pause, 6) < floor and not (
+                pd.notna(end_gap) and 0 <= end_gap <= 2)) if pd.notna(pause) else pd.NA
+            df.at[i, "flag_4b_pitch_dur"] = value
+            df.at[i, "pitch_pause_check"] = f"Pitch {pause:.1f} min (< {floor})" if value == 1 else ""
+        original_signup, original_auto = unrounded_signup.loc[i], unrounded_announcement.loc[i]
+        df.at[i, "flag_3_signup_discrep"] = int(abs(original_signup - original_auto) > 2) if pd.notna(original_signup) and pd.notna(original_auto) else pd.NA
+        ride_value = pd.to_numeric(pd.Series([row.get("ride_duration")]), errors="coerce").iloc[0]
+        df.at[i, "flag_6_short_ride"] = int(round(ride_value, 6) < 30) if pd.notna(ride_value) else pd.NA
+        delay_value = pd.to_numeric(pd.Series([row.get("announcement_start_delay")]), errors="coerce").iloc[0]
+        df.at[i, "flag_1_start_delay"] = int(round(delay_value, 6) > 2) if pd.notna(delay_value) else pd.NA
 
     # ── Flag 5: any timing/chronological issue ───────────────────────────────
     timing_flags = [

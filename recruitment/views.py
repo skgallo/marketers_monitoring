@@ -149,7 +149,7 @@ COL_REC     = f"Recorded ann./signup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_AUTO    = "Auto form-screen dur."
 COL_DISCREP = f"Timing discrepancy (>{SIGNUP_DIFF_MAX} min)"
 COL_PITCH   = "Pause/Pitch (min)"
-COL_RIDE    = f"Ride dur. (≥{RIDE_MIN_MIN} min)"
+COL_RIDE    = "Ride duration (min)"
 COL_SIGNUPS = f"Signups (≥{SIGNUP_MIN})"
 COL_GAP     = f"Pitch start gap (≤{DELAY_MAX_MIN} min)"
 
@@ -2090,7 +2090,8 @@ def _times(r) -> dict:
     """Parsed clock times of one form (any source) with pitch/pause start/end resolved."""
     t = {k: _parse_time(r.get(k)) for k in ["b02_r", "b03", "b04", "b05", "b06", "b09", "b10", "b11"]}
     t["pp_start"] = t["b05"] if pd.notna(t["b05"]) else t["b06"]
-    t["pp_end"] = t["b09"] if pd.notna(t["b09"]) else t["b10"]
+    t["pp_end"] = (t["b11"] if _txt(r.get("form_source")) == "Launch 0" and _txt(r.get("treatment_actual")) == "S"
+                   else t["b09"] if pd.notna(t["b09"]) else t["b10"])
     return t
 
 
@@ -2228,7 +2229,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             s[COL_SGAP] = RED
         if pp_txt:
             s[COL_PP] = RED
-        if bad(ride, lo=RIDE_MIN_MIN):
+        if bad(ride, lo=30 if _txt(r.get("form_source")) == "Launch 0" else RIDE_MIN_MIN):
             s[COL_RIDE2] = GRAY                 # reference only
         if not np.isnan(lag) and lag < -1:
             s[COL_LAG] = RED
@@ -2264,10 +2265,10 @@ DUR_LABELS = [("delay", f"Start delay (≤{DELAY_MAX_MIN})"), ("signup", "Ann.+s
               ("ride", "Ride")]
 
 
-def _dur_flag(key, x) -> bool:
+def _dur_flag(key, x, form_source="") -> bool:
     if np.isnan(x):
         return False
-    x = round(x, 1)                           # judged on the value shown
+    x = round(x, 6 if form_source == "Launch 0" else 1)
     if key in ("delay", "gap"):
         return x > DELAY_MAX_MIN
     if key == "pp":
@@ -2421,10 +2422,10 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
                     bits.append(f"{src} {x - e1_du[key]:+.1f}")
                 if key == "pp":
                     trt = _txt(r.get("treatment_actual"))
-                    ppc = lambda tt: pitch_pause_check(trt, tt["b05"], tt["b06"], tt["b09"], tt["b10"], tt["b11"])[0] == 1
+                    ppc = lambda tt: pitch_pause_check(trt, tt["b05"], tt["b06"], tt["b09"], tt["b10"], tt["b11"], _txt(r.get("form_source")))[0] == 1
                     f_other, f_e1 = ppc(t_), ppc(T[i])
                 else:
-                    f_other, f_e1 = _dur_flag(key, x), _dur_flag(key, e1_du[key])
+                    f_other, f_e1 = _dur_flag(key, x, _txt(r.get("form_source"))), _dur_flag(key, e1_du[key], _txt(r.get("form_source")))
                 if f_other and f_e1:
                     confirmed.setdefault(name, [f"E1 {e1_du[key]:.1f}"]).append(f"{src} {x:.1f}")
                 if f_other and not f_e1:

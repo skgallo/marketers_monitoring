@@ -537,14 +537,14 @@ with tab2:
 | Recorded ann./signup dur. | Outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min (enumerator-recorded) |
 | Auto form-screen dur. | Not flagged — SurveyCTO screen timing, for reference |
 | Timing discrepancy | Recorded and auto differ by > {SIGNUP_DIFF_MAX} min — review; doesn't mean either is wrong |
-| Pause/Pitch | **Sit down:** the pause lasts until the ride ends (in the current forms the pause end *is* the ride end, so only older forms can be flagged here). **Normal:** pitch under 20 min, unless it ran until the ride ended. **Peddling:** pitch under 12 min, unless it ran until the ride ended |
+| Pause/Pitch | **Sit down:** the pause lasts until the ride ends (in the current forms the pause end *is* the ride end, so only older forms can be flagged here). **Normal:** pitch under 15 min for Launch 0 (20 min for Training Launch), unless it ran until the ride ended. **Peddling:** pitch under 12 min, unless it ran until the ride ended |
 | **Ride timeline** — Start check | Announcement started > {DELAY_MAX_MIN} min after the ride start although the bus was at least half full (🔴), or with no reason; 🟢 if the E1 waited because the bus was less than half full; 🟠 another reason |
 | **Ride timeline** — Strategic point | The announcement started AFTER the route's strategic point (asked only when the start was late) |
 | **Ride timeline** — Announcement | Automatic length of the script screens outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min |
 | **Ride timeline** — Ann. end → sign-up end | Lag between the end of the announcement and the end of sign-up (no target; red if sign-up "ended" > 1 min before the announcement) |
 | **Ride timeline** — Sign-up end → pitch/pause | Pitch/pause started > {DELAY_MAX_MIN} min after sign-up ended |
 | Pitch start gap *(Nov form)* | Marketer started the pitch > {DELAY_MAX_MIN} min after sign-up ended (b04 → b05; Normal/Peddling rides). For reference — not counted against the enumerator |
-| Ride dur. | < {RIDE_MIN_MIN} min |
+| Ride dur. | Launch 0 below 30 min; Training Launch below {RIDE_MIN_MIN} min |
 | Signups | < {SIGNUP_MIN} |
 
 From the Nov form the recorded sign-up duration runs from announcement start to **sign-up end** (b03 → b04);

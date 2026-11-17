@@ -1,0 +1,338 @@
+"""
+drugs.py — Drug checks for the Recruitment HFC app (page 3 "Drugs")
+====================================================================
+1. Morning drug list: what the E4 recorded in the BnB Drug Info form (submission 1 = morning).
+2. Core drugs: at least one Pain, Deworming, Cold and Infection drug in the marketer's bag.
+3. Rides (Script Checklist): the drugs actually pitched on each ride — all 4 core drugs? same order
+   as the marketer's first ride of the day?
+"""
+
+import re
+
+import numpy as np
+import pandas as pd
+
+import attendance_forms as AF
+
+CORE = ["pain", "dew", "cold", "anti"]
+CORE_LABEL = {"pain": "Pain", "dew": "Deworming", "cold": "Cold", "anti": "Infection"}
+# drug_cat codes in the BnB Drug Info form (worked out from the form's own core_* flags — confirm with the form)
+CAT_LABEL = {"1": "Pain", "2": "Infection", "3": "Infection", "4": "Deworming", "7": "Cold", "-55": "Other"}
+CAT_CORE = {"1": "pain", "2": "anti", "3": "anti", "4": "dew", "7": "cold"}
+TREATMENT = {"N": "Normal", "P": "Peddling", "S": "Sit down"}
+TEST_USERNAMES = AF.TEST_USERNAMES
+E4_NAMES = AF.FORM_DEFAULTS["bnb_druginfo"]["code_maps"]["E4"]
+
+GREEN, RED, AMBER, GREY = ("color:#1E7B34;font-weight:600", "color:#CC0000;font-weight:600",
+                           "color:#B26B00;font-weight:600", "color:#888888")
+
+
+def norm(x) -> str:
+    """Drug-name key for matching: lower case, letters and digits only ('Metromax ' == 'metromax')."""
+    return re.sub(r"[^a-z0-9]", "", str(x).lower()) if x is not None and str(x) not in ("nan", "None") else ""
+
+
+def _clean(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    # group-path names (a/b/drug_name, rep[2]/drug_name) → drug_name / drug_name_2
+    ren = {}
+    for c in df.columns:
+        s = str(c).strip()
+        if "/" in s or "[" in s:
+            last = s.split("/")[-1]
+            k = re.findall(r"\[(\d+)\]", s)
+            base = re.sub(r"\[\d+\]$", "", last)
+            new = f"{base}_{k[-1]}" if k and not re.search(r"_\d+$", base) else base
+            if new not in df.columns and new not in ren.values():
+                ren[c] = new
+    df = df.rename(columns=ren)
+    if "KEY" in df.columns:
+        df = df[~(df["KEY"].notna() & df.duplicated(subset="KEY", keep="last"))]
+    if "username" in df.columns:
+        df = df[~df["username"].astype(str).str.lower().isin(TEST_USERNAMES)]
+    return df.reset_index(drop=True)
+
+
+def _split_list(s) -> list:
+    """'ID1 all cold; ID2 xipain' → ['all cold', 'xipain']."""
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return []
+    out = []
+    for part in str(s).split(";"):
+        p = re.sub(r"^\s*ID\d+\s*", "", part).strip()
+        if p:
+            out.append(p)
+    return out
+
+
+# --------------------------------------------------------------------------- 1–2. Drug Info
+def drug_info(raw: pd.DataFrame) -> tuple:
+    """(one row per Drug Info form, one row per drug). Category from drug_cat_N; for check-in 2 (no new
+    drugs) the categories are taken from the same marketer's morning form."""
+    df = _clean(raw)
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    date = AF._naive_dt(AF._first_col(df, ["date_key", "bc_date_key", "today"])).dt.normalize()
+    sub = AF._naive_dt(df.get("SubmissionDate", pd.Series(None, index=df.index)))
+    first = AF._first_col(df, ["bc_first", "batch_codes_today"]).map(
+        lambda x: str(x).split()[0] if isinstance(x, str) and x.split() else None)
+    team = first.map(lambda c: AF.parse_code(c).get("team") if c else None)
+    mkt = AF._first_col(df, ["bc_mkt_id", "a03_r"]).map(AF._code)
+    forms, drugs = [], []
+    for i, r in df.iterrows():
+        enum = AF._code(r.get("enumerator"))
+        name = E4_NAMES.get(enum, r.get("enum_oth") if enum == "-55" else enum)
+        no = AF._code(r.get("submission_no")) or "1"
+        lst = _split_list(r.get("drugid_total"))
+        f = {"date": date[i], "team": team[i], "mkt": mkt[i], "sub_no": no, "e4": name,
+             "submitted_at": sub[i], "key": r.get("KEY"), "drugs": lst,
+             "new_drugs": AF._code(r.get("new_drugs_yn"))}
+        for c in CORE:
+            f[c] = AF._code(r.get(f"core_{c}"))
+        forms.append(f)
+        for n, d in enumerate(lst, 1):
+            cat = AF._code(r.get(f"drug_cat_{n}"))
+            if cat == "-55":
+                other = r.get(f"drug_cat_oth_{n}")
+            else:
+                other = None
+            unit = r.get(f"unit_{n}")
+            drugs.append({"date": date[i], "team": team[i], "mkt": mkt[i], "sub_no": no, "e4": name, "n": n,
+                          "drug": d, "cat": cat, "cat_other": other if isinstance(other, str) else None,
+                          "unit": unit if isinstance(unit, str) else None, "key": r.get("KEY")})
+    F = pd.DataFrame(forms)
+    D = pd.DataFrame(drugs)
+    if not D.empty:
+        # categories missing (check-in 2) → same drug, same marketer, same day, from another form
+        kd = D.dropna(subset=["cat"])
+        known = {(d, m, norm(x)): c for d, m, x, c in zip(kd["date"], kd["mkt"], kd["drug"], kd["cat"])}
+        k = list(zip(D["date"], D["mkt"], D["drug"].map(norm)))
+        D["cat"] = [c if c else known.get(kk) for c, kk in zip(D["cat"], k)]
+        D["category"] = [CAT_LABEL.get(c, f"Category {c}") if c else "—" for c in D["cat"]]
+        D.loc[D["cat"] == "-55", "category"] = "Other" + D.loc[D["cat"] == "-55", "cat_other"].map(
+            lambda x: f" ({x})" if x else "")
+    return F, D
+
+
+def bag_for(F: pd.DataFrame, D: pd.DataFrame, date, mkt) -> list:
+    """The marketer's drug list for the day (latest check-in, as the Script Checklist uses)."""
+    if F.empty:
+        return []
+    f = F[(F["date"] == date) & (F["mkt"] == mkt)].sort_values(["sub_no", "submitted_at"])
+    return list(f.iloc[-1]["drugs"]) if not f.empty else []
+
+
+def cat_of(D: pd.DataFrame, date, mkt) -> dict:
+    """{drug key: category code} for one marketer-day (any day as fallback)."""
+    if D.empty:
+        return {}
+    d = D.dropna(subset=["cat"])
+    same = d[(d["date"] == date) & (d["mkt"] == mkt)]
+    out = {norm(x): c for x, c in zip(d["drug"], d["cat"])}       # any day
+    out.update({norm(x): c for x, c in zip(same["drug"], same["cat"])})
+    return out
+
+
+def morning_table(F: pd.DataFrame, D: pd.DataFrame, day, plan: pd.DataFrame | None = None) -> tuple:
+    """One row per marketer working on `day`: morning drug list and the 4 core drugs. Returns (table, css)."""
+    day = pd.Timestamp(day).normalize()
+    f = F[F["date"] == day] if not F.empty else F
+    mkts = set(f["mkt"]) if not f.empty else set()
+    if plan is not None and not plan.empty:
+        mkts |= set(plan.loc[plan["date"] == day, "mkt_id"])
+    rows, sty = [], []
+    for m in sorted(x for x in mkts if x):
+        fm = f[f["mkt"] == m] if not f.empty else f
+        morning = fm[fm["sub_no"] == "1"].sort_values("submitted_at") if not fm.empty else fm
+        second = fm[fm["sub_no"] == "2"].sort_values("submitted_at") if not fm.empty else fm
+        team = (fm["team"].dropna().iloc[0] if not fm.empty and fm["team"].notna().any() else
+                (plan.loc[(plan["date"] == day) & (plan["mkt_id"] == m), "team"].iloc[0]
+                 if plan is not None and not plan.empty and ((plan["date"] == day) & (plan["mkt_id"] == m)).any() else "—"))
+        row = {"Team": team, "Marketer": m}
+        s = {"Team": "", "Marketer": ""}
+        if morning.empty:
+            row.update({"E4": "—", "Morning form": "✗ not submitted", "Drugs in the bag": "—", "N": "—"})
+            s.update({"E4": "", "Morning form": RED, "Drugs in the bag": GREY, "N": GREY})
+            for c in CORE:
+                row[CORE_LABEL[c]], s[CORE_LABEL[c]] = "—", GREY
+            row["4 core drugs"], s["4 core drugs"] = "—", GREY
+        else:
+            mr = morning.iloc[-1]
+            dd = D[(D["key"] == mr["key"])] if not D.empty else D
+            cats = {norm(x): c for x, c in zip(dd["drug"], dd["cat"])} if not dd.empty else {}
+            lst = [f"{x} ({CAT_LABEL.get(cats.get(norm(x)), '?')})" for x in mr["drugs"]]
+            row.update({"E4": mr["e4"], "Morning form": mr["submitted_at"].strftime("%H:%M") if pd.notna(mr["submitted_at"]) else "✓",
+                        "Drugs in the bag": " · ".join(lst) or "—", "N": str(len(mr["drugs"]))})
+            s.update({"E4": "", "Morning form": GREEN, "Drugs in the bag": "", "N": ""})
+            have = {c: (mr.get(c) == "1") or any(CAT_CORE.get(cats.get(norm(x))) == c for x in mr["drugs"]) for c in CORE}
+            for c in CORE:
+                row[CORE_LABEL[c]], s[CORE_LABEL[c]] = ("✓", GREEN) if have[c] else ("✗", RED)
+            miss = [CORE_LABEL[c] for c in CORE if not have[c]]
+            row["4 core drugs"], s["4 core drugs"] = ("✓", GREEN) if not miss else ("Missing: " + ", ".join(miss), RED)
+            if len(morning) > 1:
+                row["Morning form"] += f" (×{len(morning)})"
+                s["Morning form"] = AMBER
+        if second.empty:
+            row["Check-in 2"], s["Check-in 2"] = "not yet", GREY
+        else:
+            sr = second.iloc[-1]
+            new = [x for x in sr["drugs"] if norm(x) not in {norm(y) for y in (morning.iloc[-1]["drugs"] if not morning.empty else [])}]
+            row["Check-in 2"] = (sr["submitted_at"].strftime("%H:%M") if pd.notna(sr["submitted_at"]) else "✓") + \
+                (f" · new: {', '.join(new)}" if new else " · no new drugs")
+            s["Check-in 2"] = AMBER if new else GREEN
+        rows.append(row); sty.append(s)
+    t = pd.DataFrame(rows)
+    return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
+
+
+# --------------------------------------------------------------------------- 3. Script Checklist
+def _repeat_values(r: pd.Series, field: str) -> list:
+    """Values of a repeat field published wide: field_1, field_2, … (in order)."""
+    vals = []
+    for c in r.index:
+        m = re.fullmatch(rf"{field}_(\d+)", str(c))
+        if m and pd.notna(r[c]) and str(r[c]).strip():
+            vals.append((int(m.group(1)), str(r[c]).strip()))
+    if not vals and field in r.index and pd.notna(r[field]) and str(r[field]).strip():
+        vals = [(1, str(r[field]).strip())]
+    return [v for _, v in sorted(vals)]
+
+
+def ride_drugs(script_raw: pd.DataFrame) -> pd.DataFrame:
+    """One row per ride (Script Checklist, E4 preferred over supervisor): planned code, ride info and
+    the drugs pitched in order (a bundle counts as all its drugs, in the same position)."""
+    df = _clean(script_raw)
+    if df.empty:
+        return pd.DataFrame()
+    if "activity" in df.columns:
+        act = pd.to_numeric(df["activity"], errors="coerce")
+        df = df[act.isna() | (act > 2)]
+    code = AF._first_col(df, ["batch_code_pre", "batch_code"]).map(lambda x: str(x).strip() if pd.notna(x) else None)
+    rows = []
+    for i, r in df.iterrows():
+        p = AF.parse_code(code[i])
+        if not p:
+            continue
+        drugs = _repeat_values(r, "drug_name")
+        rows.append({"code": code[i], "date": p["date"], "team": p["team"], "mkt": p["mkt_id"],
+                     "ride": p["ride"], "treatment": p["treatment"],
+                     "role": "E4" if AF._code(r.get("role_type")) != "0" else "Supervisor",
+                     "submitted_at": AF._naive_dt(pd.Series([r.get("SubmissionDate")])).iloc[0],
+                     "pitched": drugs, "key": r.get("KEY")})
+    R = pd.DataFrame(rows)
+    if R.empty:
+        return R
+    R["_pref"] = (R["role"] == "E4").astype(int)
+    R = R.sort_values(["_pref", "submitted_at"]).drop_duplicates("code", keep="last").drop(columns="_pref")
+    return R.reset_index(drop=True)
+
+
+def _items(pitched: list) -> list:
+    """Bundles 'A + B' → each drug separately (same position)."""
+    out = []
+    for p in pitched:
+        out += [x.strip() for x in str(p).split(" + ") if x.strip()]
+    return out
+
+
+def ride_table(R: pd.DataFrame, F: pd.DataFrame, D: pd.DataFrame, day, plan: pd.DataFrame | None = None) -> tuple:
+    """One row per ride on `day`: drugs pitched (order), 4 core drugs pitched, order vs the marketer's first ride."""
+    day = pd.Timestamp(day).normalize()
+    r_day = R[R["date"] == day].copy() if not R.empty else pd.DataFrame(columns=["code", "date", "team", "mkt", "ride", "treatment", "pitched"])
+    if plan is not None and not plan.empty:
+        missing = plan[(plan["date"] == day) & ~plan["code"].isin(r_day["code"])]
+        if not missing.empty:
+            r_day = pd.concat([r_day, pd.DataFrame({"code": missing["code"], "date": day, "team": missing["team"],
+                                                     "mkt": missing["mkt_id"], "ride": missing["ride"],
+                                                     "treatment": missing["treatment"], "pitched": None})],
+                              ignore_index=True)
+    if r_day.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    r_day["_r"] = pd.to_numeric(r_day["ride"], errors="coerce")
+    r_day = r_day.sort_values(["team", "mkt", "_r"])
+    first_order = {}
+    rows, sty = [], []
+    for _, x in r_day.iterrows():
+        row = {"Team": x["team"], "Marketer": x["mkt"], "Ride": x["ride"],
+               "Pitch": TREATMENT.get(x["treatment"], x["treatment"])}
+        s = {k: "" for k in row}
+        if not isinstance(x["pitched"], list):
+            row.update({"Drugs pitched (in order)": "no Script Checklist yet", "N": "—"})
+            for c in CORE:
+                row[CORE_LABEL[c]] = "—"
+            row.update({"4 core drugs pitched": "—", "Order": "—", "Not in the morning list": "—"})
+            s = {k: GREY for k in row}
+            s["Drugs pitched (in order)"] = AMBER
+            rows.append(row); sty.append(s)
+            continue
+        if x["treatment"] == "S":
+            row.update({"Drugs pitched (in order)": " → ".join(x["pitched"]) or "none (Sit down)",
+                        "N": str(len(_items(x["pitched"])))})
+            for c in CORE:
+                row[CORE_LABEL[c]] = "—"
+            row.update({"4 core drugs pitched": "n/a (Sit down)", "Order": "n/a",
+                        "Not in the morning list": "—"})
+            s = {k: GREY for k in row}
+            if x["pitched"]:
+                row["4 core drugs pitched"], s["4 core drugs pitched"] = "⚠ drugs recorded on a Sit down ride", RED
+            rows.append(row); sty.append(s)
+            continue
+        items = _items(x["pitched"])
+        cats = cat_of(D, day, x["mkt"])
+        bag = {norm(b) for b in bag_for(F, D, day, x["mkt"])}
+        row["Drugs pitched (in order)"] = " → ".join(f"{i + 1}. {p}" for i, p in enumerate(x["pitched"])) or "none recorded"
+        row["N"] = str(len(items))
+        have = {c: any(CAT_CORE.get(cats.get(norm(d))) == c for d in items) for c in CORE}
+        for c in CORE:
+            row[CORE_LABEL[c]], s[CORE_LABEL[c]] = ("✓", GREEN) if have[c] else ("✗", RED)
+        miss = [CORE_LABEL[c] for c in CORE if not have[c]]
+        row["4 core drugs pitched"], s["4 core drugs pitched"] = ("✓", GREEN) if not miss else ("Missing: " + ", ".join(miss), RED)
+        if not items:
+            s["Drugs pitched (in order)"] = RED
+        # order vs the marketer's first ride of the day
+        seq = [norm(d) for d in items]
+        key = (x["mkt"], day)
+        if key not in first_order and seq:
+            first_order[key] = (x["ride"], seq, items)
+            row["Order"], s["Order"] = "reference (first ride)", GREY
+        elif seq:
+            ref_ride, ref, ref_items = first_order[key]
+            common_ref = [d for d in ref if d in seq]
+            common_now = [d for d in seq if d in ref]
+            notes = []
+            if common_ref != common_now:
+                notes.append(f"order changed vs ride {ref_ride}")
+            dropped = [ri for ri, rk in zip(ref_items, ref) if rk not in seq]
+            added = [it for it, k in zip(items, seq) if k not in ref]
+            if dropped:
+                notes.append("dropped: " + ", ".join(dropped))
+            if added:
+                notes.append("added: " + ", ".join(added))
+            row["Order"] = "✓ same as ride " + ref_ride if not notes else "⚠ " + "; ".join(notes)
+            s["Order"] = GREEN if not notes else (RED if common_ref != common_now else AMBER)
+        else:
+            row["Order"], s["Order"] = "—", GREY
+        not_bag = [d for d in items if bag and norm(d) not in bag]
+        row["Not in the morning list"] = ", ".join(not_bag) if not_bag else ("✓" if bag else "no Drug Info")
+        s["Not in the morning list"] = AMBER if not_bag else (GREEN if bag else GREY)
+        rows.append(row); sty.append(s)
+    t = pd.DataFrame(rows)
+    return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
+
+
+def summary_table(rides: pd.DataFrame) -> pd.DataFrame:
+    """Per marketer: rides checked, rides with all 4 core drugs, rides with an order change."""
+    if rides is None or rides.empty:
+        return pd.DataFrame()
+    r = rides[~rides["Pitch"].eq("Sit down") & ~rides["Drugs pitched (in order)"].eq("no Script Checklist yet")]
+    if r.empty:
+        return pd.DataFrame()
+    g = r.groupby(["Team", "Marketer"])
+    return pd.DataFrame({
+        "Rides checked": g.size(),
+        "All 4 core drugs": g["4 core drugs pitched"].apply(lambda s: f"{(s == '✓').sum()}/{len(s)}"),
+        "Order changed": g["Order"].apply(lambda s: int(s.str.contains("order changed").sum())),
+        "Drugs dropped/added": g["Order"].apply(lambda s: int(s.str.contains("dropped|added").sum())),
+    }).reset_index()
