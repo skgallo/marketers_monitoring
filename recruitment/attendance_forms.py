@@ -252,16 +252,23 @@ def submissions(raw: pd.DataFrame, form: str, cfg: dict, roster: pd.DataFrame) -
                         "person": person, "submitted_at": sub, "marketer": mkt}, index=df.index)
     out["form_key"] = df["KEY"].values if "KEY" in df.columns else None
     out["key"] = out["person"].map(norm_name)
-    # match short names to the roster ('Fatu' → 'Fatu Conteh') when the match is unique
-    if roster is not None and not roster.empty:
-        rkeys = sorted(set(roster["key"]))
-        def to_roster(k):
-            if not k or k in rkeys:
-                return k
-            hits = [rk for rk in rkeys if rk.startswith(k) or k.startswith(rk)]
-            return hits[0] if len(hits) == 1 else k
-        out["key"] = out["key"].map(to_roster)
+    out = rekey(out, roster)
     return out.reset_index(drop=True)
+
+
+def rekey(subs: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    """Match short names to the roster ('Fatu' → 'Fatu Conteh') when the match is unique."""
+    if subs is None or subs.empty or roster is None or roster.empty:
+        return subs
+    rkeys = sorted(set(roster["key"]))
+    def to_roster(k):
+        if not k or k in rkeys:
+            return k
+        hits = [rk for rk in rkeys if rk.startswith(k) or k.startswith(rk)]
+        return hits[0] if len(hits) == 1 else k
+    s = subs.copy()
+    s["key"] = s["person"].map(norm_name).map(to_roster)
+    return s
 
 
 # --------------------------------------------------------------------------- views
@@ -277,7 +284,7 @@ def expected_for(person_row, plan_day: pd.DataFrame) -> dict:
     return exp
 
 
-def day_people(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame, today=None):
+def day_people(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame, today=None, adj=None):
     """One row per person on `day`: attendance and submitted / expected for each form. Returns (table, css)."""
     day = pd.Timestamp(day).normalize()
     r_day = roster[roster["date"] == day]
@@ -288,7 +295,14 @@ def day_people(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame
     for _, pr in r_day.sort_values(["team", "role", "name"]).iterrows():
         mine = s_day[s_day["key"] == pr["key"]]
         exp = expected_for(pr, p_day)
+        notes = []
+        for (d_, k_, f_), (n_, why_) in (adj or {}).items():
+            if d_ == day and k_ == pr["key"] and f_ in FORM_DEFAULTS:
+                exp[f_] = n_
+                notes.append(f"{FORM_DEFAULTS[f_]['label']} → {n_}" + (f" ({why_})" if why_ else ""))
         row = {"Team": pr["team"] or "—", "Role": pr["role"], "Name": pr["name"]}
+        if pr.get("changed"):
+            notes.insert(0, pr["changed"])
         s = {k: "" for k in row}
         total_exp, total_got = 0, 0
         for f in FORM_ORDER:
@@ -306,16 +320,19 @@ def day_people(day, roster: pd.DataFrame, plan: pd.DataFrame, subs: pd.DataFrame
         worked = len(mine) > 0
         future = today is not None and day > pd.Timestamp(today)
         tracked = pr["role"] in TRACKED_ROLES
-        row["Attendance"] = ("Present" if worked else "Scheduled" if future
+        excused = (not worked) and total_exp == 0 and any(k_ == pr["key"] and d_ == day for (d_, k_, _f) in (adj or {}))
+        row["Attendance"] = ("Present" if worked else "Excused (adjusted)" if excused else "Scheduled" if future
                              else "Absent / no forms" if tracked else "Not tracked (no form)")
         s["Attendance"] = ("color:#1E7B34;font-weight:600" if worked else
-                           "color:#CC0000;font-weight:600" if (tracked and not future) else "color:#888888")
+                           "color:#CC0000;font-weight:600" if (tracked and not future and not excused) else "color:#888888")
         last = mine["submitted_at"].max()
         row["Last form"] = last.strftime("%H:%M") if pd.notna(last) else "—"
         row["All forms in"] = ("✓" if total_got >= total_exp else f"{total_exp - total_got} missing") if total_exp else "—"
         s["All forms in"] = ("color:#1E7B34;font-weight:600" if total_got >= total_exp
                              else "color:#CC0000;font-weight:600") if total_exp else "color:#888888"
         s["Last form"] = ""
+        row["Changes"] = "; ".join(notes) or ""
+        s["Changes"] = "color:#5B4BB7"
         rows.append(row); sty.append(s); seen.add(pr["key"])
     # people who submitted but aren't on the roster
     for k, g in s_day[~s_day["key"].isin(seen) & (s_day["key"] != "")].groupby("key"):
@@ -384,7 +401,15 @@ def fix_roster_dates(roster: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
     return r
 
 
-def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=None):
+def _all_zeroed(key, d, r_pd, adj) -> bool:
+    """True when every form this person was expected to submit that day was adjusted down to 0."""
+    if not adj:
+        return False
+    forms = {fm for role in r_pd["role"] for fm, _u, _n in EXPECTED.get(role, [])}
+    return bool(forms) and all(adj.get((d, key, fm), (None,))[0] == 0 for fm in forms)
+
+
+def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=None, adj=None):
     """Person × day: Present (submitted something) / Absent (rostered, nothing) / — (not rostered).
     Returns (table, css)."""
     people = roster.drop_duplicates("key")[["key", "name"]]
@@ -400,10 +425,12 @@ def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=
             rostered = not r_pd.empty
             tracked = r_pd["role"].isin(TRACKED_ROLES).any()
             worked = ((subs["key"] == p["key"]) & (subs["date"] == d)).any()
+            excused = rostered and not worked and _all_zeroed(p["key"], d, r_pd, adj)
             future = today is not None and pd.Timestamp(d) > pd.Timestamp(today)
             field_r = rostered and r_pd["role"].map(lambda x: x in TRACKED_ROLES and x != "Data entry").any()
             field_w = ((subs["key"] == p["key"]) & (subs["date"] == d) & (subs["form"] != "dataentry")).any()
-            n_rostered += field_r and not future; n_present += field_w and field_r
+            n_rostered += field_r and not future; n_present += (field_w or excused) and field_r
+            n_total += bool(excused and not worked)
             as_entry = rostered and (r_pd["role"] == "Data entry").any()
             if "Data entry" in TRACKED_ROLES:    # card form connected: count days they actually entered cards
                 entry_day = as_entry and ((subs["key"] == p["key"]) & (subs["date"] == d) & (subs["form"] == "dataentry")).any()
@@ -414,6 +441,8 @@ def attendance_grid(roster: pd.DataFrame, subs: pd.DataFrame, days: list, today=
             if worked:
                 row[col] = "✓" if rostered else "✓ (not rostered)"
                 s[col] = "background-color:#D9F2E6" if rostered else "background-color:#EEEDFE"
+            elif excused:
+                row[col], s[col] = "✓ (adjusted)", "background-color:#E8F4EC"
             elif rostered and today is not None and pd.Timestamp(d) > pd.Timestamp(today):
                 row[col], s[col] = "scheduled", "color:#888888"
             elif rostered and not tracked:
@@ -485,7 +514,7 @@ def name_checks(day, roster: pd.DataFrame, subs: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- sign-up card data entry
-def card_entry(plan: pd.DataFrame, subs: pd.DataFrame, upto=None, day=None, roster=None) -> tuple:
+def card_entry(plan: pd.DataFrame, subs: pd.DataFrame, upto=None, day=None, roster=None, cards_adj=None) -> tuple:
     """One row per planned ride (on `day`, or every ride up to `upto`): sign-up cards entered / 27,
     who entered them and when. Matched by batch code, whatever day the entry was done. Returns (table, css)."""
     p = plan.copy()
@@ -501,8 +530,9 @@ def card_entry(plan: pd.DataFrame, subs: pd.DataFrame, upto=None, day=None, rost
     for _, pr in p.sort_values(["date", "team", "_r"]).iterrows():
         m = de[de["code"] == pr["code"]]
         n = len(m)
+        exp_n, why = (cards_adj or {}).get(pr["code"], (CARDS_PER_RIDE, ""))
         row = {"Ride date": pr["date"].strftime("%a %d %b"), "Team": pr["team"], "Ride": pr["ride"],
-               "Batch code": pr["code"], "Cards entered": f"{n}/{CARDS_PER_RIDE}",
+               "Batch code": pr["code"], "Cards entered": f"{n}/{exp_n}",
                "Entered by": ", ".join(dict.fromkeys(str(x) for x in m["person"] if x)) or "—",
                "Entered on": ", ".join(dict.fromkeys(d.strftime("%d %b") for d in m["date"].dropna())) or "—"}
         # date check: was each card entered on a day the person was on the roster for data entry?
@@ -514,14 +544,15 @@ def card_entry(plan: pd.DataFrame, subs: pd.DataFrame, upto=None, day=None, rost
                 if (k, d) not in sched:
                     off.append(f"{g['person'].iloc[0]} {d.strftime('%d %b')} ({len(g)})")
         row["Entry date check"] = ("✓ on scheduled days" if not off else "Not scheduled: " + "; ".join(off)) if n else "—"
-        if n == CARDS_PER_RIDE:
+        if n == exp_n:
             status, css = "✓ complete", "color:#1E7B34;font-weight:600"
-        elif n > CARDS_PER_RIDE:
-            status, css = f"{n - CARDS_PER_RIDE} too many — duplicates?", "color:#B26B00;font-weight:600"
+        elif n > exp_n:
+            status, css = f"{n - exp_n} too many — duplicates?", "color:#B26B00;font-weight:600"
         elif n == 0:
             status, css = "not started", "color:#CC0000;font-weight:600"
         else:
-            status, css = f"{CARDS_PER_RIDE - n} missing", "color:#B26B00;font-weight:600"
+            status, css = f"{exp_n - n} missing", "color:#B26B00;font-weight:600"
+        row["Expected changed"] = f"{CARDS_PER_RIDE} → {exp_n}" + (f" ({why})" if why else "") if (pr["code"] in (cards_adj or {})) else ""
         row["Status"] = status
         s = {k: "" for k in row}
         s["Cards entered"] = s["Status"] = css
@@ -529,3 +560,74 @@ def card_entry(plan: pd.DataFrame, subs: pd.DataFrame, upto=None, day=None, rost
         rows.append(row); sty.append(s)
     t = pd.DataFrame(rows)
     return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
+
+
+# --------------------------------------------------------------------------- corrections made in the dashboard
+ROSTER_CHANGE_COLS = ["date", "team", "role", "planned", "new", "reason", "saved_at"]
+ADJUST_COLS = ["date", "name", "form", "batch_code", "expected", "reason", "saved_at"]
+
+
+def _as_date(x):
+    d = pd.to_datetime(x, format="ISO8601", errors="coerce")
+    if pd.isna(d):
+        d = pd.to_datetime(x, dayfirst=True, errors="coerce")
+    return d.normalize() if pd.notna(d) else pd.NaT
+
+
+def apply_roster_changes(roster: pd.DataFrame, changes: pd.DataFrame) -> pd.DataFrame:
+    """Replacements and other roster changes saved from the dashboard (roster_changes tab).
+    planned + new = replacement · new only = person added · planned only = removed (didn't work, not expected)."""
+    r = roster.copy()
+    r["changed"] = ""
+    if changes is None or changes.empty:
+        return r
+    ch = changes.reindex(columns=ROSTER_CHANGE_COLS).fillna("")
+    for _, c in ch.iterrows():
+        d = _as_date(c["date"])
+        if pd.isna(d):
+            continue
+        team = re.sub(r"\D", "", str(c["team"]))
+        role, planned, new, why = str(c["role"]).strip(), str(c["planned"]).strip(), str(c["new"]).strip(), str(c["reason"]).strip()
+        why_txt = f" — {why}" if why else ""
+        if planned:
+            m = (r["date"] == d) & (r["key"] == norm_name(planned))
+            if team:
+                m &= r["team"] == team
+            if role:
+                m &= r["role"] == role
+            if not m.any():
+                continue
+            if new:
+                r.loc[m, "name"] = new
+                r.loc[m, "key"] = norm_name(new)
+                r.loc[m, "code"] = ""
+                r.loc[m, "changed"] = f"Replaces {planned}{why_txt}"
+            else:
+                r = r[~m]
+        elif new:
+            r = pd.concat([r, pd.DataFrame([{"date": d, "team": team, "role": role, "name": new, "code": "",
+                                             "key": norm_name(new), "changed": f"Added{why_txt}"}])],
+                          ignore_index=True)
+    return r.reset_index(drop=True)
+
+
+def parse_adjustments(adj: pd.DataFrame):
+    """adjust_expected tab → ({(date, person key, form id): (expected, reason)}, {batch code: (expected, reason)})."""
+    people, cards = {}, {}
+    if adj is None or adj.empty:
+        return people, cards
+    lab2id = {v["label"]: k for k, v in FORM_DEFAULTS.items()}
+    a = adj.reindex(columns=ADJUST_COLS).fillna("")
+    for _, x in a.iterrows():
+        n = pd.to_numeric(x["expected"], errors="coerce")
+        if pd.isna(n):
+            continue
+        form = lab2id.get(str(x["form"]).strip(), str(x["form"]).strip())
+        why = str(x["reason"]).strip()
+        if form == "dataentry" and str(x["batch_code"]).strip():
+            cards[str(x["batch_code"]).strip()] = (int(n), why)
+            continue
+        d = _as_date(x["date"])
+        if pd.notna(d) and str(x["name"]).strip():
+            people[(d, norm_name(x["name"]), form)] = (int(n), why)
+    return people, cards

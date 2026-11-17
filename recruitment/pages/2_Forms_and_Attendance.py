@@ -47,8 +47,11 @@ def _roster_sheet_id():
     return m.group(1) if m else None
 
 
-def _fixes_ws(create=False):
-    """The 'fixes' worksheet in the roster Sheet via the service account, or None if not possible."""
+TAB_COLS = {"fixes": FIX_COLS, "roster_changes": F.ROSTER_CHANGE_COLS, "adjust_expected": F.ADJUST_COLS}
+
+
+def _tab_ws(tab: str, create=False):
+    """A worksheet in the roster Sheet via the service account (created with headers if asked), or None."""
     try:
         import gspread
         from data_io import _service_account_info
@@ -58,34 +61,34 @@ def _fixes_ws(create=False):
             return None
         sh = gspread.service_account_from_dict(info).open_by_key(sid)
         try:
-            ws = sh.worksheet("fixes")
+            ws = sh.worksheet(tab)
         except gspread.WorksheetNotFound:
             if not create:
                 return None
-            ws = sh.add_worksheet("fixes", rows=500, cols=len(FIX_COLS))
+            ws = sh.add_worksheet(tab, rows=500, cols=len(TAB_COLS[tab]))
         if not ws.row_values(1):
-            ws.update(values=[FIX_COLS], range_name="A1")
+            ws.update(values=[TAB_COLS[tab]], range_name="A1")
         return ws
     except Exception as e:
-        st.session_state["fixes_error"] = str(e)
+        st.session_state["sheet_error"] = str(e)
         return None
 
 
-def _load_fixes() -> pd.DataFrame:
-    ws = _fixes_ws()
+def _load_tab(tab: str) -> pd.DataFrame:
+    ws = _tab_ws(tab)
     if ws is not None:
         try:
             return pd.DataFrame(ws.get_all_records(), dtype=str)
         except Exception as e:
-            st.session_state["fixes_error"] = str(e)
-    url = st.secrets.get("fixes_url")
-    return _read(url, "fixes") if url else pd.DataFrame()
+            st.session_state["sheet_error"] = str(e)
+    url = st.secrets.get(f"{tab}_url")
+    return _read(url, tab) if url else pd.DataFrame()
 
 
-def _save_fixes(rows: list) -> str | None:
-    ws = _fixes_ws(create=True)
+def _append_tab(tab: str, rows: list) -> str | None:
+    ws = _tab_ws(tab, create=True)
     if ws is None:
-        return st.session_state.get("fixes_error") or "No service account or roster_url in Secrets."
+        return st.session_state.get("sheet_error") or "No service account or roster_url in Secrets."
     try:
         ws.append_rows(rows, value_input_option="RAW")
         return None
@@ -93,19 +96,46 @@ def _save_fixes(rows: list) -> str | None:
         return str(e)
 
 
-def _rewrite_fixes(df: pd.DataFrame) -> str | None:
-    """Replace the whole fixes tab with `df` (used to edit or undo saved fixes)."""
-    ws = _fixes_ws(create=True)
+def _rewrite_tab(tab: str, df: pd.DataFrame) -> str | None:
+    """Replace a whole tab with `df` (used to edit or undo saved corrections)."""
+    ws = _tab_ws(tab, create=True)
     if ws is None:
-        return st.session_state.get("fixes_error") or "No service account or roster_url in Secrets."
+        return st.session_state.get("sheet_error") or "No service account or roster_url in Secrets."
     try:
-        cols = list(dict.fromkeys(FIX_COLS + [c for c in df.columns if c in FIX_COLS]))
+        cols = TAB_COLS[tab]
         body = df.reindex(columns=cols).fillna("").astype(str).values.tolist()
         ws.clear()
         ws.update(values=[cols] + body, range_name="A1")
         return None
     except Exception as e:
         return str(e)
+
+
+_load_fixes = lambda: _load_tab("fixes")
+_save_fixes = lambda rows: _append_tab("fixes", rows)
+_rewrite_fixes = lambda df: _rewrite_tab("fixes", df)
+SHARE_HINT = ("Share the roster Sheet with the service account "
+              "(hfc-dashboard@recruitment-hfc-dashboard.iam.gserviceaccount.com) as **Editor**.")
+
+
+def saved_list(tab: str, label_cols: dict, key: str):
+    """Saved corrections with an Undo? tick box; saving rewrites the tab."""
+    saved = _load_tab(tab)
+    if saved.empty:
+        st.caption("Nothing saved yet.")
+        return
+    saved = saved.reindex(columns=TAB_COLS[tab]).fillna("")
+    sv = saved.copy()
+    sv.insert(0, "Undo?", False)
+    new_sv = st.data_editor(sv.rename(columns=label_cols), hide_index=True, width="stretch", key=key,
+                            disabled=[c for c in sv.rename(columns=label_cols).columns if c != "Undo?"])
+    if st.button("💾 Save (remove ticked)", key=key + "_btn"):
+        keep = saved[~new_sv["Undo?"].values]
+        err = _rewrite_tab(tab, keep)
+        if err:
+            st.error(f"Could not save: {err}. {SHARE_HINT}")
+        else:
+            load_all.clear(); st.rerun()
 
 
 # --------------------------------------------------------------------------- data
@@ -146,7 +176,7 @@ def load_all():
         columns=["form", "date", "code", "team", "role", "person", "key", "submitted_at", "marketer", "form_key"])
     subs = F.apply_fixes(subs, _load_fixes(), roster)
     status["fixes"] = f"{int(subs['fixed_from'].notna().sum())} forms"
-    return roster, plan, subs, status
+    return roster, plan, subs, status, _load_tab("roster_changes"), _load_tab("adjust_expected")
 
 
 def show(t, css):
@@ -163,7 +193,7 @@ if c2.button("🔄 Refresh"):
     load_all.clear()
     st.rerun()
 
-roster, plan, subs, status = load_all()
+roster, plan, subs, status, roster_changes, adjust_raw = load_all()
 if status.get("dataentry") != "not connected":
     F.TRACKED_ROLES.add("Data entry")      # data-entry people now have a form: ✓ / ✗ like everyone else
 try:
@@ -177,6 +207,9 @@ roster["date"] = pd.to_datetime(roster["date"], errors="coerce", utc=True).dt.tz
 plan = plan.copy()
 plan["date"] = pd.to_datetime(plan["date"], errors="coerce", utc=True).dt.tz_localize(None).dt.normalize()
 roster = F.fix_roster_dates(roster, plan)
+roster = F.apply_roster_changes(roster, roster_changes)      # replacements made in the dashboard
+subs = F.rekey(subs, roster)
+adj, cards_adj = F.parse_adjustments(adjust_raw)
 subs = subs[subs["date"].isna() | (subs["date"] >= start)]
 
 st.caption("Data sources: " + " · ".join(f"{F.FORM_DEFAULTS[f]['label']}: {status.get(f, '—')}" for f in F.FORM_ORDER)
@@ -196,7 +229,7 @@ tab_day, tab_att = st.tabs(["Day", "Attendance"])
 with tab_day:
     day = st.selectbox("Day", days, index=default, format_func=lambda d: pd.Timestamp(d).strftime("%a %d %b %Y")
                        + (" (today)" if pd.Timestamp(d) == today else ""))
-    t, css = F.day_people(day, roster, plan, subs, today)
+    t, css = F.day_people(day, roster, plan, subs, today, adj)
     if not t.empty:
         rostered = t[~t["Attendance"].isin(["Not on roster", "Not tracked (no form)"])]
         k = st.columns(4)
@@ -209,6 +242,73 @@ with tab_day:
                "1 per ride (E4) · BnB Drug Info: 2 per marketer (E4) · BnB Data Entry: 1 per ride each (E2, E3). "
                "🟢 complete · 🟠 some missing · 🔴 none yet · purple = submitted but not on the roster.")
     show(t, css)
+
+    D = pd.Timestamp(day).normalize()
+    r_today = roster[roster["date"] == D]
+    all_names = sorted(set(roster["name"]) - {""})
+    c_rep, c_adj = st.columns(2)
+    with c_rep.expander("🔁 Replacement / roster change for this day"):
+        st.caption("Someone replaced a planned person, an extra person worked, or a planned person didn't work. "
+                   "Saved to the *roster_changes* tab — no need to edit the roster itself.")
+        kind = st.radio("What happened?", ["Replacement", "Extra person worked", "Planned person did not work"],
+                        horizontal=True, key="rc_kind")
+        teams = sorted(set(r_today["team"]) - {""}) or sorted(set(plan.loc[plan["date"] == D, "team"]))
+        cc = st.columns(2)
+        team = cc[0].selectbox("Team", teams or ["—"], key="rc_team")
+        role = cc[1].selectbox("Role", ["E1", "E2", "E3", "E4", "Supervisor", "Data entry"], key="rc_role")
+        planned_opts = sorted(r_today.loc[(r_today["team"] == team) & (r_today["role"] == role), "name"])
+        planned = new = ""
+        if kind != "Extra person worked":
+            planned = st.selectbox("Planned person", planned_opts or ["(nobody rostered for this team and role)"],
+                                   key="rc_planned")
+        if kind != "Planned person did not work":
+            pick = st.selectbox("Who actually worked", ["— type a new name —"] + all_names, key="rc_new")
+            new = st.text_input("New name", key="rc_new_txt") if pick.startswith("—") else pick
+        why = st.text_input("Reason (optional)", key="rc_why")
+        if st.button("💾 Save roster change", key="rc_save"):
+            if (kind != "Extra person worked" and planned not in planned_opts) or (kind != "Planned person did not work" and not new.strip()):
+                st.info("Choose the planned person and/or who worked.")
+            else:
+                err = _append_tab("roster_changes", [[str(D.date()), team, role, planned, new.strip(), why,
+                                                      dt.datetime.now().strftime("%Y-%m-%d %H:%M")]])
+                if err:
+                    st.error(f"Could not save: {err}. {SHARE_HINT}")
+                else:
+                    load_all.clear(); st.rerun()
+        st.markdown("**Saved roster changes**")
+        saved_list("roster_changes", {"planned": "Planned", "new": "Worked instead"}, "rc_saved")
+
+    with c_adj.expander("🧮 Adjust expected forms"):
+        st.caption("Something in the field meant forms couldn't be filled (phone broke, ride cancelled, fewer cards…). "
+                   "Set the number we should expect. Saved to the *adjust_expected* tab.")
+        labels = {F.FORM_DEFAULTS[f]["label"]: f for f in F.FORM_ORDER}
+        form_lbl = st.selectbox("Form", list(labels), key="ax_form")
+        fid = labels[form_lbl]
+        code, person = "", ""
+        if fid == "dataentry":
+            codes = list(plan.loc[plan["date"] == D, "code"])
+            code = st.selectbox("Ride (batch code)", codes or ["(no rides planned)"], key="ax_code")
+            cur = cards_adj.get(code, (F.CARDS_PER_RIDE, ""))[0]
+        else:
+            people_opts = sorted(r_today["name"])
+            person = st.selectbox("Person", people_opts or ["(nobody rostered)"], key="ax_person")
+            pr = r_today[r_today["name"] == person]
+            cur = F.expected_for(pr.iloc[0], plan[plan["date"] == D]).get(fid, 0) if not pr.empty else 0
+            cur = adj.get((D, F.norm_name(person), fid), (cur, ""))[0]
+        n_exp = st.number_input(f"Expected {form_lbl} forms (now {cur})", min_value=0, value=int(cur), step=1, key="ax_n")
+        why2 = st.text_input("Reason", key="ax_why", placeholder="e.g. phone battery died on ride 3")
+        if st.button("💾 Save adjustment", key="ax_save"):
+            if not why2.strip():
+                st.info("Please add a short reason.")
+            else:
+                err = _append_tab("adjust_expected", [[str(D.date()), person, form_lbl, code, int(n_exp), why2.strip(),
+                                                       dt.datetime.now().strftime("%Y-%m-%d %H:%M")]])
+                if err:
+                    st.error(f"Could not save: {err}. {SHARE_HINT}")
+                else:
+                    load_all.clear(); st.rerun()
+        st.markdown("**Saved adjustments**")
+        saved_list("adjust_expected", {"expected": "Expected"}, "ax_saved")
 
     nc = F.name_checks(day, roster, subs)
     st.markdown("#### Check names")
@@ -286,9 +386,9 @@ with tab_day:
         st.caption(f"Each planned ride should have {F.CARDS_PER_RIDE} Data Entry submissions (one per sign-up card), "
                    "matched by batch code — whatever day they were entered. **Entry date check**: cards entered by someone "
                    "who wasn't on the roster for data entry that day.")
-        tc, tcc = F.card_entry(plan, subs, day=day, roster=roster)
+        tc, tcc = F.card_entry(plan, subs, day=day, roster=roster, cards_adj=cards_adj)
         show(tc, tcc)
-        back, backc = F.card_entry(plan, subs, upto=today, roster=roster)
+        back, backc = F.card_entry(plan, subs, upto=today, roster=roster, cards_adj=cards_adj)
         if not back.empty:
             open_ = back["Status"] != "✓ complete"
             with st.expander(f"All rides so far: {int(open_.sum())} of {len(back)} not complete"):
@@ -301,7 +401,7 @@ with tab_att:
                "form is connected, past days on the roster for data entry). **Total** = days worked, either kind, "
                "each day counted once.")
     sel = st.slider("Days", 1, len(days), min(14, len(days)), help="How many of the most recent days to show")
-    tg, tgc = F.attendance_grid(roster, subs, days[-sel:], today)
+    tg, tgc = F.attendance_grid(roster, subs, days[-sel:], today, adj)
     show(tg, tgc)
     st.download_button("⬇ Download attendance (CSV)", tg.to_csv(index=False).encode("utf-8"),
                        file_name="attendance.csv", mime="text/csv")
