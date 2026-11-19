@@ -2229,8 +2229,6 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             issues.append("E4: E1 not sitting after sign-up")
         if _o.get("E4: Sit down confirmed", ("", ""))[1] == RED:
             issues.insert(0, "E4: marketer spoke or sold on the Sit down ride")
-        if _o.get("E4: bus at start", ("", ""))[1] == RED:
-            issues.append("E4 disagrees on how full the bus was")
         row["Timeline issues"] = " · ".join(issues) or "None"
         s["Timeline issues"] = RED if issues else GREEN
         s["Independent check"] = (verdicts or {}).get(_txt(r.get("form_id")), ("", GRAY))[1]
@@ -2411,14 +2409,10 @@ def e4_observations(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: pd
         if e4f in BUS_FULLNESS:
             txt = BUS_FULLNESS[e4f] + (f" ({BOARDING[brd]})" if brd in BOARDING else "")
             full4, full1 = e4f in ("3", "4"), e1f in ("3", "4")
-            if e1f in BUS_FULLNESS and full4 != full1:
-                txt += f" — E1 said {BUS_FULLNESS[e1f]}"
-                o["E4: bus at start"] = (txt, RED)
-                probs.append(f"E4: bus was {BUS_FULLNESS[e4f]} at the start (E1: {BUS_FULLNESS[e1f]})")
-            elif e1f in BUS_FULLNESS and e1f != e4f:
-                o["E4: bus at start"] = (txt + f" — E1: {BUS_FULLNESS[e1f]}", AMBER)
-            else:
-                o["E4: bus at start"] = (txt, GREEN if e1f else "")
+            # information only (not a flag): shown next to the E1's answer
+            if e1f in BUS_FULLNESS and e1f != e4f:
+                txt += f" — E1: {BUS_FULLNESS[e1f]}"
+            o["E4: bus at start"] = (txt, "")
         sat = _code(x.get("b04a"))
         if sat == "1":
             o["E4: E1 seated after sign-up"] = ("Yes", GREEN)
@@ -3042,7 +3036,7 @@ COLUMN_HELP = {
                        "strategic point?",
     "Bus at start": "How full the bus was when it left the park (E1)",
     "E4: bus at start": "How full the bus was at the start and how passengers boarded, as seen by the E4 (b02a, b02). "
-                        "Red = E4 and E1 disagree on whether the bus was full; amber = a smaller difference",
+                        "Information only (not flagged); the E1's answer is added when it differs",
     "E4: E1 seated after sign-up": "E4 (b04a): was the E1 sitting down once the sign-up process ended",
     "E4: why the pitch started late": "E4's explanation when the pitch started more than 2 min after sign-up (pitch_delay_why)",
     "E4: Sit down confirmed": "Sit down rides — E4 confirms the marketer sat, didn't speak and sold nothing "
