@@ -2082,7 +2082,8 @@ COL_DELAY2 = f"Ride start → announcement (min, ≤{DELAY_MAX_MIN})"
 COL_ANN   = f"Announcement + sign-up ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_LAG   = "Ann. end → sign-up end (min)"
 COL_SGAP  = f"Sign-up end → pitch/pause (≤{DELAY_MAX_MIN} min)"
-COL_PP    = "Pitch/pause (min)"
+COL_PP    = "Pitch time (min)"
+COL_PAUSEQ = "Pause time / equivalent (min)"
 COL_RIDE2 = "Ride (min)"
 COL_PREV  = "Since team's previous ride (min)"
 
@@ -2147,6 +2148,11 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
         ann_end = t["b03"] + pd.Timedelta(minutes=ann) if pd.notna(t["b03"]) and not np.isnan(ann) else pd.NaT
         lag = _diff_minutes(ann_end, t["b04"])
         pp = _num(r.get("pause_duration"));  pp = du["pp"] if np.isnan(pp) else pp
+        _trt_i = str(ident.at[i, "planned"] or "")[-1:] or ("S" if pd.isna(t["b05"]) and pd.notna(t["b06"]) else "")
+        # Sit down: pause start → ride end. Normal/Peddling: the same span = pitch + (pitch end → ride end)
+        pauseq = _diff_minutes(t["b06"] if _trt_i == "S" or pd.isna(t["b05"]) else t["b05"], t["b11"])
+        if _trt_i == "S" and not np.isnan(pp):
+            pauseq = pp
         ride = _num(r.get("ride_duration")); ride = du["ride"] if np.isnan(ride) else ride
         start_txt, start_css = _start_check(r)
         sp = _code(r.get("sp_when"))
@@ -2204,7 +2210,8 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             COL_ANN: fmt_val(annsu, 1),
             COL_LAG: fmt_val(lag, 1),
             COL_SGAP: fmt_val(du["gap"], 1),
-            COL_PP: fmt_val(pp, 1),
+            COL_PP: fmt_val(pp, 1) if _trt_i != "S" else "—",
+            COL_PAUSEQ: fmt_val(pauseq, 1),
             COL_RIDE2: fmt_val(ride, 1),
             "Apprentice gave seat": YESNO_SHORT.get(_code(r.get("apprentice_seat")), "—"),
             CLOCK_PREFIX + "Ride start": _clock(t["b02_r"]),
@@ -2961,6 +2968,11 @@ def _balance_one(f: pd.DataFrame, control: str = "Sit down"):
 # Column descriptions (shown when hovering over a column header, and under the tables)
 # ---------------------------------------------------------------------------
 COLUMN_HELP = {
+    COL_PP: "Normal / Peddling only: how long the marketer pitched (pitch start b05 → pitch end b09). Empty for "
+            "Sit down. Targets: Normal ≥ 15 min, Peddling ≥ 12 min (or until the ride ended).",
+    COL_PAUSEQ: "Sit down: the pause = pause start (b06) → ride end (b11), i.e. ride duration − initial wait − "
+                "announcement + sign-up − gap to the pause. Normal / Peddling: the equivalent span = pitch time + "
+                "time from pitch end to ride end (b05 → b11), so the three treatments can be compared.",
     # performance indicators
     "Rides": "Number of rides in the selection",
     "Correct batch code": "Right planned code selected and ride details (date, team, ride #) entered correctly. "
