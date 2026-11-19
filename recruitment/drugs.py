@@ -16,8 +16,11 @@ import attendance_forms as AF
 
 CORE = ["pain", "dew", "cold", "anti"]
 CORE_LABEL = {"pain": "Pain", "dew": "Deworming", "cold": "Cold", "anti": "Infection"}
-# drug_cat codes in the BnB Drug Info form (worked out from the form's own core_* flags — confirm with the form)
-CAT_LABEL = {"1": "Pain", "2": "Infection", "3": "Infection", "4": "Deworming", "7": "Cold", "-55": "Other"}
+# drug_cat codes in the BnB Drug Info form (choice list "drugcat")
+CAT_LABEL = {"1": "Pain Medicine", "2": "Antibiotic", "3": "Antifungal", "4": "Deworming", "5": "Vitamins",
+             "6": "Candy", "7": "Cold Medicine", "8": "Antimalarial", "9": "Ulcer or anti acid", "10": "Perfume",
+             "-55": "Other"}
+# core types: Infection = antibiotic or antifungal (as in the form's core_anti)
 CAT_CORE = {"1": "pain", "2": "anti", "3": "anti", "4": "dew", "7": "cold"}
 TREATMENT = {"N": "Normal", "P": "Peddling", "S": "Sit down"}
 TEST_USERNAMES = AF.TEST_USERNAMES
@@ -137,6 +140,8 @@ def drug_info(raw: pd.DataFrame) -> tuple:
         known = {(d, m, norm(x)): c for d, m, x, c in zip(kd["date"], kd["mkt"], kd["drug"], kd["cat"])}
         k = list(zip(D["date"], D["mkt"], D["drug"].map(norm)))
         D["cat"] = [c if c else known.get(kk) for c, kk in zip(D["cat"], k)]
+        oth = {(d, m, norm(x)): o for d, m, x, o in zip(kd["date"], kd["mkt"], kd["drug"], kd["cat_other"]) if o}
+        D["cat_other"] = [o if o else oth.get(kk) for o, kk in zip(D["cat_other"], k)]
         D["category"] = [CAT_LABEL.get(c, f"Category {c}") if c else "—" for c in D["cat"]]
         D.loc[D["cat"] == "-55", "category"] = "Other" + D.loc[D["cat"] == "-55", "cat_other"].map(
             lambda x: f" ({x})" if x else "")
@@ -189,7 +194,7 @@ def morning_table(F: pd.DataFrame, D: pd.DataFrame, day, plan: pd.DataFrame | No
             mr = morning.iloc[-1]
             dd = D[(D["key"] == mr["key"])] if not D.empty else D
             cats = {norm(x): c for x, c in zip(dd["drug"], dd["cat"])} if not dd.empty else {}
-            lst = [f"{x} ({CAT_LABEL.get(cats.get(norm(x)), '?')})" for x in mr["drugs"]]
+            lst = [f"{x} ({CAT_LABEL.get(cats.get(norm(x)), 'no category')})" for x in mr["drugs"]]
             row.update({"E4": mr["e4"], "Morning form": mr["submitted_at"].strftime("%H:%M") if pd.notna(mr["submitted_at"]) else "✓",
                         "Drugs in the bag": " · ".join(lst) or "—", "N": str(len(mr["drugs"]))})
             s.update({"E4": "", "Morning form": GREEN, "Drugs in the bag": "", "N": ""})
@@ -227,6 +232,34 @@ def _repeat_values(r: pd.Series, field: str) -> list:
     return [v for _, v in sorted(vals)]
 
 
+MENTIONS = {"name": "Name of the drug", "condition": "Condition / sickness", "dosage": "Dosage",
+            "dosage_x": "Dosage (added claims)", "sym_basic": "Symptoms", "sym_narr": "Symptoms (narratives)",
+            "predisp": "Predisposing factors", "complications": "Complications", "price": "Price",
+            "price_x": "Price (bargaining / promotions)", "work": "Work of the drug", "composition": "Composition",
+            "composition_x": "Composition (appeals)", "contra": "Contraindications",
+            "contra_x": "Contraindications (claims)", "manufact": "Manufacturer", "manufact_x": "Manufacturer (appeals)",
+            "expiry": "Expiry date", "expiry_x": "Expiry (reassurance)", "sidefx": "Side effects",
+            "fear": "Fear-based appeals", "hope": "Hope and promises", "scarcity": "Scarcity / call to action",
+            "destigma": "Destigmatising", "authority": "Authority / pharmacy", "visual": "Visual aids",
+            "testimony": "Testimonies", "local_terms": "Local sayings", "tactile": "Tactile / taste",
+            "proof": "Proof of correctness", "icebreaker": "Icebreaker", "mimic": "Mimicking", "teaching": "Teaching",
+            "nosidefx": "No side effects", "referral": "Referral", "warranty": "Warranty"}
+ASKED_WHO = {"1": "Marketer", "2": "E1", "3": "E2", "4": "E3", "5": "E4", "6": "Supervisor",
+             "7": "Another passenger", "-55": "Other"}
+
+
+def _repeat_map(r: pd.Series, field: str) -> dict:
+    """{instance number: value} of a repeat field published wide (field_1, field_2, …)."""
+    out = {}
+    for c in r.index:
+        m = re.fullmatch(rf"{field}_(\d+)", str(c))
+        if m and pd.notna(r[c]) and str(r[c]).strip():
+            out[int(m.group(1))] = str(r[c]).strip()
+    if not out and field in r.index and pd.notna(r[field]) and str(r[field]).strip():
+        out[1] = str(r[field]).strip()
+    return out
+
+
 def ride_drugs(script_raw: pd.DataFrame) -> pd.DataFrame:
     """One row per ride (Script Checklist, E4 preferred over supervisor): planned code, ride info and
     the drugs pitched in order (a bundle counts as all its drugs, in the same position)."""
@@ -242,12 +275,30 @@ def ride_drugs(script_raw: pd.DataFrame) -> pd.DataFrame:
         p = AF.parse_code(code[i])
         if not p:
             continue
-        drugs = _repeat_values(r, "drug_name")
+        names = _repeat_map(r, "drug_name")
+        drugs = [names[k] for k in sorted(names)]
+        ran_out = _repeat_map(r, "f12"); asked = _repeat_map(r, "f13")
+        qs = _repeat_map(r, "f13b"); mentions = _repeat_map(r, "question_mentions")
+        stockout = [names.get(k, f"drug {k}") for k, v_ in sorted(ran_out.items()) if AF._code(v_) == "1"]
+        pitch_q = []
+        for k, v_ in sorted(asked.items()):
+            if AF._code(v_) == "1":
+                men = ", ".join(MENTIONS.get(m, m) for m in mentions.get(k, "").split())
+                pitch_q.append(f"{names.get(k, f'drug {k}')}: {qs.get(k, '(no text)')}"
+                               + (f" [marketer mentioned: {men}]" if men else ""))
+        who = [ASKED_WHO.get(c, c) for c in str(r.get("sd_pause_who") or "").split()]
+        if "Other" in who and isinstance(r.get("sd_pause_who_oth"), str):
+            who = [w if w != "Other" else f"Other ({r['sd_pause_who_oth'].strip()})" for w in who]
         rows.append({"code": code[i], "date": p["date"], "team": p["team"], "mkt": p["mkt_id"],
                      "ride": p["ride"], "treatment": p["treatment"],
                      "role": "E4" if AF._code(r.get("role_type")) != "0" else "Supervisor",
                      "submitted_at": AF._naive_dt(pd.Series([r.get("SubmissionDate")])).iloc[0],
-                     "pitched": drugs, "key": r.get("KEY")})
+                     "pitched": drugs, "key": r.get("KEY"),
+                     "stockout": stockout, "pitch_questions": pitch_q,
+                     "pause_q": AF._code(r.get("sd_pause_q")), "pause_who": who,
+                     "pause_what": str(r.get("sd_pause_what")).strip() if isinstance(r.get("sd_pause_what"), str) else "",
+                     "comment_yn": AF._code(r.get("f14")),
+                     "comment": str(r.get("f15")).strip() if isinstance(r.get("f15"), str) else ""})
     R = pd.DataFrame(rows)
     if R.empty:
         return R
@@ -343,12 +394,15 @@ def ride_table(R: pd.DataFrame, F: pd.DataFrame, D: pd.DataFrame, day, plan: pd.
             s["Order"] = GREEN if not notes else (RED if common_ref != common_now else AMBER)
         else:
             row["Order"], s["Order"] = "—", GREY
+        so = x.get("stockout") if isinstance(x.get("stockout"), list) else []
+        row["Ran out (stockout)"] = ", ".join(so) if so else "—"
+        s["Ran out (stockout)"] = RED if so else GREY
         not_bag = [d for d, k in zip(items, keys) if bag and k not in bag]
         row["Not in the morning list"] = ", ".join(not_bag) if not_bag else ("✓" if bag else "no Drug Info")
         s["Not in the morning list"] = AMBER if not_bag else (GREEN if bag else GREY)
         rows.append(row); sty.append(s)
-    t = pd.DataFrame(rows)
-    return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
+    t = pd.DataFrame(rows).fillna("—")
+    return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna(GREY)
 
 
 def summary_table(rides: pd.DataFrame) -> pd.DataFrame:
@@ -365,6 +419,8 @@ def summary_table(rides: pd.DataFrame) -> pd.DataFrame:
             g["4 core drugs pitched"].apply(lambda s: f"{(s == '✓').sum()} of {len(s)}"),
         "Rides where the order changed": g["Order"].apply(lambda s: int(s.str.contains("order changed").sum())),
         "Rides with a drug dropped or added": g["Order"].apply(lambda s: int(s.str.contains("dropped|added").sum())),
+        "Stockouts (drug ran out)": g["Ran out (stockout)"].apply(lambda s: ", ".join(x for x in s if x != "—") or "—")
+            if "Ran out (stockout)" in r.columns else "—",
     }).reset_index()
 
 
@@ -388,3 +444,43 @@ def unmatched_names(R: pd.DataFrame, F: pd.DataFrame, D: pd.DataFrame, day) -> p
     t = (t.groupby(["Marketer", "_k"], as_index=False)
           .agg({"Written on the checklist": "first", "options": "first", "Rides": lambda s: ", ".join(sorted(set(s)))}))
     return t.drop(columns="_k")
+
+
+def reactions_table(R: pd.DataFrame, day) -> tuple:
+    """One row per ride on `day` (Script Checklist): questions during the pitch (per drug), questions during the
+    Sit down pause (and to whom), and passenger comments. Returns (table, css)."""
+    day = pd.Timestamp(day).normalize()
+    if R.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    r_day = R[R["date"] == day].copy()
+    if r_day.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    r_day["_r"] = pd.to_numeric(r_day["ride"], errors="coerce")
+    rows, sty = [], []
+    for _, x in r_day.sort_values(["team", "mkt", "_r"]).iterrows():
+        sit = x["treatment"] == "S"
+        row = {"Team": x["team"], "Marketer": x["mkt"], "Ride": x["ride"],
+               "Pitch": TREATMENT.get(x["treatment"], x["treatment"])}
+        s = {k: "" for k in row}
+        pq = x.get("pitch_questions") or []
+        row["Questions during the pitch"] = " · ".join(pq) if pq else ("n/a (Sit down)" if sit else "none")
+        s["Questions during the pitch"] = AMBER if pq else GREY
+        if sit:
+            if x.get("pause_q") == "1":
+                who = ", ".join(x.get("pause_who") or []) or "?"
+                row["Questions during the pause"] = f"Asked: {who} — {x.get('pause_what') or '(no text)'}"
+                s["Questions during the pause"] = RED if "Marketer" in (x.get("pause_who") or []) else AMBER
+            else:
+                row["Questions during the pause"] = "none" if x.get("pause_q") == "0" else "—"
+                s["Questions during the pause"] = GREY
+        else:
+            row["Questions during the pause"], s["Questions during the pause"] = "n/a", GREY
+        if x.get("comment_yn") == "1":
+            row["Passenger comments"] = x.get("comment") or "(yes, no text)"
+            s["Passenger comments"] = RED if sit else AMBER
+        else:
+            row["Passenger comments"] = "none" if x.get("comment_yn") == "0" else "—"
+            s["Passenger comments"] = GREY
+        rows.append(row); sty.append(s)
+    t = pd.DataFrame(rows)
+    return t, pd.DataFrame(sty).reindex(columns=t.columns).fillna("")

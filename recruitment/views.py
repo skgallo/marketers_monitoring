@@ -31,7 +31,7 @@ from rollup import (
 # Constants
 # ---------------------------------------------------------------------------
 
-VIEWS_VERSION = "2026-11-12"   # app.py checks this to catch an out-of-date views.py
+VIEWS_VERSION = "2026-11-19"   # app.py checks this to catch an out-of-date views.py
 
 E1, SUP = "Enumerator 1", "Supervisor"
 MISSING = "Missing/not assessed"
@@ -149,7 +149,7 @@ COL_REC     = f"Recorded ann./signup dur. ({ANN_DUR_MIN}–{ANN_DUR_MAX} min)"
 COL_AUTO    = "Auto form-screen dur."
 COL_DISCREP = f"Timing discrepancy (>{SIGNUP_DIFF_MAX} min)"
 COL_PITCH   = "Pause/Pitch (min)"
-COL_RIDE    = "Ride duration (min)"
+COL_RIDE    = f"Ride dur. (≥{RIDE_MIN_MIN} min)"
 COL_SIGNUPS = f"Signups (≥{SIGNUP_MIN})"
 COL_GAP     = f"Pitch start gap (≤{DELAY_MAX_MIN} min)"
 
@@ -469,7 +469,7 @@ def _role_short(role):
 
 
 def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
-                reviews: pd.DataFrame | None = None):
+                reviews: pd.DataFrame | None = None, e4_problems: dict | None = None):
     """
     One row per planned ride. Forms are assigned to the ride they describe
     (date + team + ride # on the form), so a form filed under the wrong planned
@@ -522,7 +522,8 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
             parts.add("Other marketer")
         # Sit down: the supervisor saw the team's own marketer speak or sell during the pause (s27 = No)
         mkt_spoke = [f for _, f in d.iterrows() if _code(f.get("s27")) == "0"]
-        if mkt_spoke:
+        e4_spoke = [x for x in (e4_problems or {}).get(code, []) if "Sit down ride" in x]
+        if mkt_spoke or e4_spoke:
             parts.add("Marketer spoke in pause")
         # Ride stopped: after sign-up cards were used (cancelled), or before them and not restarted yet
         if len(cancelled):
@@ -634,10 +635,10 @@ def ride_ledger(subs: pd.DataFrame, batch_codes: pd.DataFrame,
                     t_ += f" ({_txt(f.get('c10_labels'))})"
                 txts.append(t_)
             part_text["Ride stopped"] = txts
-        if mkt_spoke:
+        if mkt_spoke or e4_spoke:
             part_text["Marketer spoke in pause"] = [
                 "Supervisor: the marketer spoke or sold during the Sit down pause"
-                + (f" ({_txt(f.get('s27a'))})" if _txt(f.get('s27a')) else "") for f in mkt_spoke]
+                + (f" ({_txt(f.get('s27a'))})" if _txt(f.get('s27a')) else "") for f in mkt_spoke] + e4_spoke
         if other_mkt:
             part_text["Other marketer"] = [
                 f"Another marketer marketed on the bus ({_role_short(f['role'])} form, {_txt(f['person'])}"
@@ -2090,8 +2091,7 @@ def _times(r) -> dict:
     """Parsed clock times of one form (any source) with pitch/pause start/end resolved."""
     t = {k: _parse_time(r.get(k)) for k in ["b02_r", "b03", "b04", "b05", "b06", "b09", "b10", "b11"]}
     t["pp_start"] = t["b05"] if pd.notna(t["b05"]) else t["b06"]
-    t["pp_end"] = (t["b11"] if _txt(r.get("form_source")) == "Launch 0" and _txt(r.get("treatment_actual")) == "S"
-                   else t["b09"] if pd.notna(t["b09"]) else t["b10"])
+    t["pp_end"] = t["b09"] if pd.notna(t["b09"]) else t["b10"]
     return t
 
 
@@ -2118,7 +2118,8 @@ def _order_problems(t: dict) -> list:
 
 
 def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
-                        reviews: pd.DataFrame | None = None, verdicts: dict | None = None):
+                        reviews: pd.DataFrame | None = None, verdicts: dict | None = None,
+                        e4obs: dict | None = None):
     """
     One row per E1 form. Issues first (start checks, durations and gaps against their
     targets, impossible order), then — in columns starting with 🕒 — the clock times.
@@ -2197,6 +2198,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             "Start check": start_txt,
             "Strategic point": {"1": "Before point", "2": "At point", "3": "AFTER point"}.get(sp, "—"),
             "Bus at start": BUS_FULLNESS.get(_code(r.get("b02a")), "—"),
+            **{c: (e4obs or {}).get(_txt(r.get("form_id")), {}).get(c, ("—", ""))[0] for c in E4_COLS},
             COL_PREV: fmt_val(prev.get(i, np.nan), 0),
             COL_ANN: fmt_val(annsu, 1),
             COL_LAG: fmt_val(lag, 1),
@@ -2212,6 +2214,16 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             CLOCK_PREFIX + "Ride end": _clock(t["b11"]),
         }
         s = {k: "" for k in row}
+        _o = (e4obs or {}).get(_txt(r.get("form_id")), {})
+        for c in E4_COLS:
+            s[c] = _o.get(c, ("", ""))[1]
+        if _o.get("E4: E1 seated after sign-up", ("", ""))[1] == RED:
+            issues.append("E4: E1 not sitting after sign-up")
+        if _o.get("E4: Sit down confirmed", ("", ""))[1] == RED:
+            issues.insert(0, "E4: marketer spoke or sold on the Sit down ride")
+        if _o.get("E4: bus at start", ("", ""))[1] == RED:
+            issues.append("E4 disagrees on how full the bus was")
+        row["Timeline issues"] = " · ".join(issues) or "None"
         s["Timeline issues"] = RED if issues else GREEN
         s["Independent check"] = (verdicts or {}).get(_txt(r.get("form_id")), ("", GRAY))[1]
         s["Interruption — what happened"] = (RED if "STOPPED" in row["Interruption — what happened"]
@@ -2229,7 +2241,7 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
             s[COL_SGAP] = RED
         if pp_txt:
             s[COL_PP] = RED
-        if bad(ride, lo=30 if _txt(r.get("form_source")) == "Launch 0" else RIDE_MIN_MIN):
+        if bad(ride, lo=RIDE_MIN_MIN):
             s[COL_RIDE2] = GRAY                 # reference only
         if not np.isnan(lag) and lag < -1:
             s[COL_LAG] = RED
@@ -2245,6 +2257,9 @@ def ride_timeline_table(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = N
     css = pd.DataFrame(sty).reindex(columns=t.columns).fillna("")
     if verdicts is None:
         t, css = t.drop(columns=["Independent check"]), css.drop(columns=["Independent check"])
+    for c in E4_COLS:          # hide E4 columns with nothing in them (e.g. no Sit down rides shown)
+        if c in t.columns and (t[c] == "—").all():
+            t, css = t.drop(columns=[c]), css.drop(columns=[c])
     if "Interruption — what happened" in t.columns and (t["Interruption — what happened"] == "—").all():
         t, css = t.drop(columns=["Interruption — what happened"]), css.drop(columns=["Interruption — what happened"])
     for col, src in [("Apprentice gave seat", "apprentice_seat"), ("Strategic point", "sp_when"),
@@ -2265,10 +2280,10 @@ DUR_LABELS = [("delay", f"Start delay (≤{DELAY_MAX_MIN})"), ("signup", "Ann.+s
               ("ride", "Ride")]
 
 
-def _dur_flag(key, x, form_source="") -> bool:
+def _dur_flag(key, x) -> bool:
     if np.isnan(x):
         return False
-    x = round(x, 6 if form_source == "Launch 0" else 1)
+    x = round(x, 1)                           # judged on the value shown
     if key in ("delay", "gap"):
         return x > DELAY_MAX_MIN
     if key == "pp":
@@ -2357,6 +2372,68 @@ def _describe_crosscheck(step_diffs: dict, flips_red: list, flips_amber: list, r
     return " ".join(out) or "Records agree."
 
 
+BOARDING = {"1": "slow boarding, bus stopped", "2": "fast boarding, bus only turned",
+            "3": "picked up along the road"}
+E4_COLS = ["E4: bus at start", "E4: E1 seated after sign-up", "E4: why the pitch started late", "E4: Sit down confirmed"]
+
+
+def e4_observations(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: pd.DataFrame | None = None,
+                    reviews: pd.DataFrame | None = None) -> tuple[dict, dict]:
+    """
+    What the E4 (Script Checklist) saw on the same ride, beyond the clock times:
+      · b02 / b02a  how passengers boarded and how full the bus was at the start (vs the E1's b02a)
+      · b04a        was the E1 sitting down once sign-up ended
+      · pitch_delay_why   why the pitch started > 2 min after sign-up
+      · sitdown_confirm / sitdown_explain   Sit down ride: marketer silent, nothing sold
+    Returns ({E1 form_id: {column: (text, css)}}, {planned code: [problem texts]}).
+    """
+    e4 = e4 if e4 is not None else pd.DataFrame()
+    d = subs[subs["role"] == E1] if not subs.empty else subs
+    if d.empty or e4.empty:
+        return {}, {}
+    ident = ride_identity(d, batch_codes, reviews)
+    T = {i: _times(r) for i, r in d.iterrows()}
+    e4_ident = ride_identity(e4, batch_codes, reviews)
+    m4 = _match_e4({i: ident.at[i, "planned"] for i in d.index}, T, e4, e4_ident)
+    by_form, by_code = {}, {}
+    for i, j in m4.items():
+        r, x = d.loc[i], e4.loc[j]
+        o, probs = {}, []
+        e1f, e4f, brd = _code(r.get("b02a")), _code(x.get("b02a")), _code(x.get("b02"))
+        if e4f in BUS_FULLNESS:
+            txt = BUS_FULLNESS[e4f] + (f" ({BOARDING[brd]})" if brd in BOARDING else "")
+            full4, full1 = e4f in ("3", "4"), e1f in ("3", "4")
+            if e1f in BUS_FULLNESS and full4 != full1:
+                txt += f" — E1 said {BUS_FULLNESS[e1f]}"
+                o["E4: bus at start"] = (txt, RED)
+                probs.append(f"E4: bus was {BUS_FULLNESS[e4f]} at the start (E1: {BUS_FULLNESS[e1f]})")
+            elif e1f in BUS_FULLNESS and e1f != e4f:
+                o["E4: bus at start"] = (txt + f" — E1: {BUS_FULLNESS[e1f]}", AMBER)
+            else:
+                o["E4: bus at start"] = (txt, GREEN if e1f else "")
+        sat = _code(x.get("b04a"))
+        if sat == "1":
+            o["E4: E1 seated after sign-up"] = ("Yes", GREEN)
+        elif sat == "0":
+            o["E4: E1 seated after sign-up"] = ("No — E1 still standing", RED)
+            probs.append("E4: E1 not sitting down after sign-up")
+        why = _txt(x.get("pitch_delay_why")) if str(ident.at[i, "planned"] or "")[-1:] != "S" else ""
+        if why:
+            o["E4: why the pitch started late"] = (why, AMBER)
+        trt = str(ident.at[i, "planned"] or "")[-1:]
+        sc = _code(x.get("sitdown_confirm")) if trt in ("S", "") else None
+        if sc == "1":
+            o["E4: Sit down confirmed"] = ("Yes — marketer silent, nothing sold", GREEN)
+        elif sc == "0":
+            ex = _txt(x.get("sitdown_explain"))
+            o["E4: Sit down confirmed"] = ("NO" + (f" — {ex}" if ex else ""), RED)
+            probs.append("E4: marketer spoke or sold on the Sit down ride" + (f" ({ex})" if ex else ""))
+        by_form[_txt(r.get("form_id"))] = o
+        if probs:
+            by_code.setdefault(ident.at[i, "planned"], []).extend(probs)
+    return by_form, by_code
+
+
 def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: pd.DataFrame | None = None,
                       reviews: pd.DataFrame | None = None):
     """
@@ -2422,10 +2499,10 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
                     bits.append(f"{src} {x - e1_du[key]:+.1f}")
                 if key == "pp":
                     trt = _txt(r.get("treatment_actual"))
-                    ppc = lambda tt: pitch_pause_check(trt, tt["b05"], tt["b06"], tt["b09"], tt["b10"], tt["b11"], _txt(r.get("form_source")))[0] == 1
+                    ppc = lambda tt: pitch_pause_check(trt, tt["b05"], tt["b06"], tt["b09"], tt["b10"], tt["b11"])[0] == 1
                     f_other, f_e1 = ppc(t_), ppc(T[i])
                 else:
-                    f_other, f_e1 = _dur_flag(key, x, _txt(r.get("form_source"))), _dur_flag(key, e1_du[key], _txt(r.get("form_source")))
+                    f_other, f_e1 = _dur_flag(key, x), _dur_flag(key, e1_du[key])
                 if f_other and f_e1:
                     confirmed.setdefault(name, [f"E1 {e1_du[key]:.1f}"]).append(f"{src} {x:.1f}")
                 if f_other and not f_e1:
@@ -2554,7 +2631,8 @@ GROUP_BY = {"Enumerator 1": "person", "Route (corridor)": "corridor", "Direction
 
 
 def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
-               reviews: pd.DataFrame | None = None, verdicts: dict | None = None) -> pd.DataFrame:
+               reviews: pd.DataFrame | None = None, verdicts: dict | None = None,
+               e4obs: dict | None = None) -> pd.DataFrame:
     """
     One row per E1 form: the groupers (enumerator, route, direction, team, treatment, marketer, day),
     the averaged measures and the counted performance indicators (True/False/None = not assessed).
@@ -2612,6 +2690,8 @@ def ride_facts(subs: pd.DataFrame, batch_codes: pd.DataFrame | None = None,
             "same_day": sr.get("same_day"),
             "order_ok": not _order_problems(t),
             "indep_ok": None if not vd or vd[1] == GRAY else vd[1] == GREEN,
+            "seated_ok": {GREEN: True, RED: False}.get(
+                (e4obs or {}).get(_txt(r.get("form_id")), {}).get("E4: E1 seated after sign-up", ("", ""))[1]),
             "start_ok": None if start_css == GRAY else start_css == GREEN,
             "sp_ok": None if not sp else sp != "3",
             "ann_ok": (None if np.isnan(_ann_signup(r)) else ANN_DUR_MIN <= round(_ann_signup(r), 1) <= ANN_DUR_MAX),
@@ -2638,6 +2718,7 @@ INDICATORS = [   # (column, label)
     ("order_ok",   "Times in logical order"),
     ("tap_ok",     "Times tapped live"),
     ("indep_ok",   "Confirmed by E4/supervisor"),
+    ("seated_ok",  "Seated after sign-up (E4)"),
     ("start_ok",   "Start on time / justified"),
     ("sp_ok",      "At/before strategic point"),
     ("ann_ok",     f"Announcement + sign-up {ANN_DUR_MIN}–{ANN_DUR_MAX} min"),
@@ -2942,7 +3023,14 @@ COLUMN_HELP = {
     "Start check": "Did the announcement start on time, or was the delay justified by a bus less than half full?",
     "Strategic point": "When the start was late: did the announcement begin before, at or after the route's "
                        "strategic point?",
-    "Bus at start": "How full the bus was when it left the park",
+    "Bus at start": "How full the bus was when it left the park (E1)",
+    "E4: bus at start": "How full the bus was at the start and how passengers boarded, as seen by the E4 (b02a, b02). "
+                        "Red = E4 and E1 disagree on whether the bus was full; amber = a smaller difference",
+    "E4: E1 seated after sign-up": "E4 (b04a): was the E1 sitting down once the sign-up process ended",
+    "E4: why the pitch started late": "E4's explanation when the pitch started more than 2 min after sign-up (pitch_delay_why)",
+    "E4: Sit down confirmed": "Sit down rides — E4 confirms the marketer sat, didn't speak and sold nothing "
+                              "(sitdown_confirm; with sitdown_explain if not). No = Validity at risk",
+    "Seated after sign-up (E4)": "Share of rides where the E4 saw the E1 sitting down after sign-up",
     "Since team's previous ride (min)": "Minutes from the end of the team's previous ride to the start of this one",
     "Apprentice gave seat": "Did the apprentice give up their seat for the recruitment team?",
     "Another marketer on the bus": "Share of rides where another marketer got on and marketed — this can invalidate the ride",

@@ -159,7 +159,8 @@ st.markdown("### 2. Drugs pitched on each ride (Script Checklist)")
 st.caption("The drugs the E4 recorded, in the order pitched (a bundle counts as all its drugs). "
            "**4 core drugs pitched**: at least one of each core category on the ride. "
            "**Order**: compared with the marketer's first ride of the day — red if the order changes, "
-           "amber if a drug was dropped or added. **Not in the morning list**: pitched but not in Drug Info.")
+           "amber if a drug was dropped or added. **Ran out (stockout)**: the marketer ran out of that drug while "
+           "selling it (F.12). **Not in the morning list**: pitched but not in Drug Info.")
 rt, rtc = DR.ride_table(R, F, D, day, plan)
 if not rt.empty:
     checked = rt[~rt["Pitch"].eq("Sit down") & ~rt["Drugs pitched (in order)"].eq("no Script Checklist yet")]
@@ -168,6 +169,19 @@ if not rt.empty:
     k[1].metric("Rides with all 4 core drugs pitched", help="At least one pain, deworming, cold and infection drug pitched on the ride", value= int((checked["4 core drugs pitched"] == "✓").sum()))
     k[2].metric("Order changed", int(checked["Order"].str.contains("order changed").sum()))
 show(rt, rtc)
+
+st.markdown("### 3. Passenger questions and comments")
+st.caption("From the Script Checklist. **Questions during the pitch**: per drug, what passengers asked and what the "
+           "marketer mentioned in the answer. **Questions during the pause** (Sit down rides): who was asked — 🔴 if "
+           "passengers asked the marketer. **Passenger comments**: whether passengers commented on the pitch — on a "
+           "Sit down ride (🔴), whether they noticed the marketer was not selling.")
+qt, qtc = DR.reactions_table(R, day)
+if not qt.empty:
+    k = st.columns(3)
+    k[0].metric("Rides with questions during the pitch", int((~qt["Questions during the pitch"].isin(["none", "n/a (Sit down)"])).sum()))
+    k[1].metric("Sit down rides with questions in the pause", int(qt["Questions during the pause"].str.startswith("Asked").sum()))
+    k[2].metric("Rides with passenger comments", int((~qt["Passenger comments"].isin(["none", "—"])).sum()))
+show(qt, qtc)
 
 with st.expander("✏️ Drug names that don't match the morning list — mark as the same drug"):
     st.caption("Names written differently on the Script Checklist ('Ronamox' vs 'Ronamox 500'). Names that clearly "

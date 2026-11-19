@@ -35,7 +35,7 @@ import views as v
 # an older copy in memory after a push, so app.py and views.py stop matching.
 importlib.reload(_rollup)
 importlib.reload(v)
-EXPECTED_VIEWS_VERSION = "2026-11-12"
+EXPECTED_VIEWS_VERSION = "2026-11-19"
 
 # ---------------------------------------------------------------------------
 # Page setup, auth, data
@@ -113,7 +113,7 @@ def download(t: pd.DataFrame, name: str, key: str, label="⬇ Download CSV"):
 
 col_title, col_refresh = st.columns([6, 1])
 with col_title:
-    st.title("🚌 Recruitment HFC Dashboard")
+    st.title("🚌 Recruitment Monitoring")
 with col_refresh:
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("🔄 Refresh"):
@@ -121,12 +121,17 @@ with col_refresh:
         load_reviews.clear()
         st.rerun()
 
-ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, reviews)
-
 # E4 (Script Checklist) forms — the independent record used in Today and Tab 2
 e4_all = load_e4()
 if not e4_all.empty:
     e4_all = e4_all[e4_all["ride_date"].isna() | (e4_all["ride_date"] >= MONITOR_FROM)]
+try:      # what else the E4 saw: bus at start (b02/b02a), E1 seated (b04a), late pitch reason, Sit down confirmed
+    e4obs_all, e4_problems = v.e4_observations(subs, e4_all, batch_codes, reviews)
+except Exception as _e:
+    st.warning(f"E4 observations could not be read ({type(_e).__name__}: {_e}).")
+    e4obs_all, e4_problems = {}, {}
+
+ledger_all, ledger_css_all = v.ride_ledger(subs, batch_codes, reviews, e4_problems)
 try:
     _xt_all, _, _ = v.timing_crosscheck(subs, e4_all, batch_codes, reviews)
     verdicts_all, flips_by_code = v.crosscheck_verdicts(_xt_all)
@@ -185,7 +190,9 @@ with tab0:
         day = st.selectbox("Day", day_opts, index=day_opts.index(default),
                            format_func=lambda d: v.fmt_day(pd.Timestamp(d)) + (" (today)" if d == today else ""),
                            key="today_day")
-        board = v.today_board(ledger_all, day, flips_by_code)
+        _checks = {k: list(flips_by_code.get(k, [])) + [x for x in e4_problems.get(k, []) if "Sit down ride" not in x]
+                   for k in set(flips_by_code) | set(e4_problems)}
+        board = v.today_board(ledger_all, day, _checks)
         unreadable = ledger_all.loc[ledger_all["_date"].isna(), "Planned code"].tolist() if not ledger_all.empty else []
         if unreadable:
             st.warning(f"{len(unreadable)} planned code(s) in the batch_codes tab can't be read, so they don't "
@@ -361,7 +368,7 @@ form** — not only the planned code picked from the list. A ride can carry seve
 
 | Status | Meaning | What to do |
 |---|---|---|
-| 🔴 **Validity at risk** | The E1 or supervisor reported that **another marketer** got on the bus and marketed during the ride, the supervisor saw **the team's marketer speak or sell during a Sit down pause** (s27), or **the ride was stopped** (after sign-up cards were used, or before them without a restart yet). A ride stopped before any card was used and then restarted with the same batch code is *not* flagged: the restart counts, the stopped attempt is noted — this can invalidate the ride (e.g. a Sit down ride is no longer a control) | Decide: *OK – planned/allowed* = the ride still counts; *Correct in cleaning* = mark it invalid in cleaning |
+| 🔴 **Validity at risk** | The E1 or supervisor reported that **another marketer** got on the bus and marketed during the ride, the supervisor (s27) or the E4 (Script Checklist: sitdown_confirm) saw **the team's marketer speak or sell on a Sit down ride**, or **the ride was stopped** (after sign-up cards were used, or before them without a restart yet). A ride stopped before any card was used and then restarted with the same batch code is *not* flagged: the restart counts, the stopped attempt is noted — this can invalidate the ride (e.g. a Sit down ride is no longer a control) | Decide: *OK – planned/allowed* = the ride still counts; *Correct in cleaning* = mark it invalid in cleaning |
 | 🔴 **Wrong code selected** | A form describing this ride (by its date, team and ride #) was filed under another planned code. The form is counted here only; the row it was filed under shows a grey note in *Code selection* but is not flagged | Decide: Correct in cleaning, or Corrected |
 | 🔴 **Not-allowed change** | The actual code has a different date, route/direction, ride number or treatment, or no readable code | Act now: the E1 should have stopped and called the supervisor; the ride may not count |
 | 🔴 **Duplicate E1** | More than one E1 form describes this ride | Same person → keep one; different people → two E1s on one ride, or a wrong code |
@@ -450,7 +457,7 @@ with tab2:
                    "with the E4 (Script Checklist) and the supervisor: 🟢 agrees or confirms; 🔴 the independent record "
                    "misses a target the E1's times don't; 🟠 a time or duration differs by more than "
                    f"{v.TIME_GAP_MAX} min. Details are in the expander below the table.")
-        tl, tl_css = v.ride_timeline_table(subs_f, batch_codes, reviews, verdicts)
+        tl, tl_css = v.ride_timeline_table(subs_f, batch_codes, reviews, verdicts, e4obs_all)
         show_clock = st.toggle("Show clock times", value=False, key="tl_clock")
         if not tl.empty:
             cols = [c for c in tl.columns if show_clock or not c.startswith(v.CLOCK_PREFIX)]
@@ -569,7 +576,7 @@ with tab3:
                "roughly the same sign-ups, announcement length, ride length… — cells far from the overall "
                "average are coloured. Your review decisions apply.")
     rs = v.ride_summary(subs, batch_codes, reviews)
-    facts = v.ride_facts(subs, batch_codes, reviews, verdicts_all)
+    facts = v.ride_facts(subs, batch_codes, reviews, verdicts_all, e4obs_all)
     if rs.empty or facts.empty:
         st.info("No E1 forms yet.")
     else:
@@ -742,7 +749,7 @@ with st.expander("Diagnostics"):
 with tab4:
     st.caption("Look back over several days to spot patterns: does an enumerator, route, team or marketer stand "
                "out, are the treatment arms balanced, and is anything getting better or worse over time?")
-    facts_p = v.ride_facts(subs, batch_codes, reviews, verdicts_all)
+    facts_p = v.ride_facts(subs, batch_codes, reviews, verdicts_all, e4obs_all)
     if facts_p.empty:
         st.info("No E1 forms yet.")
     else:
