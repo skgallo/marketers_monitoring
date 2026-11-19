@@ -456,7 +456,7 @@ with tab2:
                    "and the time between steps, against their targets. **Independent check** compares the E1's times "
                    "with the E4 (Script Checklist) and the supervisor: 🟢 agrees or confirms; 🔴 the independent record "
                    "misses a target the E1's times don't; 🟠 a time or duration differs by more than "
-                   f"{v.TIME_GAP_MAX} min. Details are in the expander below the table.")
+                   f"{v.TIME_GAP_MAX} min. Each person's times are in the table below.")
         tl, tl_css = v.ride_timeline_table(subs_f, batch_codes, reviews, verdicts, e4obs_all)
         show_clock = st.toggle("Show clock times", value=False, key="tl_clock")
         if not tl.empty:
@@ -468,21 +468,24 @@ with tab2:
 
         if not xt.empty:
             n_cmp = int(xt["_compared"].sum()); n_iss = int(xt["_issue"].sum())
-            with st.expander(f"Details: E1 vs E4 vs supervisor — {n_iss} ride(s) with differences, "
-                             f"{n_cmp}/{len(xt)} with a second record"):
-                st.caption(f"**Δ** = E4 or supervisor minus E1, in minutes (+ = recorded later than the E1), listed when "
-                           f"more than {v.TIME_GAP_MAX} min apart; blank = they agree. **What happened** reads the "
-                           "comparison in plain language.")
-                only_diff = st.toggle("Only rides with differences", value=True, key="xt_only")
-                sel = xt["_issue"] if only_diff else xt["_compared"]
-                if sel.any():
-                    show(xt[sel], xt_css[sel])
-                else:
-                    st.success("No differences between the E1 and the independent records." if n_cmp else
-                               "No E4 or supervisor records to compare yet.")
-                download(xt, "timing_crosscheck.csv", "dl_xt")
-                if not e4_unmatched.empty:
-                    st.markdown(f"**E4 checklists not matched to an E1 form ({len(e4_unmatched)})**")
+            st.markdown("#### Times recorded by the E1, the E4 and the supervisor")
+            st.caption(f"{n_cmp}/{len(xt)} rides have a second record (E4 Script Checklist and/or supervisor); "
+                       f"{n_iss} with differences. **🕒 columns** show each person's clock time for the step. "
+                       f"**Δ** = E4 or supervisor minus E1, in minutes (+ = recorded later than the E1), shown when more "
+                       f"than {v.TIME_GAP_MAX} min apart (red). **What happened** reads the comparison in plain language.")
+            cc = st.columns(2)
+            only_diff = cc[0].toggle("Only rides with differences", value=False, key="xt_only")
+            show_times = cc[1].toggle("Show each person's times", value=True, key="xt_times")
+            sel = xt["_issue"] if only_diff else xt["_compared"]
+            cols = [c for c in xt.columns if show_times or not c.startswith(v.CLOCK_PREFIX)]
+            if sel.any():
+                show(xt.loc[sel, cols], xt_css.loc[sel, [c for c in cols if c in xt_css.columns]])
+            else:
+                st.success("No differences between the E1 and the independent records." if n_cmp else
+                           "No E4 or supervisor records to compare yet.")
+            download(xt, "timing_crosscheck.csv", "dl_xt")
+            if not e4_unmatched.empty:
+                with st.expander(f"E4 checklists not matched to an E1 form ({len(e4_unmatched)})"):
                     st.dataframe(e4_unmatched, hide_index=True, width="stretch")
         try:
             _has_e4 = bool(st.secrets.get("e4_url"))

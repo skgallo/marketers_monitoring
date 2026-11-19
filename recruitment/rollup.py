@@ -218,6 +218,27 @@ def parse_batch_code(code) -> dict:
 # Cleaning
 # ---------------------------------------------------------------------------
 
+TIME_FIELDS = ['b01', 'b02_r', 'b03', 'b04', 'b05', 'b06', 'b09', 'b10', 'b11']
+
+
+def fill_times_from_clock(df: pd.DataFrame) -> pd.DataFrame:
+    """Launch 0 forms also store each time as text (b02_r_clock = '14:00'). If the time field itself wasn't
+    published to the Sheet (or is empty), use the _clock copy. 'Not recorded' and 00:00 count as missing."""
+    for f_ in TIME_FIELDS:
+        ck = f"{f_}_clock"
+        if ck not in df.columns:
+            continue
+        clk = df[ck].astype(str).str.strip()
+        clk = clk.where(~clk.isin(["Not recorded", "", "nan", "None", "00:00", "00:00:00"]), None)
+        if f_ not in df.columns:
+            df[f_] = clk
+        else:
+            cur = df[f_]
+            empty = cur.isna() | cur.astype(str).str.strip().isin(["", "nan", "None"])
+            df.loc[empty, f_] = clk[empty]
+    return df
+
+
 def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
     """
     Clean raw SurveyCTO submissions:
@@ -292,6 +313,7 @@ def clean_submissions(df: pd.DataFrame) -> pd.DataFrame:
             ren[c] = new_name
     if ren:
         df = df.rename(columns=ren)
+    df = fill_times_from_clock(df)
     # Google Sheets turns a two-choice answer like "1 3" into a date (3 Jan 2026). Undo that for the
     # multiple-choice columns (month = first code, day = second code).
     SM_COLS = ('c10', 'conf_wrong', 's13', 'sup_time_mismatch_points', 'other_marketer_when', 'other_speaker_who',
@@ -465,13 +487,14 @@ def _parse_time(val) -> pd.Timestamp:
     if pd.isna(val):
         return pd.NaT
     s = str(val).strip()
-    for fmt in ('%I:%M:%S %p', '%H:%M:%S', '%I:%M %p'):
+    for fmt in ('%I:%M:%S %p', '%H:%M:%S', '%I:%M %p', '%H:%M'):
         try:
             return pd.to_datetime(s, format=fmt)
         except ValueError:
             pass
-    try:
-        return pd.to_datetime(s)
+    try:     # anything else (e.g. a full date-time): keep the time of day only, so all sources compare
+        t = pd.to_datetime(s)
+        return pd.Timestamp(1900, 1, 1, t.hour, t.minute, t.second)
     except Exception:
         return pd.NaT
 
@@ -851,6 +874,7 @@ def prepare_e4(raw: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         df = df.T.groupby(level=0, sort=False).first().T
     df = df.reset_index(drop=True)
+    df = fill_times_from_clock(df)
     if 'KEY' in df.columns:
         df = df[~(df['KEY'].notna() & df.duplicated(subset='KEY', keep='last'))].copy()
     if 'username' in df.columns:

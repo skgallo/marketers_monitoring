@@ -2485,6 +2485,10 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
             row[f"Δ {lbl}"] = " · ".join(bits)
             if bits:
                 s[f"Δ {lbl}"] = RED; issue = True
+            # the times themselves, side by side
+            clk = [f"E1 {_clock(T[i][key])}"] + [f"{src} {_clock(t_[key])}" for src, (_, t_) in others.items()]
+            row[f"{CLOCK_PREFIX}{lbl}"] = " · ".join(c for c in clk if not c.endswith(("—", MISSING)))
+            s[f"{CLOCK_PREFIX}{lbl}"] = RED if bits else ""
         # 2. durations: other − E1, and target flips
         e1_du = _durations(T[i])
         flips_red, flips_amber, confirmed = [], [], {}
@@ -2549,7 +2553,7 @@ def timing_crosscheck(subs: pd.DataFrame, e4: pd.DataFrame | None, batch_codes: 
         rows.append(row); sty.append(s)
     t, css = pd.DataFrame(rows), pd.DataFrame(sty).reindex(columns=pd.DataFrame(rows).columns).fillna("")
     # drop difference columns that are empty for every ride
-    empty = [c for c in t.columns if c.startswith("Δ ") and (t[c] == "").all()]
+    empty = [c for c in t.columns if (c.startswith("Δ ") or c.startswith(CLOCK_PREFIX)) and (t[c] == "").all()]
     t, css = t.drop(columns=empty), css.drop(columns=empty)
     # E4 checklists that didn't match any E1 form, with the likely reason
     if not e4.empty:
