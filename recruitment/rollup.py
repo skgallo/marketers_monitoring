@@ -492,9 +492,13 @@ def _parse_time(val) -> pd.Timestamp:
     if pd.isna(val):
         return pd.NaT
     s = str(val).strip()
+    if s in ("", "nan", "None", "Not recorded"):
+        return pd.NaT
     for fmt in ('%I:%M:%S %p', '%H:%M:%S', '%I:%M %p', '%H:%M'):
         try:
-            return pd.to_datetime(s, format=fmt)
+            t = pd.to_datetime(s, format=fmt)
+            # exactly midnight = an empty time shown as 0:00 by Google Sheets, not a real ride time
+            return pd.NaT if (t.hour, t.minute, t.second) == (0, 0, 0) else t
         except ValueError:
             pass
     try:     # anything else (e.g. a full date-time): keep the time of day only, so all sources compare
@@ -531,12 +535,9 @@ def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
     dur = round(dur, 1) if not np.isnan(dur) else dur          # judged on the value shown (1 decimal)
     to_end = round(to_end, 1) if not np.isnan(to_end) else to_end
     if t == 'S':
-        # Launch 0: the pause lasts until the ride ends — there is no separate pause-end time any more
-        if pd.isna(b10) or np.isnan(to_end):
-            return None, ''
-        if to_end > PAUSE_END_TOL_MIN:
-            return 1, f"Pause ended {to_end:.1f} min before the ride ended"
-        return 0, ''
+        # Sit down: the pause lasts until the ride ends — the forms no longer record a separate pause end,
+        # so there is nothing to check here (any old/empty pause-end value is ignored)
+        return None, ''
     if t in ('N', 'P'):
         if np.isnan(dur):
             return None, ''

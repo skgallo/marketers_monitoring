@@ -547,7 +547,7 @@ with tab2:
 | Recorded ann./signup dur. | Outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min (enumerator-recorded) |
 | Auto form-screen dur. | Not flagged — SurveyCTO screen timing, for reference |
 | Timing discrepancy | Recorded and auto differ by > {SIGNUP_DIFF_MAX} min — review; doesn't mean either is wrong |
-| Pause/Pitch | **Sit down:** the pause lasts until the ride ends (in the current forms the pause end *is* the ride end, so only older forms can be flagged here). **Normal:** pitch under 15 min, unless it ran until the ride ended. **Peddling:** pitch under 12 min, unless it ran until the ride ended |
+| Pause/Pitch | **Sit down:** no check — the pause lasts until the ride ends. **Normal:** pitch under 15 min, unless it ran until the ride ended. **Peddling:** pitch under 12 min, unless it ran until the ride ended |
 | **Ride timeline** — Start check | Announcement started > {DELAY_MAX_MIN} min after the ride start although the bus was at least half full (🔴), or with no reason; 🟢 if the E1 waited because the bus was less than half full; 🟠 another reason |
 | **Ride timeline** — Strategic point | The announcement started AFTER the route's strategic point (asked only when the start was late) |
 | **Ride timeline** — Announcement | Automatic length of the script screens outside {ANN_DUR_MIN}–{ANN_DUR_MAX} min |

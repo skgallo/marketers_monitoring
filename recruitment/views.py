@@ -2091,9 +2091,8 @@ def _times(r) -> dict:
     """Parsed clock times of one form (any source) with pitch/pause start/end resolved."""
     t = {k: _parse_time(r.get(k)) for k in ["b02_r", "b03", "b04", "b05", "b06", "b09", "b10", "b11"]}
     t["pp_start"] = t["b05"] if pd.notna(t["b05"]) else t["b06"]
-    t["pp_end"] = t["b09"] if pd.notna(t["b09"]) else t["b10"]
-    if pd.isna(t["pp_end"]) and pd.isna(t["b05"]) and pd.notna(t["b06"]):
-        t["pp_end"] = t["b11"]          # Sit down (Launch 0): the pause runs until the ride ends
+    # pitch ends at b09; a Sit down pause (b06, no b05) runs until the ride ends (b11)
+    t["pp_end"] = t["b09"] if pd.notna(t["b09"]) else (t["b11"] if pd.isna(t["b05"]) and pd.notna(t["b06"]) else t["b10"])
     return t
 
 
