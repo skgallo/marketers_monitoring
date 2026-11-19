@@ -53,7 +53,7 @@ SIGNUP_DIFF_MAX      = 2    # Flag 3: max |signup - announcement| discrepancy (m
 PITCH_TARGET_MIN     = 25   # (old rule, kept for reference) target pitch/pause duration
 PITCH_TOL_MIN        = 2    # (old rule) tolerance either side
 # Treatment-specific pitch/pause rules (Nov 2026)
-NORMAL_PITCH_MIN     = 20   # Normal: marketer pitch at least 20 min ...
+NORMAL_PITCH_MIN     = 15   # Normal: marketer pitch at least 15 min (same as the Launch 0 form: pitch_min_target)
 PEDDLING_PITCH_MIN   = 12   # Peddling (pitch ~15 min): at least 12 min ...
 #                             ... unless the pitch ran until the end of the ride
 PAUSE_END_TOL_MIN    = 2    # Sit down: pause must last until the ride ends (ends ≤ 2 min before ride end)
@@ -223,7 +223,12 @@ TIME_FIELDS = ['b01', 'b02_r', 'b03', 'b04', 'b05', 'b06', 'b09', 'b10', 'b11']
 
 def fill_times_from_clock(df: pd.DataFrame) -> pd.DataFrame:
     """Launch 0 forms also store each time as text (b02_r_clock = '14:00'). If the time field itself wasn't
-    published to the Sheet (or is empty), use the _clock copy. 'Not recorded' and 00:00 count as missing."""
+    published to the Sheet (or is empty), use the _clock copy. 'Not recorded' and 00:00 count as missing
+    (00:00 is what an empty time becomes, e.g. the old pause-end b10 that Launch 0 no longer asks)."""
+    for f_ in TIME_FIELDS:
+        if f_ in df.columns:
+            v_ = df[f_].astype(str).str.strip()
+            df.loc[v_.isin(["00:00", "00:00:00", "12:00:00 AM", "Not recorded"]), f_] = None
     for f_ in TIME_FIELDS:
         ck = f"{f_}_clock"
         if ck not in df.columns:
@@ -526,7 +531,8 @@ def pitch_pause_check(treatment, b05, b06, b09, b10, b11):
     dur = round(dur, 1) if not np.isnan(dur) else dur          # judged on the value shown (1 decimal)
     to_end = round(to_end, 1) if not np.isnan(to_end) else to_end
     if t == 'S':
-        if np.isnan(to_end):
+        # Launch 0: the pause lasts until the ride ends — there is no separate pause-end time any more
+        if pd.isna(b10) or np.isnan(to_end):
             return None, ''
         if to_end > PAUSE_END_TOL_MIN:
             return 1, f"Pause ended {to_end:.1f} min before the ride ended"
